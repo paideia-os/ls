@@ -2,13 +2,15 @@
 
 **Wave:** R50 (Wave 2)
 **Current milestone:** M3 (semantic-pipe / audit integration) — IN
-FLIGHT. M2 shipped four rendering primitives; M3-001 has flipped
+FLIGHT. M2 shipped four rendering primitives; M3-001 flipped
 `Runner::runner_ls` from `LS_RUN_STUB` to a real iteration body
 against the R42-PREP-008 substrate (sysno 71 sys_pdxfs_open + sysno
-72 sys_pdxfs_dir_readnext + KIND_TTY 0x197) and wired the M3-001
-schema-bound `PdxFsDirEntry[]` emission on the stdout endpoint.
-M3-002 (owner as cap ref) and M3-003 (`DirListRecord` via libpdx-
-audit) land next.
+72 sys_pdxfs_dir_readnext + KIND_TTY 0x197) and wired the schema-
+bound `PdxFsDirEntry[]` emission on the stdout endpoint. M3-002
+extended the emitted record from 128 to 144 bytes, appending an
+owner Cap wire `(kind=KIND_USER, target_ptr=user_row)` — the D2
+literal owner-as-cap-ref shape at the schema level. M3-003
+(`DirListRecord` via libpdx-audit before first byte) lands next.
 
 ## Milestone rollup
 
@@ -22,7 +24,7 @@ audit) land next.
 | M2-003 (#6)     | -a hidden-files toggle + -h human-readable size                | LANDED |
 | M2-004 (#7)     | coloring driven by declared schema/MIME (not POSIX bits)       | LANDED |
 | M3-001 (#8)     | PdxFsDirEntry[] schema bind + emit on stdout                   | LANDED |
-| M3-002 (#9)     | owner field emits as cap ref, not text uid (D2 literal)        | OPEN   |
+| M3-002 (#9)     | owner field emits as cap ref, not text uid (D2 literal)        | LANDED |
 | M3-003 (#10)    | DirListRecord via libpdx-audit before first byte               | OPEN   |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
