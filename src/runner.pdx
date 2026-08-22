@@ -1,9 +1,13 @@
-// src/runner.pdx -- ls.M1-003 + ls.M3-001 (paideia-os/ls#3 + #8)
+// src/runner.pdx -- ls.M1-003 + ls.M3-001 + ls.M3-003 (paideia-os/ls#3 + #8 + #10)
 //
 // Runner module: the operation body -- iterate a held KIND_PDXFS_FILE
 // (directory) cap via sys_pdxfs_dir_readnext (sysno 72), write each
 // entry's name to KIND_TTY(write) one per line, and emit one typed
 // PdxFsDirEntry record per entry to the stdout semantic-pipe endpoint.
+// At M3-003 the whole body is wrapped in a libpdx-audit begin/commit
+// pair (DirListRecord frame) so the D3 audit-first invariant holds:
+// no user-visible byte on KIND_TTY or the stdout endpoint is emitted
+// before the audit frame is open.
 //
 // =============================================================================
 // SCOPE
@@ -23,6 +27,7 @@
 //   LS_ERR_TTY_WRITE   (0xFFFFEB23)  sys_write (fd 1) returned -errno
 //   LS_ERR_EMIT_BIND   (0xFFFFEB24)  libpdx-semantic-pipe bind refused
 //   LS_ERR_EMIT_SEND   (0xFFFFEB25)  send_record refused
+//   LS_ERR_AUDIT       (0xFFFFEB26)  libpdx-audit audit_begin refused (M3-003)
 //
 // =============================================================================
 // PRE-OPENED DIR CAP CONVENTION
@@ -54,13 +59,17 @@
 // cap-handoff round" idiom every M3 R49 tool uses.
 //
 // =============================================================================
-// FLOW (M3-001)
+// FLOW (M3-001 + M3-003)
 // =============================================================================
 //
 //   (1) Gate path_ptr as at M1 (empty string -> LS_ERR_BAD_PATH; null
 //       path is legal at M3 and means "default to the pre-opened
 //       LS_DIR_CAP_SLOT cap" -- the shell narrows to the concrete arg
 //       path at exec, so ls does not resolve paths itself at M3).
+//   (1b) M3-003: audit_ls_begin(path_ptr, flag_bits) -- open the
+//       DirListRecord audit frame BEFORE any user-visible byte is
+//       emitted (D3 invariant). On refusal return LS_ERR_AUDIT
+//       without touching KIND_TTY or the semantic-pipe endpoint.
 //   (2) sem_emit_reset() -- imprint the schema hash stub.
 //   (3) sem_emit_bind_stdout() -- bind LS_STDOUT_ENDPOINT_SLOT to
 //       PdxFsDirEntry@0.1. On refusal return LS_ERR_EMIT_BIND.
@@ -81,6 +90,12 @@
 //           LS_ERR_EMIT_SEND.
 //       (g) ls_note(LS_ST_ENTRIES); continue loop.
 //   (5) Return LS_OK.
+//
+// Every ret path (except the pre-audit LS_ERR_BAD_PATH branch) flows
+// through rn_ls_epilogue which calls audit_ls_commit(exit_code)
+// before unwinding. audit_ls_commit is safe to call on the pre-audit
+// path too -- it gates internally on _au_id != 0 -- so the epilogue
+// unification is unconditional.
 //
 // =============================================================================
 // AS_BIT_A DEPENDENCY
@@ -130,6 +145,8 @@
 //   sem_emit_reset         -- SemanticEmit (src/semantic_emit.pdx)
 //   sem_emit_bind_stdout   -- SemanticEmit (src/semantic_emit.pdx)
 //   sem_emit_entry         -- SemanticEmit (src/semantic_emit.pdx)
+//   audit_ls_begin         -- AuditShim (src/audit_shim.pdx) -- M3-003
+//   audit_ls_commit        -- AuditShim (src/audit_shim.pdx) -- M3-003
 
 module Runner = structure {
 
@@ -192,7 +209,7 @@ module Runner = structure {
   pub let runner_ls : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
     fn (path_ptr: u64) (flag_bits: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap},
-      justification: "ls.M3-001 (#8): Runner flips from LS_RUN_STUB to a real iteration body. Uses pdxfs_dir_readnext (sysno 72) against a pre-handed KIND_PDXFS_FILE(read, <arg-path>) at LS_DIR_CAP_SLOT (2, per caps.decl order). Bumps LS_ST_RUNS on entry unconditionally so the counter records every ATTEMPT. Argument gates preserve the M1 shape: null path_ptr resolves through the read loop with the pre-handed cap (informational path; shell narrowed the cap already); non-null path_ptr with byte0 == 0 refuses with LS_ERR_BAD_PATH. Emit prelude: sem_emit_reset + sem_emit_bind_stdout must succeed before the read loop; bind refusal returns LS_ERR_EMIT_BIND. Loop: pdxfs_dir_readnext(LS_DIR_CAP_SLOT, &_rn_entry_buf); rc == 1 -> proceed; rc == 0 -> break; else LS_ERR_READDIR. Per-entry: extract name_len (offset 16) + name_ptr (offset 24) from the 128-byte record; hidden_filter_accept(name_ptr, flag_bits & AS_BIT_A) -- rejects bump LS_ST_HIDDEN and loop; accepts compose name + '\\n' in _rn_line_buf (byte copy loop with #1248 mitigation) and tty_write; tty_write refusal (negative rax) -> LS_ERR_TTY_WRITE; then sem_emit_entry (128-byte record over the bound stdout endpoint) -> LS_ERR_EMIT_SEND on refusal; bump LS_ST_ENTRIES; continue. Six callee-save pushes (rbx = LS_DIR_CAP_SLOT copy; r12 = path_ptr; r13 = flag_bits; r14 = name_len for the current entry; r15 = _rn_line_buf base for the tty_write call; rbp = name_ptr for the tty_write + hidden_filter_accept chain) + sub rsp,8 pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at every nested-call site (ls_note, pdxfs_dir_readnext, hidden_filter_accept, tty_write, sem_emit_entry). Matched add rsp,8 + 6 pops before every ret via the shared rn_ls_epilogue label. paideia-as conformance: r11 + r10 for LEA + byte-address scratch; no test mnemonic; largest cmp immediate 128 (RN_ENT_SIZE) fits imm32; the 0xFFFFEB2x return sentinels are mov rax, imm64 emissions, not compares. Effects widened to !{mem, sysreg} @{cap} matching the union of the callees (pdxfs_dir_readnext + tty_write + sem_emit_entry all carry {mem, sysreg}; pdxfs_dir_readnext + sem_emit_entry carry @{cap}). Labels prefixed rn_ls_.",
+      justification: "ls.M3-001 (#8) + ls.M3-003 (#10): Runner flips from LS_RUN_STUB to a real iteration body, wrapped in a libpdx-audit DirListRecord frame (D3 audit-first). Uses pdxfs_dir_readnext (sysno 72) against a pre-handed KIND_PDXFS_FILE(read, <arg-path>) at LS_DIR_CAP_SLOT (2, per caps.decl order). Bumps LS_ST_RUNS on entry unconditionally so the counter records every ATTEMPT. Argument gates preserve the M1 shape: null path_ptr resolves through the read loop with the pre-handed cap (informational path; shell narrowed the cap already); non-null path_ptr with byte0 == 0 refuses with LS_ERR_BAD_PATH. M3-003 audit-open: audit_ls_begin(path_ptr, flag_bits) called AFTER the path gate and BEFORE sem_emit_reset -- this is the boundary the D3 invariant pins (no user-visible byte until the audit frame is open). Refusal returns LS_ERR_AUDIT (0xFFFFEB26). Emit prelude: sem_emit_reset + sem_emit_bind_stdout must succeed before the read loop; bind refusal returns LS_ERR_EMIT_BIND. Loop: pdxfs_dir_readnext(LS_DIR_CAP_SLOT, &_rn_entry_buf); rc == 1 -> proceed; rc == 0 -> break; else LS_ERR_READDIR. Per-entry: extract name_len (offset 16) + name_ptr (offset 24) from the 128-byte record; hidden_filter_accept(name_ptr, flag_bits & AS_BIT_A) -- rejects bump LS_ST_HIDDEN and loop; accepts compose name + '\\n' in _rn_line_buf (byte copy loop with #1248 mitigation) and tty_write; tty_write refusal (negative rax) -> LS_ERR_TTY_WRITE; then sem_emit_entry (144-byte record over the bound stdout endpoint, M3-002 shape with owner Cap wire) -> LS_ERR_EMIT_SEND on refusal; bump LS_ST_ENTRIES; continue. Every ret path (except the pre-audit LS_ERR_BAD_PATH -- but that too goes through the same epilogue because audit_ls_commit is a no-op on _au_id == 0) flows through rn_ls_epilogue which saves exit_code in r13 (dead at epilogue -- flag_bits done), calls audit_ls_commit, then restores rax and unwinds. Six callee-save pushes (rbx = LS_DIR_CAP_SLOT copy; r12 = path_ptr; r13 = flag_bits then exit_code carry; r14 = name_len for the current entry; r15 = _rn_line_buf base for the tty_write call; rbp = name_ptr for the tty_write + hidden_filter_accept chain) + sub rsp,8 pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at every nested-call site (ls_note, audit_ls_begin, sem_emit_reset, sem_emit_bind_stdout, pdxfs_dir_readnext, hidden_filter_accept, tty_write, sem_emit_entry, audit_ls_commit). Matched add rsp,8 + 6 pops before every ret via the shared rn_ls_epilogue label. paideia-as conformance: r11 + r10 for LEA + byte-address scratch; no test mnemonic; largest cmp immediate 128 (RN_ENT_SIZE) fits imm32; the 0xFFFFEB2x return sentinels are mov rax, imm64 emissions, not compares. Effects widened to !{mem, sysreg} @{cap} matching the union of the callees (pdxfs_dir_readnext + tty_write + sem_emit_entry + audit_ls_begin + audit_ls_commit all carry {mem, sysreg}; pdxfs_dir_readnext + sem_emit_entry + audit_ls_begin + audit_ls_commit carry @{cap}). Labels prefixed rn_ls_.",
       block: {
         // ---- 6-push prologue + 8-byte alignment pad ------------------
         push rbx;
@@ -212,11 +229,25 @@ module Runner = structure {
 
         // ---- Path arg gate (empty-string reject preserved from M1) --
         cmp r12, 0;
-        je  rn_ls_pre_emit;                      // null path -> proceed
+        je  rn_ls_audit_open;                    // null path -> proceed
         xor rax, rax;
         mov_b rax, [r12];
         cmp rax, 0;
         je  rn_ls_bad_path;
+
+      rn_ls_audit_open:
+        // ---- M3-003: open DirListRecord audit frame (D3) -------------
+        //
+        // MUST happen before any user-visible byte reaches KIND_TTY
+        // or the semantic-pipe endpoint. On refusal, we return
+        // LS_ERR_AUDIT via the epilogue -- audit_ls_commit is a no-op
+        // when _au_id == 0 (which it stays on refusal), so the
+        // unified epilogue is safe.
+        mov rdi, r12;                            // path_ptr
+        mov rsi, r13;                            // flag_bits
+        call audit_ls_begin;
+        cmp rax, 0;                              // AU_OK
+        jne rn_ls_audit_fail;
 
       rn_ls_pre_emit:
         // ---- Emit prelude: schema-imprint + bind ---------------------
@@ -375,7 +406,27 @@ module Runner = structure {
         mov rax, 0xFFFFEB25;                     // LS_ERR_EMIT_SEND
         jmp rn_ls_epilogue;
 
+      rn_ls_audit_fail:
+        mov rdi, 4;
+        call ls_note;
+        mov rax, 0xFFFFEB26;                     // LS_ERR_AUDIT
+        // audit_ls_commit is a no-op here (_au_id stayed 0) so the
+        // unified epilogue is safe -- no separate no-audit epilogue
+        // needed.
+        jmp rn_ls_epilogue;
+
       rn_ls_epilogue:
+        // ---- M3-003: close DirListRecord audit frame -----------------
+        //
+        // Save exit code in r13 (dead at this point -- flag_bits no
+        // longer needed), call audit_ls_commit, restore.
+        // audit_ls_commit gates internally on _au_id != 0, so the
+        // pre-audit LS_ERR_BAD_PATH path is safe here.
+        mov r13, rax;                            // save exit_code
+        mov rdi, r13;
+        call audit_ls_commit;                    // clobbers rax
+        mov rax, r13;                            // restore exit_code
+
         add rsp, 8;
         pop rbp;
         pop r15;

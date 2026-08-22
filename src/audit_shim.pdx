@@ -1,0 +1,294 @@
+// src/audit_shim.pdx -- ls.M3-003 (paideia-os/ls#10)
+//
+// AuditShim module: ls-side wrappers around libpdx-audit's three-call
+// API (audit_begin, audit_record_output, audit_commit) for the D3
+// audit-first invariant -- ls journals a DirListRecord BEFORE it emits
+// its first user-visible byte on either KIND_TTY or the semantic-pipe
+// stdout endpoint.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// libpdx-audit ships three externally-linked symbols (see
+// design/tooling/r49-r50-plan.md §5 line 785, libpdx-audit.M1-001):
+//
+//   audit_begin(op_name_ptr, args_ptr)             -> audit_id | -errno
+//   audit_record_output(audit_id, schema_ptr, hash_ptr) -> 0 | -errno
+//   audit_commit(audit_id, exit_code)              -> 0 | -errno
+//
+// The library resolves the svc.audit-journal endpoint on first call
+// via sys_svc_lookup (per r49-r50-plan.md §3 line 202), so ls itself
+// does NOT need to hold a KIND_IPC_ENDPOINT cap narrowed to that
+// broker in caps.decl -- the four caps already declared (KIND_USER,
+// KIND_TTY(write), KIND_PDXFS_FILE(read,<arg-path>), KIND_IPC_ENDPOINT
+// for stdout) suffice at the ls-manifest level.
+//
+// This module wraps the three raw calls with tool-shaped helpers that
+// (a) stash the audit_id in a .bss slot so Runner does not have to
+// thread it through the register file, (b) compose the DirListRecord
+// args blob at a stable .bss scratch, (c) collapse library-internal
+// errno codes into the ls sub-band vocabulary (LS_ERR_AUDIT
+// 0xFFFFEB26 from Ls's return-code table), and (d) treat a zero
+// audit_id as "no audit in flight" so an epilogue that unconditionally
+// calls audit_ls_commit is safe on a path that bailed BEFORE
+// audit_ls_begin ran (e.g. the LS_ERR_BAD_PATH gate).
+//
+// =============================================================================
+// DIRLISTRECORD SHAPE (M3-003)
+// =============================================================================
+//
+// The args blob passed to audit_begin encodes the "what did the user
+// invoke" fields the audit-journal broker stitches into the
+// DirListRecord's payload (see r49-r50-plan.md §5.4 line 496 and
+// user_events_journal.pdx UEJ_KIND_TOOL_INVOKE). At M3-003 the layout
+// is:
+//
+//   [0..8]   path_ptr    : u64  -- NUL-terminated argument path
+//                                   (or 0 == "default to `.`")
+//   [8..16]  flag_bits   : u64  -- ArgvSurface bit-field
+//                                   (AS_BIT_L | AS_BIT_A | ...)
+//   [16..24] reserved    : u64  -- 0 (M3-003 filler; the M4 fixture
+//                                   pins this expectation)
+//
+// Total = 24 bytes = 3 u64 lanes. Aligned to 8. Kept small so an
+// M4 audit-replay fixture can inline the whole struct in a golden
+// hex block.
+//
+// =============================================================================
+// PLACEHOLDER SEMANTICS AT PRE-LIBPDX-AUDIT.M1
+// =============================================================================
+//
+// libpdx-audit's .M1 scaffold ships with the three symbol names but a
+// stub body that returns 0 (no-op) so tools linking against the M1
+// library can call it now without triggering the audit-journal
+// substrate. When libpdx-audit.M1-001 lands the real IPC send, ls's
+// audit_ls_begin/commit start writing actual DirListRecord frames
+// without any tool-side change -- the flip is purely inside the
+// library.
+//
+// If audit_begin returns a negative-errno u64 (bit 63 set), audit_ls_
+// begin surfaces LS_ERR_AUDIT (0xFFFFEB26) to Runner, which returns
+// to _start without emitting output. This is the "audit-refused ->
+// tool-refuses" gate the D3 invariant demands.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`AuditShim`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Immediates in
+//     this module: 0 (id-zero gate) and small offsets (0, 8, 16 for
+//     the args blob lanes). LS_ERR_AUDIT (0xFFFFEB26) stages via
+//     `mov rax, imm64` on the error return path.
+//   - Byte reads: none. The op_name string is written qword-wise
+//     (16 bytes covers "ls\0" + zero-fill lanes; the library reads
+//     until first NUL).
+//   - r11 is scratch for LEA staging.
+//   - audit_ls_begin non-leaf: two callee-save pushes (r12=path_ptr,
+//     r13=flag_bits) -> 16 bytes; entry rsp % 16 == 8; 8 + 16 = 24;
+//     24 % 16 == 8. Needs additional `sub rsp, 8` pad for the nested
+//     audit_begin call. Matched `add rsp, 8` + 2 pops before ret.
+//   - audit_ls_commit non-leaf: one callee-save push (r12=exit_code)
+//     -> 8 bytes; entry rsp % 16 == 8; 8 + 8 = 16; 16 % 16 == 0.
+//     No extra pad. Matched pop before ret.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   audit_begin           -- libpdx-audit (external, per §5 line 785)
+//   audit_commit          -- libpdx-audit (external, per §5 line 785)
+//
+// Written / read:
+//   _au_op_name           -- "ls\0" + zero fill (this module's .bss)
+//   _au_args_scratch      -- 24-byte DirListRecord args blob
+//   _au_id                -- u64 audit_id (0 == no audit in flight)
+
+module AuditShim = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let AU_OK           : u64 = 0
+  pub let AU_ERR_BEGIN    : u64 = 0xFFFFEB26    // LS_ERR_AUDIT mirror
+  pub let AU_ERR_COMMIT   : u64 = 0xFFFFEB26    // LS_ERR_AUDIT mirror
+
+  // ==========================================================================
+  // Args-blob offsets (see file header §DirListRecord shape).
+  // ==========================================================================
+  pub let AU_ARGS_OFF_PATH  : u64 = 0
+  pub let AU_ARGS_OFF_FLAGS : u64 = 8
+  pub let AU_ARGS_OFF_RSVD  : u64 = 16
+
+  // ==========================================================================
+  // .bss storage
+  // ==========================================================================
+  //
+  // _au_op_name -- 16 bytes = 2 u64 lanes. Holds the ASCII bytes
+  // "ls\0" at position 0..3 and zero fill through position 15. Sized
+  // to two lanes so the M4 audit-replay fixture can inline the whole
+  // op_name in a single qword compare. audit_ls_begin imprints on
+  // first call (idempotent -- the second imprint is the same bytes).
+  pub let mut _au_op_name       : [u64; 2]  = uninit @align(8)
+
+  // _au_args_scratch -- 24 bytes = 3 u64 lanes. See file header
+  // §DirListRecord shape.
+  pub let mut _au_args_scratch  : [u64; 3]  = uninit @align(8)
+
+  // _au_id -- u64 audit_id returned by audit_begin (0 == none in
+  // flight). audit_ls_commit gates on this being non-zero so an
+  // epilogue that unconditionally calls audit_ls_commit is safe.
+  pub let mut _au_id            : [u64; 1]  = uninit @align(8)
+
+  // ==========================================================================
+  // audit_ls_begin(path_ptr, flag_bits) -> u64
+  //
+  // Signature: (u64, u64) -> u64 !{mem, sysreg} @{cap}
+  //   RDI (input): path_ptr  -- NUL-terminated arg path (0 == default)
+  //   RSI (input): flag_bits -- ArgvSurface bit-field
+  //   RAX (output): AU_OK (0) on success; LS_ERR_AUDIT (0xFFFFEB26)
+  //                 on refusal.
+  //
+  // Sequence:
+  //   (1) Imprint "ls\0" (bytes 0x6C, 0x73, 0x00, ...) at _au_op_name.
+  //   (2) Store path_ptr at args[0], flag_bits at args[8], 0 at
+  //       args[16].
+  //   (3) Call audit_begin(op_name, args). Negative-errno -> refuse.
+  //   (4) Store audit_id at _au_id. Return AU_OK.
+  //
+  // Register plan (non-leaf; two callee-save pushes + pad):
+  //   r12 = path_ptr (survives across the compose + call)
+  //   r13 = flag_bits
+  //   r11 = LEA scratch
+  //   rax = return / imprint constant
+  //   rdi/rsi = arg marshalling for audit_begin
+  // ==========================================================================
+  pub let audit_ls_begin : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (path_ptr: u64) (flag_bits: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "ls.M3-003 (#10): open a DirListRecord audit frame BEFORE Runner emits its first user-visible byte on KIND_TTY or the semantic-pipe stdout endpoint (D3 audit-first invariant, r49-r50-plan.md §1 D3 and §4.4). Composes the args blob at &_au_args_scratch (path_ptr @0, flag_bits @8, reserved 0 @16 -- see file header §DirListRecord shape), imprints \"ls\\0\" at &_au_op_name (little-endian byte pattern: 0x006C73 covers the first three bytes; lane 1 = 0 for the tail), then calls audit_begin(op_name, args). Negative-errno u64 return (bit 63 set) -> AU_ERR_BEGIN = LS_ERR_AUDIT (0xFFFFEB26); non-negative return -> stashed at _au_id + AU_OK. Two callee-save pushes (r12=path_ptr, r13=flag_bits) + sub rsp,8 pad -> 24 bytes; entry rsp % 16 == 8; 8 + 24 = 32; 32 % 16 == 0 at the audit_begin call site. Matched add rsp,8 + 2 pops before every ret. r11 scratch for LEA staging. paideia-as conformance: no test mnemonic; largest cmp is `cmp rax, 0` for the negative-errno detector via jl (signed less-than); LS_ERR_AUDIT stages via mov rax, imm64. Effects {mem, sysreg} @{cap} match audit_begin's declared effects (mem for the .bss stores + args-blob read, sysreg for the SYSCALL clobber inside libpdx-audit's sys_ipc_send, cap for the svc.audit-journal endpoint lookup). Labels prefixed aulb_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                              // rsp % 16 == 0 for nested call
+
+        mov r12, rdi;                            // r12 = path_ptr
+        mov r13, rsi;                            // r13 = flag_bits
+
+        // ---- (1) Imprint "ls\0" at _au_op_name -----------------------
+        //
+        // Bytes 0x6C 0x73 0x00 -> little-endian qword 0x00000000_00007322
+        // (wait: 'l'=0x6C, 's'=0x73, so LE qword low nibble = 0x0073_6C = "l" "s" "\0" ...)
+        // 'l'=0x6C at byte 0; 's'=0x73 at byte 1; NUL at byte 2 ->
+        // qword value (LE) = 0x00_00_00_00_00_00_73_6C = 0x736C.
+        lea r11, [rip + _au_op_name];
+        mov rax, 0x736C;                         // "ls\0" + zero pad
+        mov [r11], rax;
+        xor rax, rax;
+        mov [r11 + 8], rax;                      // zero the second lane
+
+        // ---- (2) Compose args blob ------------------------------------
+        lea r11, [rip + _au_args_scratch];
+        mov [r11 + 0], r12;                      // args[0] = path_ptr
+        mov [r11 + 8], r13;                      // args[8] = flag_bits
+        xor rax, rax;
+        mov [r11 + 16], rax;                     // args[16] = 0 (reserved)
+
+        // ---- (3) Call audit_begin(op_name_ptr, args_ptr) --------------
+        lea r11, [rip + _au_op_name];
+        mov rdi, r11;                            // op_name_ptr
+        lea r11, [rip + _au_args_scratch];
+        mov rsi, r11;                            // args_ptr
+        call audit_begin;
+
+        // ---- Negative-errno detector (bit 63 set) ---------------------
+        cmp rax, 0;
+        jl  aulb_begin_fail;
+
+        // ---- (4) Stash audit_id + return AU_OK ------------------------
+        lea r11, [rip + _au_id];
+        mov [r11], rax;
+
+        xor rax, rax;                            // AU_OK
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      aulb_begin_fail:
+        // Zero _au_id (defence-in-depth so a caller that ignores the
+        // return code cannot spuriously commit a stale id).
+        lea r11, [rip + _au_id];
+        xor rax, rax;
+        mov [r11], rax;
+
+        mov rax, 0xFFFFEB26;                     // AU_ERR_BEGIN
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // audit_ls_commit(exit_code) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem, sysreg} @{cap}
+  //   RDI (input): exit_code -- the tool's return code (usually
+  //                             LS_OK or one of LS_ERR_*)
+  //   RAX (output): AU_OK (0). Library-side errors are ignored --
+  //                 the tool's own exit_code is authoritative; a
+  //                 failed commit is logged into the library's own
+  //                 counter table (libpdx-audit's future stats slot)
+  //                 and not surfaced to the tool.
+  //
+  // Sequence:
+  //   (1) Load _au_id. If zero, return AU_OK without calling the
+  //       library -- no audit is in flight (path that bailed before
+  //       audit_ls_begin ran).
+  //   (2) Call audit_commit(audit_id, exit_code). Ignore rax.
+  //   (3) Clear _au_id back to 0 so a subsequent commit call on the
+  //       same process is a no-op.
+  //   (4) Return AU_OK.
+  //
+  // Register plan (non-leaf; one callee-save push):
+  //   r12 = exit_code (survives across audit_commit call)
+  //   r11 = LEA scratch
+  //   rdi/rsi = arg marshalling
+  //   rax = return
+  // ==========================================================================
+  pub let audit_ls_commit : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (exit_code: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "ls.M3-003 (#10): close the DirListRecord audit frame opened by audit_ls_begin. Gates on _au_id != 0 so a path that bailed BEFORE audit_ls_begin (LS_ERR_BAD_PATH before the audit_ls_begin call in Runner) is safe: no audit was opened, no commit is issued, return AU_OK. On a real commit path, calls audit_commit(_au_id, exit_code) then clears _au_id back to 0. Library return is IGNORED -- the tool's own exit_code is authoritative; a failed commit inside libpdx-audit lands in that library's stats table (libpdx-audit.M1-001 owns that counter), not surfaced up to the tool. This preserves the invariant that a Runner return code is exactly one of the LS_* sentinels declared in Ls's error band. One callee-save push (r12=exit_code) -> 8 bytes; entry rsp % 16 == 8; 8 + 8 = 16; 16 % 16 == 0 at the audit_commit call site. Matched pop before ret. paideia-as conformance: no test mnemonic; only `cmp rax, 0` compare. Effects {mem, sysreg} @{cap} match audit_commit's declared tail. Labels prefixed aulc_.",
+      block: {
+        push r12;
+        mov r12, rdi;                            // r12 = exit_code
+
+        // ---- (1) Load _au_id; zero -> AU_OK (no audit in flight) ------
+        lea r11, [rip + _au_id];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  aulc_no_audit;
+
+        // ---- (2) Call audit_commit(audit_id, exit_code) ---------------
+        mov rdi, rax;                            // audit_id
+        mov rsi, r12;                            // exit_code
+        call audit_commit;
+
+        // ---- (3) Clear _au_id -----------------------------------------
+        lea r11, [rip + _au_id];
+        xor rax, rax;
+        mov [r11], rax;
+
+      aulc_no_audit:
+        // ---- (4) Return AU_OK -----------------------------------------
+        xor rax, rax;
+        pop r12;
+        ret
+      }
+    }
+}

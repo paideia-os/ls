@@ -1,16 +1,18 @@
 # ls — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M3 (semantic-pipe / audit integration) — IN
-FLIGHT. M2 shipped four rendering primitives; M3-001 flipped
-`Runner::runner_ls` from `LS_RUN_STUB` to a real iteration body
-against the R42-PREP-008 substrate (sysno 71 sys_pdxfs_open + sysno
-72 sys_pdxfs_dir_readnext + KIND_TTY 0x197) and wired the schema-
-bound `PdxFsDirEntry[]` emission on the stdout endpoint. M3-002
-extended the emitted record from 128 to 144 bytes, appending an
-owner Cap wire `(kind=KIND_USER, target_ptr=user_row)` — the D2
-literal owner-as-cap-ref shape at the schema level. M3-003
-(`DirListRecord` via libpdx-audit before first byte) lands next.
+**Current milestone:** M3 (semantic-pipe / audit integration) —
+CLOSED. M3-001 flipped `Runner::runner_ls` from `LS_RUN_STUB` to a
+real iteration body against the R42-PREP-008 substrate (sysno 71
+sys_pdxfs_open + sysno 72 sys_pdxfs_dir_readnext + KIND_TTY 0x197)
+and wired the schema-bound `PdxFsDirEntry[]` emission on the stdout
+endpoint. M3-002 extended the emitted record from 128 to 144 bytes,
+appending an owner Cap wire `(kind=KIND_USER, target_ptr=user_row)`
+— the D2 literal owner-as-cap-ref shape at the schema level. M3-003
+wrapped the whole Runner body in a libpdx-audit begin/commit pair
+(`DirListRecord` frame) so the D3 audit-first invariant holds: no
+user-visible byte on KIND_TTY or the stdout endpoint escapes before
+the audit frame is open. M4 (correctness matrix) is next.
 
 ## Milestone rollup
 
@@ -25,7 +27,7 @@ literal owner-as-cap-ref shape at the schema level. M3-003
 | M2-004 (#7)     | coloring driven by declared schema/MIME (not POSIX bits)       | LANDED |
 | M3-001 (#8)     | PdxFsDirEntry[] schema bind + emit on stdout                   | LANDED |
 | M3-002 (#9)     | owner field emits as cap ref, not text uid (D2 literal)        | LANDED |
-| M3-003 (#10)    | DirListRecord via libpdx-audit before first byte               | OPEN   |
+| M3-003 (#10)    | DirListRecord via libpdx-audit before first byte               | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -69,7 +71,12 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
 - `src/semantic_emit.pdx` — `SemanticEmit` module (schema-bound
   PdxFsDirEntry emission on the stdout KIND_IPC_ENDPOINT via
   libpdx-semantic-pipe::Binding + Send). M3-001 (128-byte kernel
-  record).
+  record) + M3-002 (144-byte record: kernel prefix + 16-byte owner
+  Cap wire).
+- `src/audit_shim.pdx` — `AuditShim` module (`audit_ls_begin` +
+  `audit_ls_commit` wrappers around libpdx-audit's three-call API;
+  DirListRecord frame open before any user-visible byte, close in
+  the shared Runner epilogue). M3-003.
 - `caps.decl` — the four caps ls receives at exec (KIND_USER,
   KIND_TTY, KIND_PDXFS_FILE, KIND_IPC_ENDPOINT).
 - `tests/` — empty until `ls.M4-001` lands the fixture matrix.
