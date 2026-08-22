@@ -1,15 +1,19 @@
 # ls — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M4 (tests + smoke matrix) — IN PROGRESS.
+**Current milestone:** M4 (tests + smoke matrix) — CLOSED.
 M4-001 landed `tests/color_fixtures.pdx` (10 dispatch + 3 SGR
 goldens). M4-002 landed `tests/owner_fixtures.pdx` (7 row + 2
-wire-cap cases). M4-003 landed `src/exit_map.pdx` — the ls
-sub-band → I4 exit-code mapping (0/2/3/4) reachable from both
-the M4 fixture and the eventual R14b `_start` frame — plus
-`tests/exit_matrix.pdx` with 13 cases covering every 0xFFFFEBxx
-sentinel Ls declares; the "empty=0 / missing=2 / cap-denied=4"
-line from issue #13 is cases 0, 7, 8 respectively. M4-004 follows.
+wire-cap cases). M4-003 landed `src/exit_map.pdx` + `tests/
+exit_matrix.pdx` (13 cases, the "empty=0/missing=2/cap-denied=4"
+line pinned as cases 0/7/8). M4-004 landed
+`tests/schema_golden.pdx` with two golden verifiers: the M3-001
+schema-hash imprint stub (via `SemanticEmit::sem_emit_reset`) and
+the 144-byte wire body (via a new `SemanticEmit::sem_emit_wire
+_compose` — the compose-only sibling of `sem_emit_entry` added at
+M4-004 so the wire spec is testable without a live libpdx-
+semantic-pipe substrate). M5 (signed release + `.pdxdoc` + mirror
+push) is next.
 
 ## Milestone rollup
 
@@ -28,6 +32,7 @@ line from issue #13 is cases 0, 7, 8 respectively. M4-004 follows.
 | M4-001 (#11)    | coloring test against known-schema fixture corpus              | LANDED |
 | M4-002 (#12)    | owner-render correctness for multi-user quota subtree          | LANDED |
 | M4-003 (#13)    | exit-code matrix (empty=0, missing=2, cap-denied=4)            | LANDED |
+| M4-004 (#14)    | --schema output validates against libpdx-semantic-pipe golden  | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -72,7 +77,8 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   PdxFsDirEntry emission on the stdout KIND_IPC_ENDPOINT via
   libpdx-semantic-pipe::Binding + Send). M3-001 (128-byte kernel
   record) + M3-002 (144-byte record: kernel prefix + 16-byte owner
-  Cap wire).
+  Cap wire) + M4-004 (`sem_emit_wire_compose` — compose-only
+  sibling of `sem_emit_entry` for the schema-golden fixture).
 - `src/audit_shim.pdx` — `AuditShim` module (`audit_ls_begin` +
   `audit_ls_commit` wrappers around libpdx-audit's three-call API;
   DirListRecord frame open before any user-visible byte, close in
@@ -86,6 +92,8 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   7 quota-subtree row cases + 2 wire-cap cases for `OwnerCol`.
 - `tests/exit_matrix.pdx` — `ExitMatrix` module (M4-003):
   13 cases covering every 0xFFFFEBxx sentinel via `ExitMap`.
+- `tests/schema_golden.pdx` — `SchemaGolden` module (M4-004):
+  hash-imprint + 144-byte wire-body goldens for `SemanticEmit`.
 - `src/exit_map.pdx` — `ExitMap` module (M4-003): pins the ls
   sub-band → I4 exit-code mapping (0 / 2 / 3 / 4). Used by the
   M4-003 fixture and by the eventual R14b `_start` frame.

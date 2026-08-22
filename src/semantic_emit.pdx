@@ -1,4 +1,5 @@
-// src/semantic_emit.pdx -- ls.M3-001 + ls.M3-002 (paideia-os/ls#8 + #9)
+// src/semantic_emit.pdx -- ls.M3-001 + ls.M3-002 + ls.M4-004
+//                          (paideia-os/ls#8 + #9 + #14)
 //
 // SemanticEmit module: schema-bind + per-entry PdxFsDirEntry record
 // emission on ls's stdout KIND_IPC_ENDPOINT.
@@ -379,6 +380,118 @@ module SemanticEmit = structure {
       seme_send_fail:
         mov rax, 0xFFFFEB25;                     // SE_ERR_SEND
         pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sem_emit_wire_compose(kernel_entry_ptr) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI (input): kernel_entry_ptr -- 128-byte kernel-visible
+  //                                     PdxFsDirEntry
+  //   RAX (output): SE_WIRE_RECORD_SIZE (144) -- the number of wire
+  //                 bytes composed into _se_wire_scratch. On any
+  //                 defensive refusal (kernel_entry_ptr == 0),
+  //                 returns 0 without touching the scratch.
+  //
+  // sem_emit_wire_compose runs the same compose logic as sem_emit_
+  // entry steps (1) + (2) -- copy the 128-byte kernel record, append
+  // the 16-byte owner Cap wire -- but SKIPS step (3) (Send::send_
+  // record). Callers get the byte-exact wire body inside _se_wire_
+  // scratch and can compare against a golden without needing a live
+  // libpdx-semantic-pipe substrate.
+  //
+  // This is the M4-004 hook: the schema-golden fixture at tests/
+  // schema_golden.pdx invokes this with a canned kernel entry, then
+  // walks _se_wire_scratch byte-by-byte against the expected 144-byte
+  // wire golden. If the compose logic ever drifts from the record
+  // shape declared in the file header §Wire Record Shape, the
+  // fixture's byte-diff surfaces the drift at M4 rather than at M5
+  // (when a live-substrate run would surface it as a receiver-side
+  // schema mismatch).
+  //
+  // Design decision: this helper duplicates the copy+append body from
+  // sem_emit_entry rather than being extracted-and-shared. Two reasons:
+  // (a) the loop shape at the call site is tiny (~30 instructions);
+  // sharing would require an intermediate function-call boundary that
+  // changes the register plan (rax survives the copy vs sem_emit_entry
+  // where rax is the send return). (b) sem_emit_entry is the M3
+  // hot path; keeping it a straight-line body (no extra call) is worth
+  // duplicating twenty instructions.
+  //
+  // Register plan (non-leaf; two callee-save pushes for pipeline
+  // stability across the compose):
+  //   r12 = kernel_entry_ptr (survives the copy loop)
+  //   r13 = wire scratch base (LEA once, reused across owner append)
+  //   rcx = copy loop counter
+  //   rax = load byte / return value
+  //   r10, r11 = address-holder scratch (byte + qword store addressing)
+  //
+  // Alignment: 2 pushes + sub rsp,8 pad = 24 bytes; entry rsp % 16 ==
+  // 8; 8 + 24 = 32; 32 % 16 == 0. Function has NO nested calls, so
+  // the alignment discipline is trivially satisfied -- but we keep
+  // the sub rsp,8 for parity with sem_emit_entry so a future
+  // refactor that adds a call site inherits alignment for free.
+  // ==========================================================================
+  pub let sem_emit_wire_compose : (u64) -> u64 !{mem} @{} =
+    fn (kernel_entry_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-004 (#14): the compose-only sibling of sem_emit_entry, exposing the same 128-byte kernel-record copy + 16-byte owner Cap wire append into _se_wire_scratch WITHOUT the Send::send_record tail call. Callers (the schema-golden fixture at tests/schema_golden.pdx) get byte-exact wire bytes in _se_wire_scratch to diff against a golden, with no dependency on a live libpdx-semantic-pipe substrate. Defensive gate: kernel_entry_ptr == 0 returns 0 (bytes composed) without touching the scratch -- a broken caller sees a zero return, not garbage in _se_wire_scratch. Byte-by-byte copy loop follows the #1248 mitigation (xor rax, rax; mov_b rax, [src]; mov_b [dst], rax) identical to sem_emit_entry's copy body. Owner Cap wire append: qword stores at scratch[128] = SE_OWNER_KIND_USER (0x190), scratch[136] = 0 (placeholder user_row, concretises when PdxFsDirEntry grows an owner field). Two callee-save pushes (r12=kernel_entry_ptr, r13=wire scratch base) + sub rsp,8 pad = 24 bytes; entry rsp % 16 == 8; 8 + 24 = 32; 32 % 16 == 0. No nested calls so alignment is trivial, but the sub rsp,8 stays for parity with sem_emit_entry (a future refactor that adds a call site inherits alignment). Return value SE_WIRE_RECORD_SIZE (144) matches the number of wire bytes populated. paideia-as conformance: r11 + r10 as address scratch; no test mnemonic; largest cmp immediate 128 (SE_KERNEL_ENTRY_SIZE); the 0x190 owner-kind constant is a `mov rax, imm32` store, not a compare. Effects {mem} only (no send_record, no cap invoke). Labels prefixed semc_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        // Defensive gate.
+        cmp rdi, 0;
+        je  semc_bad;
+
+        mov r12, rdi;                            // r12 = kernel_entry_ptr
+        lea r13, [rip + _se_wire_scratch];       // r13 = &_se_wire_scratch
+
+        // ---- (1) byte-by-byte copy kernel_entry[0..128] -> scratch --
+        xor rcx, rcx;
+
+      semc_copy_head:
+        cmp rcx, 128;                            // SE_KERNEL_ENTRY_SIZE
+        jae semc_copy_done;
+
+        mov r11, r12;
+        add r11, rcx;
+        xor rax, rax;                            // #1248 mitigation
+        mov_b rax, [r11];
+
+        mov r10, r13;
+        add r10, rcx;
+        mov_b [r10], rax;
+
+        add rcx, 1;
+        jmp semc_copy_head;
+
+      semc_copy_done:
+        // ---- (2) append owner Cap wire at scratch[128..144] ---------
+        mov r11, r13;
+        add r11, 128;
+        mov rax, 0x190;                          // SE_OWNER_KIND_USER
+        mov [r11], rax;
+
+        mov r11, r13;
+        add r11, 136;
+        xor rax, rax;                            // placeholder user_row
+        mov [r11], rax;
+
+        mov rax, 144;                            // SE_WIRE_RECORD_SIZE
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      semc_bad:
+        xor rax, rax;
+        add rsp, 8;
         pop r13;
         pop r12;
         ret

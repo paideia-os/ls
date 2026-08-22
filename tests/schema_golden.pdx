@@ -1,0 +1,426 @@
+// tests/schema_golden.pdx -- ls.M4-004 (paideia-os/ls#14)
+//
+// SchemaGolden module: validates ls's `--schema` output shape against
+// the libpdx-semantic-pipe golden -- specifically the 32-byte schema
+// hash stub imprinted by SemanticEmit::sem_emit_reset and the 144-byte
+// wire body composed by SemanticEmit::sem_emit_wire_compose (the M4
+// compose-only sibling of sem_emit_entry added at ls.M4-004).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// FIXTURE module. Two sub-matrices exercised through a single case
+// index:
+//
+//   Case 0: schema-hash imprint.
+//     Call sem_emit_reset. Read _se_pdxfsdirentry_hash (4 u64 lanes)
+//     and compare against _sg_hash_golden. First lane mismatch ->
+//     SG_ERR_HASH + lane_idx.
+//
+//   Case 1: wire-record composition.
+//     Call sem_emit_wire_compose(&_sg_kernel_input). Assert return ==
+//     SE_WIRE_RECORD_SIZE (144). Read _se_wire_scratch (18 u64 lanes)
+//     and compare against _sg_wire_golden. First lane mismatch ->
+//     SG_ERR_WIRE + lane_idx.
+//
+// The two cases together prove:
+//   (a) The schema id imprinted is the M3-001 stub (first byte 0x01,
+//       rest zero) so a downstream libpdx-semantic-pipe Recv with the
+//       same imprint round-trips.
+//   (b) The 144-byte wire body composed by sem_emit_wire_compose has
+//       byte-exact the shape declared in semantic_emit.pdx §Wire
+//       Record Shape: 128 kernel bytes copied verbatim + 16 owner
+//       Cap wire (KIND_USER at offset 128, target_ptr = 0 at offset
+//       136).
+//
+// A live-substrate M5 harness will exercise sem_emit_entry end-to-end
+// (bind + send + recv) but does NOT need to re-derive these two
+// invariants -- they are pinned here at M4 and stable across the
+// send/recv round-trip.
+//
+// =============================================================================
+// CANNED KERNEL ENTRY (128 BYTES)
+// =============================================================================
+//
+// Fields (kernel PdxFsDirEntry per paideia-os pdxfs_dir_iter.pdx §1):
+//
+//   [0..8]     inode      = 42
+//   [8..16]    kind       = 8 (PDXFS_ENT_KIND_FILE per M3-001 mirror)
+//   [16..24]   name_len   = 5
+//   [24..128]  name[104]  = "hello" then zero-padded
+//
+// In u64 lanes (16 lanes total):
+//   lane 0 = 42
+//   lane 1 = 8
+//   lane 2 = 5
+//   lane 3 = "hello\0\0\0" LE-packed = 0x0000006F6C6C6568
+//     (bytes 'h'=0x68, 'e'=0x65, 'l'=0x6C, 'l'=0x6C, 'o'=0x6F)
+//   lane 4..15 = 0
+//
+// =============================================================================
+// EXPECTED WIRE GOLDEN (144 BYTES = 18 U64 LANES)
+// =============================================================================
+//
+// The 144-byte body is identical to the 128-byte kernel entry (lanes
+// 0..15) plus a 16-byte owner Cap wire (lanes 16..17):
+//
+//   lanes 0..15 == _sg_kernel_input lanes 0..15
+//   lane 16     = 0x190 (SE_OWNER_KIND_USER, at wire offset 128)
+//   lane 17     = 0     (placeholder user_row, at wire offset 136)
+//
+// =============================================================================
+// SCHEMA HASH GOLDEN (32 BYTES = 4 U64 LANES)
+// =============================================================================
+//
+// The M3-001 stub: first byte 0x01, remaining 31 bytes zero.
+//
+//   lane 0 = 1  (LE: byte 0 = 0x01; bytes 1..7 = 0)
+//   lane 1 = 0
+//   lane 2 = 0
+//   lane 3 = 0
+//
+// This matches sem_emit_reset's imprint exactly. When libpdx-schema-
+// registry.M1 ships (R51+), sem_emit_reset will overwrite the .bss
+// with a real BLAKE3-truncated hash; the golden here is bumped in
+// lock-step (a single .rodata edit) and the fixture continues to
+// pin the hash imprint invariant.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`SchemaGolden`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates:
+//     144 (SE_WIRE_RECORD_SIZE compare), 4 (hash lane count), 18
+//     (wire lane count). The 0xFFFFEBxx sentinels are `mov rax,
+//     imm64` stores.
+//   - No byte reads (all diffs are qword-wide because the .bss +
+//     goldens are 8-aligned).
+//   - r10 / r11 are scratch.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   sem_emit_reset            -- SemanticEmit (src/semantic_emit.pdx)
+//   sem_emit_wire_compose     -- SemanticEmit (src/semantic_emit.pdx)
+//
+// Read (via lea):
+//   _se_pdxfsdirentry_hash    -- SemanticEmit .bss
+//   _se_wire_scratch          -- SemanticEmit .bss
+
+module SchemaGolden = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let SG_OK               : u64 = 0
+  pub let SG_ERR_HASH_LEN     : u64 = 0xFFFFEBE0
+  pub let SG_ERR_HASH         : u64 = 0xFFFFEBE1    // + lane_idx (0..3)
+  pub let SG_ERR_WIRE_LEN     : u64 = 0xFFFFEBE5
+  pub let SG_ERR_WIRE         : u64 = 0xFFFFEBE6    // + lane_idx (0..17)
+  pub let SG_ERR_COMPOSE      : u64 = 0xFFFFEBEE
+  pub let SG_ERR_BAD_CASE_IDX : u64 = 0xFFFFEBEF
+
+  pub let SG_CASE_COUNT       : u64 = 2
+
+  // ==========================================================================
+  // Canned kernel-entry input (128 bytes = 16 u64 lanes).
+  // ==========================================================================
+  pub let _sg_kernel_input : [u64; 16] = [
+      42,                                        // lane 0: inode
+      8,                                         // lane 1: kind (FILE)
+      5,                                         // lane 2: name_len
+      0x0000006F6C6C6568,                        // lane 3: "hello\0\0\0" LE
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0        // lanes 4..15: zero
+  ]
+
+  // ==========================================================================
+  // Wire-body golden (144 bytes = 18 u64 lanes).
+  // ==========================================================================
+  pub let _sg_wire_golden : [u64; 18] = [
+      // lanes 0..15: identical to _sg_kernel_input
+      42,
+      8,
+      5,
+      0x0000006F6C6C6568,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      // lane 16: owner_kind = KIND_USER (0x190) at wire offset 128
+      0x190,
+      // lane 17: owner_target_ptr = 0 (placeholder user_row) at 136
+      0
+  ]
+
+  // ==========================================================================
+  // Schema-hash golden (32 bytes = 4 u64 lanes).
+  //
+  // Byte 0 = 0x01, rest zero -- matches sem_emit_reset's imprint.
+  // ==========================================================================
+  pub let _sg_hash_golden : [u64; 4] = [ 1, 0, 0, 0 ]
+
+  // ==========================================================================
+  // schema_golden_case_count() -> u64
+  //
+  // Leaf.
+  // ==========================================================================
+  pub let schema_golden_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.M4-004 (#14): return SG_CASE_COUNT (2 cases: hash-imprint + wire-body). Leaf pure function. paideia-as: no test; no cmp. Labels prefixed sgcc_.",
+      block: {
+        mov rax, 2;                              // SG_CASE_COUNT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // schema_golden_run_hash() -> u64
+  //
+  // Signature: () -> u64 !{mem} @{}
+  //   RAX: 0 on pass; SG_ERR_HASH + lane_idx on lane mismatch.
+  //
+  // Sequence:
+  //   (1) Call sem_emit_reset (imprints _se_pdxfsdirentry_hash).
+  //   (2) Loop lane_idx 0..3; compare _se_pdxfsdirentry_hash[lane_idx]
+  //       against _sg_hash_golden[lane_idx]. First mismatch ->
+  //       SG_ERR_HASH + lane_idx.
+  //
+  // Register plan (non-leaf; four callee-save pushes for pipeline
+  // stability across the sem_emit_reset call):
+  //   rbx = lane_idx (0..3)
+  //   r12 = actual base (LEA _se_pdxfsdirentry_hash)
+  //   r13 = golden base (LEA _sg_hash_golden)
+  //   r14 = lane cap (4)
+  //
+  // Alignment: 4 pushes = 32 bytes; entry rsp % 16 == 8; 8 + 32 = 40;
+  // 40 % 16 == 8. Need pad. sub rsp,8 = 40 + 8 = 48; aligned.
+  // ==========================================================================
+  pub let schema_golden_run_hash : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-004 (#14): schema-hash imprint verifier. Call sem_emit_reset (populates _se_pdxfsdirentry_hash with first-byte-0x01 stub), then walk 4 u64 lanes comparing _se_pdxfsdirentry_hash[i] against _sg_hash_golden[i] (which encodes lane 0 = 1, lanes 1..3 = 0 -- byte-exact the LE representation of the stub). First mismatch -> SG_ERR_HASH (0xFFFFEBE1) + lane_idx. Four callee-save pushes (rbx=lane_idx, r12=actual base, r13=golden base, r14=lane cap) + sub rsp,8 pad = 40; entry rsp % 16 == 8; 8 + 40 = 48; aligned at sem_emit_reset call site. Matched add rsp,8 + 4 pops. Qword-wide diff (both actual and golden are 8-aligned in their respective .bss / .rodata regions) so no byte-load per iteration -- one qword compare per lane. paideia-as: no test; largest cmp immediate 4 (lane cap); SG_ERR_HASH sentinel is mov rax, imm64. Labels prefixed sgrh_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        // Call sem_emit_reset (no args).
+        call sem_emit_reset;
+
+        // Set up loop bases.
+        lea r12, [rip + _se_pdxfsdirentry_hash];
+        lea r13, [rip + _sg_hash_golden];
+        mov r14, 4;                              // lane cap
+        xor rbx, rbx;
+
+      sgrh_loop:
+        cmp rbx, r14;
+        jae sgrh_ok;
+
+        // Compare qword-by-qword.
+        mov rax, [r12 + rbx * 8];
+        mov r10, [r13 + rbx * 8];
+        cmp rax, r10;
+        jne sgrh_hash_fail;
+
+        add rbx, 1;
+        jmp sgrh_loop;
+
+      sgrh_ok:
+        xor rax, rax;
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sgrh_hash_fail:
+        mov rax, 0xFFFFEBE1;                     // SG_ERR_HASH
+        add rax, rbx;
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // schema_golden_run_wire() -> u64
+  //
+  // Signature: () -> u64 !{mem} @{}
+  //   RAX: 0 on pass; SG_ERR_COMPOSE / SG_ERR_WIRE + lane_idx on fail.
+  //
+  // Sequence:
+  //   (1) Call sem_emit_wire_compose(&_sg_kernel_input). Assert
+  //       return == 144 (SE_WIRE_RECORD_SIZE) -> SG_ERR_COMPOSE
+  //       otherwise.
+  //   (2) Loop lane_idx 0..17; compare _se_wire_scratch[lane_idx]
+  //       against _sg_wire_golden[lane_idx]. First mismatch ->
+  //       SG_ERR_WIRE + lane_idx.
+  //
+  // Register plan (non-leaf; four callee-save pushes for pipeline
+  // stability across the sem_emit_wire_compose call):
+  //   rbx = lane_idx
+  //   r12 = actual base (_se_wire_scratch)
+  //   r13 = golden base (_sg_wire_golden)
+  //   r14 = lane cap (18)
+  //
+  // Alignment: 4 pushes + sub rsp,8 pad = 40; aligned at compose site.
+  // ==========================================================================
+  pub let schema_golden_run_wire : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-004 (#14): wire-body golden verifier. Call sem_emit_wire_compose(&_sg_kernel_input) which populates _se_wire_scratch with the 144-byte wire body (128 kernel copy + 16 owner Cap wire) WITHOUT the Send::send_record tail -- no live substrate needed. Return must be 144 (SE_WIRE_RECORD_SIZE); anything else -> SG_ERR_COMPOSE. Then walk 18 u64 lanes comparing _se_wire_scratch[i] against _sg_wire_golden[i]. Lanes 0..15 must be identical to the kernel input (verbatim copy); lane 16 must be 0x190 (SE_OWNER_KIND_USER); lane 17 must be 0 (placeholder user_row). First mismatch -> SG_ERR_WIRE (0xFFFFEBE6) + lane_idx. Four callee-save pushes (rbx=lane_idx, r12=actual base, r13=golden base, r14=lane cap) + sub rsp,8 pad = 40; entry rsp %16==8; 8+40=48; aligned at sem_emit_wire_compose call site. paideia-as: no test; largest cmp immediate 144 (wire len) or 18 (lane cap); sentinels are mov rax, imm64. Labels prefixed sgrw_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        // Call sem_emit_wire_compose(&_sg_kernel_input).
+        lea r11, [rip + _sg_kernel_input];
+        mov rdi, r11;
+        call sem_emit_wire_compose;
+
+        // Return must be 144.
+        cmp rax, 144;                            // SE_WIRE_RECORD_SIZE
+        jne sgrw_compose_fail;
+
+        // Set up loop bases.
+        lea r12, [rip + _se_wire_scratch];
+        lea r13, [rip + _sg_wire_golden];
+        mov r14, 18;                             // lane cap
+        xor rbx, rbx;
+
+      sgrw_loop:
+        cmp rbx, r14;
+        jae sgrw_ok;
+
+        mov rax, [r12 + rbx * 8];
+        mov r10, [r13 + rbx * 8];
+        cmp rax, r10;
+        jne sgrw_wire_fail;
+
+        add rbx, 1;
+        jmp sgrw_loop;
+
+      sgrw_ok:
+        xor rax, rax;
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sgrw_compose_fail:
+        mov rax, 0xFFFFEBEE;                     // SG_ERR_COMPOSE
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sgrw_wire_fail:
+        mov rax, 0xFFFFEBE6;                     // SG_ERR_WIRE
+        add rax, rbx;
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // schema_golden_run(case_idx) -> u64
+  //
+  //   0 -> schema_golden_run_hash
+  //   1 -> schema_golden_run_wire
+  //
+  // Register plan (non-leaf; one callee-save push for alignment):
+  //   rbx = case_idx (survives across the sub-call for the error math)
+  //
+  // Alignment: 1 push = 8 bytes; entry rsp %16==8; 8+8=16; aligned.
+  // ==========================================================================
+  pub let schema_golden_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-004 (#14): case dispatcher. 0 -> schema_golden_run_hash, 1 -> schema_golden_run_wire. Bounds check case_idx >= 2 -> SG_ERR_BAD_CASE_IDX. One callee-save push (rbx=case_idx); aligned trivially. paideia-as: no test; cmp against 2 fits imm32. Labels prefixed sgr_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+
+        cmp rbx, 2;                              // SG_CASE_COUNT
+        jae sgr_bad_idx;
+
+        cmp rbx, 0;
+        je  sgr_hash;
+
+      sgr_wire:
+        call schema_golden_run_wire;
+        pop rbx;
+        ret;
+
+      sgr_hash:
+        call schema_golden_run_hash;
+        pop rbx;
+        ret;
+
+      sgr_bad_idx:
+        mov rax, 0xFFFFEBEF;                     // SG_ERR_BAD_CASE_IDX
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // schema_golden_verify_all() -> u64
+  //
+  // Walk case_idx 0..1; first non-zero propagates.
+  // ==========================================================================
+  pub let schema_golden_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-004 (#14): fail-fast walk of both cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp %16==8; 8+24=32; aligned at schema_golden_run call site. paideia-as: no test; cmp against 2 fits imm32. Labels prefixed sgva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 2;                              // SG_CASE_COUNT
+
+      sgva_loop:
+        cmp rbx, r12;
+        jae sgva_ok;
+
+        mov rdi, rbx;
+        call schema_golden_run;
+        cmp rax, 0;
+        jne sgva_out;
+
+        add rbx, 1;
+        jmp sgva_loop;
+
+      sgva_ok:
+        xor rax, rax;
+      sgva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
