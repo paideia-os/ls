@@ -1,0 +1,431 @@
+// src/argv_surface.pdx -- ls.M1-002 (paideia-os/ls#2)
+//
+// ArgvSurface module: argv-facing wrapper around libpdx-argv::Parser.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The tool-side layer that consumes libpdx-argv's ParsedArgs record
+// and recognises the six ls-specific flags into a compact bit-field
+// plus a target-path pointer + a --color= value pointer. It exists
+// because libpdx-argv is a shared library that must not know any one
+// tool's flag vocabulary (else the argv library becomes an
+// nine-way-branched library, undoing the D3 "long flags primary"
+// invariant the plan doc establishes). Every R50 tool ships a
+// module of this shape; ls's happens to recognise
+//
+//   -l  -a  -h  --json  --schema  --color=<value>
+//
+// and, as an alias at M1, --pdx-schema (which libpdx-argv v0.1 already
+// hard-recognises via ParsedArgs::emit_schema).
+//
+// =============================================================================
+// FLOW OF argv_surface_parse(argv, argc)
+// =============================================================================
+//
+//   1. Bump LS_ST_INVOKES unconditionally (shell/line_reader precedent
+//      -- counts every attempt, not every success, so the counter
+//      records the failed-arg case too).
+//   2. Gate: argv == 0 || argc == 0 -> AS_ERR_BAD_ARGV.
+//   3. Reset our own .bss (_as_flag_bits, _as_path_ptr,
+//      _as_color_value_ptr) via argv_surface_reset.
+//   4. Reset libpdx-argv's ParsedArgs via ParsedArgs::reset (linked
+//      symbol name: parsed_args_reset).
+//   5. Drive the parse via Parser::parse_argv (linked symbol name:
+//      parse_argv). Non-zero return -> AS_ERR_PARSER_REJECT.
+//   6. Walk flag_names[0..flag_count]. For each entry:
+//      - byte1 == 0 -> single-char short flag. Dispatch by byte0:
+//        'l' -> AS_BIT_L; 'a' -> AS_BIT_A; 'h' -> AS_BIT_H;
+//        else -> AS_ERR_UNSUPPORTED_SHORT.
+//      - byte1 != 0 -> long flag. Dispatch by byte0:
+//        'j' -> match "json\0"    -> AS_BIT_JSON
+//        's' -> match "schema\0"  -> AS_BIT_SCHEMA
+//        'c' -> match "color\0"   -> AS_BIT_COLOR + capture value ptr
+//        'p' -> match "pdx-schema\0" -> AS_BIT_SCHEMA (M1 alias for
+//                                        libpdx-argv's built-in flag)
+//        else -> AS_ERR_UNKNOWN_FLAG.
+//        A byte-by-byte mismatch mid-compare also -> AS_ERR_UNKNOWN_FLAG.
+//   7. If pos_count > 0, store pos_ptrs[0] in _as_path_ptr.
+//      Positionals beyond [0] are ignored at M1 (multi-path listing
+//      lands at ls.M4 correctness matrix per r49-r50-plan.md §5.4).
+//   8. Bump LS_ST_OKS. Return AS_OK.
+//
+// =============================================================================
+// WHY --pdx-schema IS AN ALIAS AT M1
+// =============================================================================
+//
+// libpdx-argv v0.1 hard-recognises --pdx-schema in its Parser (see
+// libpdx-argv/src/parser.pdx) and sets ParsedArgs::emit_schema = 1 in
+// addition to storing "pdx-schema" as an ordinary long flag in
+// flag_names[]. Ls treats it as a synonym of its own --schema flag,
+// setting AS_BIT_SCHEMA when the walk hits the flag_names entry. This
+// gives every tool one uniform way to ask for a schema dump -- the
+// argv record and the tool agree on the semantics without a tool-side
+// branch on ParsedArgs::emit_schema. The standard 9-flag vocabulary
+// (--help, --version, --schema, --json, --color=, --dry-run,
+// --verbose, --quiet, --no-cap:<name>) lands with libpdx-argv M2 per
+// r49-r50-plan.md §5.12; ls inherits that centralised recognition at
+// ls.M2 and retires the local pdx-schema alias then.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ArgvSurface`), no directory
+//     prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. All immediate
+//     compares in this module are ASCII byte values (<= 0x7F) or the
+//     zero-slot check (0).
+//   - Byte reads always preceded by `xor rax, rax; mov_b rax, [ptr]`
+//     (#1248 mitigation).
+//   - r11 is scratch (paideia-as-reserved) and appears in every
+//     `lea r11, [rip + sym]` .bss reach. r10 is scratch for the
+//     current-flag-name pointer inside the walk.
+//   - argv_surface_reset is a LEAF function. argv_surface_parse is
+//     NON-LEAF (calls ls_note + argv_surface_reset + parsed_args_reset
+//     + parse_argv). Two callee-save pushes (r12=argv, r13=argc)
+//     preserve the args across the pre-parse call chain; after
+//     parse_argv returns the two regs are reused (r12 = loop index i,
+//     r13 = flag_count loop bound), which is safe because argv/argc
+//     are not read after parse_argv. `sub rsp, 8` on entry balances
+//     rsp % 16 to 0 for every nested call site; matched `add rsp, 8`
+//     before each ret.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Read (from libpdx-argv):
+//   flag_names, flag_values, flag_count, pos_ptrs, pos_count
+//   -- resolved by unqualified linker name (paideia-as toolchain
+//   convention; same pattern doc's DocDispatch uses to call
+//   PdxdocParser + DocRenderer in the doc repo).
+//
+// Called (from libpdx-argv):
+//   parsed_args_reset  -- ParsedArgs::reset
+//   parse_argv         -- Parser::parse_argv
+//
+// Called (from Ls in src/ls.pdx):
+//   ls_note            -- bounded counter bump
+
+module ArgvSurface = structure {
+
+  // ==========================================================================
+  // Recognised flag bits -- one per accepted flag. Public so Runner and
+  // Dispatch can test them without redeclaring the constants.
+  // ==========================================================================
+  pub let AS_BIT_L      : u64 = 0x1
+  pub let AS_BIT_A      : u64 = 0x2
+  pub let AS_BIT_H      : u64 = 0x4
+  pub let AS_BIT_JSON   : u64 = 0x8
+  pub let AS_BIT_SCHEMA : u64 = 0x10
+  pub let AS_BIT_COLOR  : u64 = 0x20
+
+  // ==========================================================================
+  // Parse-result .bss slots -- populated by argv_surface_parse, read
+  // by Runner::runner_ls + Dispatch::ls_dispatch. All three are 8-byte
+  // aligned so a scalar load has natural alignment on x86_64.
+  //
+  // _as_flag_bits        : OR of AS_BIT_* constants set during the walk.
+  // _as_path_ptr         : pos_ptrs[0] if pos_count > 0, else 0. The 0
+  //                        sentinel is the caller's cue to default the
+  //                        target path to ".".
+  // _as_color_value_ptr  : flag_values[i] for the --color=<value> entry,
+  //                        or 0 if --color was not seen. Interior into
+  //                        caller-owned argv memory (libpdx-argv's
+  //                        in-place NUL-termination on '=' semantics).
+  // ==========================================================================
+  pub let mut _as_flag_bits       : u64 = uninit @align(8)
+  pub let mut _as_path_ptr        : u64 = uninit @align(8)
+  pub let mut _as_color_value_ptr : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // argv_surface_reset() -> ()
+  //
+  // Zero the three .bss slots so argv_surface_parse starts from a
+  // known-clean state. Called by argv_surface_parse itself; also
+  // safe to call from a test harness before each fixture.
+  //
+  // Register plan (leaf):
+  //   r11 = scratch (LEA for each slot)
+  //   rax = zero constant
+  // ==========================================================================
+  pub let argv_surface_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M1-002 (#2): zero the ArgvSurface .bss singletons (_as_flag_bits, _as_path_ptr, _as_color_value_ptr) so argv_surface_parse starts from a known-clean state. Same shape as ParsedArgs::reset (libpdx-argv/src/parsed_args.pdx). Leaf function -- no callee-save touched. rax = 0 written via xor rax, rax (one byte cheaper than mov rax, 0). Labels prefixed as_rs_.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + _as_flag_bits];       mov [r11], rax;
+        lea r11, [rip + _as_path_ptr];        mov [r11], rax;
+        lea r11, [rip + _as_color_value_ptr]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // argv_surface_parse(argv, argc) -> u64
+  //
+  // Signature: argv_surface_parse : (u64, u64) -> u64 !{mem} @{}
+  //   RDI: argv (u64* array of NUL-terminated arg pointers, caller-owned)
+  //   RSI: argc (count of entries in argv)
+  //   RAX: one of AS_OK / AS_ERR_* (see design/architecture.md §6)
+  //
+  // See file-header FLOW section for the ordered flow. See "PAIDEIA-AS
+  // CONFORMANCE" for the stack + register discipline.
+  //
+  // Register plan (non-leaf, four call sites: ls_note, argv_surface_
+  // reset, parsed_args_reset, parse_argv):
+  //   r12 = argv (callee-save; preserved through the four pre-parse
+  //         calls; reused as loop index i after parse_argv returns)
+  //   r13 = argc (callee-save; preserved through the pre-parse chain;
+  //         reused as flag_count loop bound after parse_argv returns)
+  //   r10 = scratch (current flag-name pointer during walk; loop-bound
+  //         copy during .bss reads)
+  //   r11 = scratch (LEA base for every .bss reach)
+  //   rax = byte load / return value / value accumulator
+  //   rcx = byte1 discriminator (short vs long flag)
+  //   rdi = call arg (which for ls_note; argv for parse_argv)
+  //   rsi = call arg (argc for parse_argv)
+  //
+  // Push count: 2 callee-saves (r12, r13). Entry rsp % 16 == 8; after
+  // 2 pushes rsp % 16 == 8 (32 mod 16 == 0; 8 + 32 mod 16 == 8); so
+  // `sub rsp, 8` puts rsp % 16 == 0 for the four call sites.
+  // ==========================================================================
+  pub let argv_surface_parse : (u64, u64) -> u64 !{mem} @{} =
+    fn (argv: u64) (argc: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M1-002 (#2): the argv-facing wrapper around libpdx-argv::Parser. Bumps LS_ST_INVOKES unconditionally (shell/line_reader precedent). Gates argv != 0, argc != 0. Resets ArgvSurface .bss + libpdx-argv ParsedArgs. Drives Parser::parse_argv on the caller's argv. Walks flag_names[0..flag_count] and dispatches: short flag (byte1 == 0) accepts l/a/h; long flag dispatches by byte0 -- 'j'/'s'/'c'/'p' route to inline byte compares against 'json'/'schema'/'color'/'pdx-schema'. Any mismatch or unknown route -> AS_ERR_*. Positional[0] captured to _as_path_ptr (0 sentinel = default '.'). --color= additionally captures flag_values[i] to _as_color_value_ptr. On success bumps LS_ST_OKS and returns AS_OK (0xFFFFEB10). paideia-as conformance: no test mnemonic; every cmp reg, imm uses imm <= 0x7FFFFFFF (max seen 0x7F ASCII); byte reads always xor rax + mov_b; r11 scratch for every LEA; r10 scratch for the transient flag-name ptr. Non-leaf: two pushes r12+r13 + `sub rsp, 8` for 16B alignment across four nested call sites; matching `add rsp, 8` + two pops before every ret. After parse_argv returns r12/r13 are reused (r12=loop index, r13=flag_count) because argv/argc are not read again. Labels prefixed as_pa_.",
+      block: {
+        // ---- prologue --------------------------------------------------
+        push r12;
+        push r13;
+        sub rsp, 8;                        // align rsp % 16 for calls
+
+        mov r12, rdi;                      // r12 = argv
+        mov r13, rsi;                      // r13 = argc
+
+        // Bump LS_ST_INVOKES unconditionally (shell/line_reader idiom:
+        // count every attempt, including the failed-arg case).
+        mov rdi, 0;                        // LS_ST_INVOKES
+        call ls_note;
+
+        // ---- gates -----------------------------------------------------
+        cmp r12, 0;
+        je  as_pa_bad_argv;
+        cmp r13, 0;
+        je  as_pa_bad_argv;
+
+        // ---- reset both .bss singletons --------------------------------
+        call argv_surface_reset;
+        call parsed_args_reset;
+
+        // ---- drive the parse -------------------------------------------
+        mov rdi, r12;                      // argv
+        mov rsi, r13;                      // argc
+        call parse_argv;
+        cmp rax, 0;
+        jne as_pa_parser_reject;
+
+        // ---- walk flag_names[0..flag_count] ----------------------------
+        // Reuse r12 as i (argv no longer needed) and r13 as flag_count.
+        xor r12, r12;                      // i = 0
+        lea r11, [rip + flag_count];
+        mov r13, [r11];                    // r13 = flag_count
+
+      as_pa_walk_head:
+        cmp r12, r13;
+        jae as_pa_walk_done;
+
+        // r10 = flag_names[i]  (name ptr into caller-owned argv)
+        lea r11, [rip + flag_names];
+        mov r10, [r11 + r12 * 8];
+
+        // rax = byte0
+        xor rax, rax;
+        mov_b rax, [r10];
+
+        // rcx = byte1
+        xor rcx, rcx;
+        mov_b rcx, [r10 + 1];
+
+        // Discriminate: byte1 == 0 -> short; else long.
+        cmp rcx, 0;
+        jne as_pa_route_long;
+
+        // ---- short-flag dispatch: byte0 ∈ {l, a, h} ------------------
+        cmp rax, 0x6C;                    // 'l'
+        je  as_pa_set_l;
+        cmp rax, 0x61;                    // 'a'
+        je  as_pa_set_a;
+        cmp rax, 0x68;                    // 'h'
+        je  as_pa_set_h;
+        jmp as_pa_unsupported_short;
+
+      as_pa_set_l:
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x1;                     // AS_BIT_L
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+      as_pa_set_a:
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x2;                     // AS_BIT_A
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+      as_pa_set_h:
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x4;                     // AS_BIT_H
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+        // ---- long-flag dispatch: byte0 selects the compare arm --------
+      as_pa_route_long:
+        cmp rax, 0x6A;                    // 'j' -> json
+        je  as_pa_try_json;
+        cmp rax, 0x73;                    // 's' -> schema
+        je  as_pa_try_schema;
+        cmp rax, 0x63;                    // 'c' -> color
+        je  as_pa_try_color;
+        cmp rax, 0x70;                    // 'p' -> pdx-schema
+        je  as_pa_try_pdx_schema;
+        jmp as_pa_unknown_flag;
+
+        // "json\0"  bytes:  j=0x6A s=0x73 o=0x6F n=0x6E NUL
+      as_pa_try_json:
+        xor rax, rax; mov_b rax, [r10 + 1]; cmp rax, 0x73; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 2]; cmp rax, 0x6F; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 3]; cmp rax, 0x6E; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 4]; cmp rax, 0;    jne as_pa_unknown_flag;
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x8;                     // AS_BIT_JSON
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+        // "schema\0" bytes:  s=0x73 c=0x63 h=0x68 e=0x65 m=0x6D a=0x61 NUL
+      as_pa_try_schema:
+        xor rax, rax; mov_b rax, [r10 + 1]; cmp rax, 0x63; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 2]; cmp rax, 0x68; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 3]; cmp rax, 0x65; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 4]; cmp rax, 0x6D; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 5]; cmp rax, 0x61; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 6]; cmp rax, 0;    jne as_pa_unknown_flag;
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x10;                    // AS_BIT_SCHEMA
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+        // "color\0"  bytes:  c=0x63 o=0x6F l=0x6C o=0x6F r=0x72 NUL
+      as_pa_try_color:
+        xor rax, rax; mov_b rax, [r10 + 1]; cmp rax, 0x6F; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 2]; cmp rax, 0x6C; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 3]; cmp rax, 0x6F; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 4]; cmp rax, 0x72; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 5]; cmp rax, 0;    jne as_pa_unknown_flag;
+        // Set AS_BIT_COLOR.
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x20;                    // AS_BIT_COLOR
+        mov [r11], rax;
+        // Capture flag_values[i] into _as_color_value_ptr. 0 there
+        // means --color was seen without a value (boolean form); the
+        // caller distinguishes that from AS_BIT_COLOR-not-set by
+        // testing the bit first.
+        lea r11, [rip + flag_values];
+        mov rax, [r11 + r12 * 8];
+        lea r11, [rip + _as_color_value_ptr];
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+        // "pdx-schema\0" bytes: p=0x70 d=0x64 x=0x78 -=0x2D s=0x73
+        //                       c=0x63 h=0x68 e=0x65 m=0x6D a=0x61 NUL
+      as_pa_try_pdx_schema:
+        xor rax, rax; mov_b rax, [r10 + 1];  cmp rax, 0x64; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 2];  cmp rax, 0x78; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 3];  cmp rax, 0x2D; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 4];  cmp rax, 0x73; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 5];  cmp rax, 0x63; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 6];  cmp rax, 0x68; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 7];  cmp rax, 0x65; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 8];  cmp rax, 0x6D; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 9];  cmp rax, 0x61; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 10]; cmp rax, 0;    jne as_pa_unknown_flag;
+        // --pdx-schema is an M1 alias for --schema (see file header).
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x10;                    // AS_BIT_SCHEMA
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+      as_pa_walk_advance:
+        add r12, 1;
+        jmp as_pa_walk_head;
+
+        // ---- post-walk: capture pos_ptrs[0] if any ---------------------
+      as_pa_walk_done:
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  as_pa_skip_path;
+        lea r11, [rip + pos_ptrs];
+        mov rax, [r11];                    // pos_ptrs[0]
+        lea r11, [rip + _as_path_ptr];
+        mov [r11], rax;
+
+      as_pa_skip_path:
+        // ---- success epilogue -----------------------------------------
+        mov rdi, 1;                        // LS_ST_OKS
+        call ls_note;
+        mov rax, 0xFFFFEB10;               // AS_OK
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+        // ---- error epilogues ------------------------------------------
+      as_pa_bad_argv:
+        mov rdi, 4;                        // LS_ST_ERRORS
+        call ls_note;
+        mov rax, 0xFFFFEB11;               // AS_ERR_BAD_ARGV
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      as_pa_parser_reject:
+        mov rdi, 4;                        // LS_ST_ERRORS
+        call ls_note;
+        mov rax, 0xFFFFEB12;               // AS_ERR_PARSER_REJECT
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      as_pa_unknown_flag:
+        mov rdi, 4;                        // LS_ST_ERRORS
+        call ls_note;
+        mov rax, 0xFFFFEB13;               // AS_ERR_UNKNOWN_FLAG
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      as_pa_unsupported_short:
+        mov rdi, 4;                        // LS_ST_ERRORS
+        call ls_note;
+        mov rax, 0xFFFFEB14;               // AS_ERR_UNSUPPORTED_SHORT
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}
