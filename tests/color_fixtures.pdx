@@ -1,0 +1,607 @@
+// tests/color_fixtures.pdx -- ls.M4-001 (paideia-os/ls#11)
+//
+// ColorFixtures module: known-schema fixture corpus + verifier for
+// ColorPicker (src/color_picker.pdx). Two independent sub-matrices:
+//
+//   (A) color_pick dispatch: 10 (kind_nibble, mode_bits, schema_id)
+//       -> expected_palette_id cases covering every branch of the
+//       plan-doc §4.4 schema-first / kind-fallback dispatch table.
+//
+//   (B) color_sgr_prefix / color_sgr_suffix byte-exact goldens: for
+//       three palette ids (0, 1 for dir, 5 for video) the expected
+//       ANSI SGR bytes are pinned as .rodata; the verifier calls
+//       color_sgr_prefix into a scratch buffer and diffs byte-for-
+//       byte. Suffix golden (ESC [ 0 m) is always 4 bytes and is
+//       exercised once.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// This module is a FIXTURE, not production code. It ships in tests/
+// and is invoked by a future M5 smoke harness. It has three public
+// entry points:
+//
+//   color_fixtures_case_count() -> u64
+//     Returns CF_CASE_COUNT (10 dispatch cases + 3 SGR goldens = 13).
+//
+//   color_fixtures_run(case_idx) -> u64
+//     Runs one case. Returns 0 on pass; a case-specific non-zero
+//     sentinel on fail (CF_ERR_DISPATCH_MISMATCH + idx or
+//     CF_ERR_SGR_BYTE_MISMATCH + idx).
+//
+//   color_fixtures_verify_all() -> u64
+//     Walks every case; returns 0 iff every case passes. First-fail
+//     case's sentinel is propagated so a harness sees which case
+//     drifted.
+//
+// =============================================================================
+// DISPATCH CASE TABLE
+// =============================================================================
+//
+//   idx  kind_nibble  mode_bits  schema_id  expected_palette  rationale
+//   ------------------------------------------------------------------------
+//    0   0x4          0          0          1 (dir)           kind route
+//    1   0xA          0          0          2 (symlink)       kind route
+//    2   0x8          0x40       0          3 (exec)          exec route
+//    3   0x8          0x0        0          0 (none)          non-exec file
+//    4   0x8          0x1        0          0 (none)          non-owner-exec
+//    5   0x0          0          0          0 (none)          unknown kind
+//    6   0x8          0          0x12345678 9 (unknown-schema)schema wins (M2)
+//    7   0x4          0          0x1        9 (unknown-schema)schema wins over dir
+//    8   0x1          0          0          0 (none)          unknown-kind route
+//    9   0x8          0x40       0x1        9 (unknown-schema)schema wins over exec
+//
+// Each case = 4 u64 lanes = 32 bytes; 10 cases = 320 bytes total.
+//
+// =============================================================================
+// SGR PREFIX GOLDEN CASES
+// =============================================================================
+//
+//   idx  palette  expected bytes            len
+//   ------------------------------------------------
+//   10   0        (none)                    0
+//   11   1        ESC [ 3 4 m  = 1B 5B 33 34 6D  5
+//   12   5        ESC [ 9 5 m  = 1B 5B 39 35 6D  5
+//
+// Note: every non-none palette in the M2 table has a two-digit SGR
+// code, so every non-none prefix is exactly 5 bytes -- covering
+// palette 1 (2-digit under 50) and palette 5 (2-digit over 50) is
+// sufficient to prove render_dec_u64 dispatches correctly.
+//
+// Suffix golden is tested inline inside case 12's verifier (write
+// suffix into a shared scratch, compare against a 4-byte constant).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ColorFixtures`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates
+//     in this module: 13 (CF_CASE_COUNT), 10 (dispatch case count for
+//     the DISPATCH_LIMIT compare), 128 (kind mask sanity), 0xFF
+//     (byte-load mask). The CF_ERR_* sentinels are `mov rax, imm64`
+//     stores on the error return path.
+//   - Byte reads (SGR byte compare loop) use `xor rax; mov_b rax,
+//     [ptr]` per #1248.
+//   - r10 / r11 are scratch (LEA base + short-lived compare staging).
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   color_pick             -- ColorPicker (src/color_picker.pdx)
+//   color_sgr_prefix       -- ColorPicker (src/color_picker.pdx)
+//   color_sgr_suffix       -- ColorPicker (src/color_picker.pdx)
+//
+// Written / read:
+//   _cf_cases              -- 10 * 4 u64 dispatch cases (this .rodata)
+//   _cf_sgr_scratch        -- 16-byte SGR emit target (this .bss)
+
+module ColorFixtures = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let CF_OK                     : u64 = 0
+  pub let CF_ERR_DISPATCH_MISMATCH  : u64 = 0xFFFFEB40    // + case_idx
+  pub let CF_ERR_SGR_LEN_MISMATCH   : u64 = 0xFFFFEB50    // + case_idx
+  pub let CF_ERR_SGR_BYTE_MISMATCH  : u64 = 0xFFFFEB60    // + case_idx
+  pub let CF_ERR_SUFFIX_MISMATCH    : u64 = 0xFFFFEB70
+  pub let CF_ERR_BAD_CASE_IDX       : u64 = 0xFFFFEB7F
+
+  // ==========================================================================
+  // Case-count constants
+  // ==========================================================================
+  pub let CF_DISPATCH_COUNT : u64 = 10
+  pub let CF_SGR_COUNT      : u64 = 3
+  pub let CF_CASE_COUNT     : u64 = 13
+
+  // ==========================================================================
+  // Dispatch fixture table -- 10 cases, 4 u64 lanes each = 40 u64.
+  //
+  // Lane layout (per case):
+  //   [0] kind_nibble
+  //   [1] mode_bits
+  //   [2] schema_id
+  //   [3] expected_palette
+  //
+  // See file header §Dispatch Case Table for the row-by-row rationale.
+  // ==========================================================================
+  pub let _cf_cases : [u64; 40] = [
+      // case 0: kind=0x4 -> dir (1)
+      0x4, 0x0, 0x0, 1,
+      // case 1: kind=0xA -> symlink (2)
+      0xA, 0x0, 0x0, 2,
+      // case 2: kind=0x8, owner-exec -> exec (3)
+      0x8, 0x40, 0x0, 3,
+      // case 3: kind=0x8, no-exec -> none (0)
+      0x8, 0x0, 0x0, 0,
+      // case 4: kind=0x8, non-owner-exec bit -> none (0)
+      0x8, 0x1, 0x0, 0,
+      // case 5: kind=0x0 -> none (0)
+      0x0, 0x0, 0x0, 0,
+      // case 6: schema != 0, kind=0x8 -> unknown-schema (9)
+      0x8, 0x0, 0x12345678, 9,
+      // case 7: schema != 0, kind=0x4 (dir) -> schema wins, unknown (9)
+      0x4, 0x0, 0x1, 9,
+      // case 8: kind=0x1 (unknown) -> none (0)
+      0x1, 0x0, 0x0, 0,
+      // case 9: schema != 0, kind=0x8 + exec -> schema wins, unknown (9)
+      0x8, 0x40, 0x1, 9
+  ]
+
+  // ==========================================================================
+  // SGR prefix / suffix golden bytes (packed into u64 lanes for the
+  // byte-compare loop; the verifier reads them as bytes).
+  //
+  // For each SGR golden:
+  //   _cf_sgr_p1: palette 1 -> bytes 0x1B 0x5B 0x33 0x34 0x6D (5 bytes)
+  //               packed LE: 0x00_00_00_6D_34_33_5B_1B = 0x0000006D34335B1B
+  //   _cf_sgr_p5: palette 5 -> bytes 0x1B 0x5B 0x39 0x35 0x6D (5 bytes)
+  //               packed LE:                         0x0000006D35395B1B
+  //   _cf_sgr_suf: suffix    -> bytes 0x1B 0x5B 0x30 0x6D (4 bytes)
+  //               packed LE:                         0x0000006D305B1B
+  //
+  // Palette 0 has no goldens (0 bytes emitted); the verifier
+  // constructs the "empty" expectation inline.
+  // ==========================================================================
+  pub let _cf_sgr_p1  : [u64; 1] = [ 0x0000006D34335B1B ]
+  pub let _cf_sgr_p5  : [u64; 1] = [ 0x0000006D35395B1B ]
+  pub let _cf_sgr_suf : [u64; 1] = [ 0x000000006D305B1B ]
+
+  // ==========================================================================
+  // .bss scratch -- 16-byte buffer for SGR prefix / suffix emit.
+  //
+  // The SGR path never writes more than 5 bytes; sized to 16 (2 u64
+  // lanes) so the emit-then-diff loop reads a naturally aligned
+  // qword without a per-byte tail edge case.
+  // ==========================================================================
+  pub let mut _cf_sgr_scratch : [u64; 2] = uninit @align(8)
+
+  // ==========================================================================
+  // color_fixtures_case_count() -> u64
+  //
+  // Signature: () -> u64 !{} @{}
+  //   RAX (output): CF_CASE_COUNT (13).
+  //
+  // Leaf function; no callee-save touched.
+  // ==========================================================================
+  pub let color_fixtures_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.M4-001 (#11): return the total number of fixture cases (10 dispatch + 3 SGR = 13) for a harness that iterates via color_fixtures_run. Leaf pure function -- no memory, no capabilities. paideia-as conformance: no test mnemonic; no cmp needed. Labels prefixed cfcc_.",
+      block: {
+        mov rax, 13;                             // CF_CASE_COUNT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // color_fixtures_run_dispatch(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI (input): case_idx  (0..9)
+  //   RAX (output): 0 on match; CF_ERR_DISPATCH_MISMATCH + case_idx on
+  //                 mismatch.
+  //
+  // Loads the four lanes for case case_idx from _cf_cases, calls
+  // color_pick(kind_nibble, mode_bits, schema_id), compares the
+  // return to the expected palette lane. First mismatch surfaces
+  // via the offset error sentinel so the harness can spot the case.
+  //
+  // Register plan (non-leaf; three callee-save pushes for pipeline
+  // stability across the color_pick call):
+  //   rbx = case_idx (survives across color_pick)
+  //   r12 = base of _cf_cases[case_idx * 4]
+  //   r13 = expected palette (survives across color_pick)
+  //   rdi/rsi/rdx = color_pick args
+  //   rax = color_pick return
+  //
+  // Alignment: 3 pushes + sub rsp,8 pad = 32 bytes; entry rsp % 16 ==
+  // 8; 8 + 32 = 40; 40 % 16 == 8. That's misaligned -- need 4 pushes
+  // OR sub rsp,16. Adopting: 3 pushes + sub rsp,16 pad = 40 bytes;
+  // entry rsp % 16 == 8; 8 + 40 = 48; 48 % 16 == 0.
+  // ==========================================================================
+  pub let color_fixtures_run_dispatch : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-001 (#11): run one dispatch fixture case. Bounds-check case_idx < 10 (CF_DISPATCH_COUNT); out-of-range returns CF_ERR_BAD_CASE_IDX. LEA _cf_cases + case_idx * 32 (32 = 4 lanes * 8 bytes) recovers the four-lane base; load kind_nibble/mode_bits/schema_id into rdi/rsi/rdx and expected_palette into r13, call color_pick, compare rax to r13. Mismatch -> CF_ERR_DISPATCH_MISMATCH (0xFFFFEB40) + case_idx. Three callee-save pushes (rbx=case_idx for the error-return math, r12=lane base, r13=expected palette) + sub rsp,16 pad = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48; 48 % 16 == 0 at the color_pick call site. Matched add rsp,16 + 3 pops before every ret. paideia-as conformance: no test mnemonic; cmp against CF_DISPATCH_COUNT (10) fits imm32; the * 32 stride is a shl rax, 5 (imm 5). Every 0xFFFFEBxx sentinel stages via mov rax, imm64 or add rax, rbx. r11/r10 scratch. Labels prefixed cfrd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 16;
+
+        mov rbx, rdi;                            // rbx = case_idx
+
+        // Bounds check.
+        cmp rbx, 10;                             // CF_DISPATCH_COUNT
+        jae cfrd_bad_idx;
+
+        // r12 = &_cf_cases + case_idx * 32
+        lea r11, [rip + _cf_cases];
+        mov r12, rbx;
+        shl r12, 5;                              // * 32
+        add r12, r11;
+
+        // Load lanes: rdi = kind_nibble, rsi = mode_bits, rdx =
+        // schema_id, r13 = expected_palette.
+        mov rdi, [r12 + 0];
+        mov rsi, [r12 + 8];
+        mov rdx, [r12 + 16];
+        mov r13, [r12 + 24];
+
+        call color_pick;
+
+        cmp rax, r13;
+        jne cfrd_mismatch;
+
+        xor rax, rax;                            // CF_OK
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cfrd_mismatch:
+        mov rax, 0xFFFFEB40;                     // CF_ERR_DISPATCH_MISMATCH
+        add rax, rbx;                            // + case_idx
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cfrd_bad_idx:
+        mov rax, 0xFFFFEB7F;                     // CF_ERR_BAD_CASE_IDX
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // color_fixtures_run_sgr(sgr_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI (input): sgr_idx (0..2)
+  //     0 -> palette 0 (empty expected: color_sgr_prefix returns 0)
+  //     1 -> palette 1 golden (ESC[34m, 5 bytes)
+  //     2 -> palette 5 golden (ESC[95m, 5 bytes); also exercises the
+  //          suffix (ESC[0m, 4 bytes) inline.
+  //   RAX (output): 0 on pass; CF_ERR_SGR_LEN_MISMATCH + sgr_idx or
+  //                 CF_ERR_SGR_BYTE_MISMATCH + sgr_idx on fail.
+  //
+  // For each SGR case:
+  //   (a) Call color_sgr_prefix(&_cf_sgr_scratch, 16, palette).
+  //   (b) Compare return to expected length.
+  //   (c) Byte-diff scratch against the golden lane.
+  //   (d) For sgr_idx == 2, additionally exercise the suffix: call
+  //       color_sgr_suffix(&_cf_sgr_scratch, 16), expect 4 bytes,
+  //       byte-diff against _cf_sgr_suf.
+  //
+  // Register plan (non-leaf; four callee-save pushes for pipeline
+  // stability across two nested calls in case 2):
+  //   rbx = sgr_idx
+  //   r12 = expected byte length
+  //   r13 = golden byte-address (LEA target)
+  //   r14 = scratch byte-address
+  //   r15 = byte-compare loop counter
+  //
+  // Alignment: 5 pushes = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48;
+  // 48 % 16 == 0. No pad needed. Matched 5 pops before every ret.
+  // ==========================================================================
+  pub let color_fixtures_run_sgr : (u64) -> u64 !{mem} @{} =
+    fn (sgr_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-001 (#11): SGR-golden byte-exact verifier. Dispatch on sgr_idx: 0 -> palette 0 empty (color_sgr_prefix returns 0, no diff needed), 1 -> palette 1 (ESC[34m 5 bytes vs _cf_sgr_p1), 2 -> palette 5 (ESC[95m 5 bytes vs _cf_sgr_p5) + inline suffix exercise (ESC[0m 4 bytes vs _cf_sgr_suf). Byte-diff loop uses xor rax + mov_b rax, [ptr] on both sides (#1248 mitigation), compares per byte, first byte mismatch -> CF_ERR_SGR_BYTE_MISMATCH + sgr_idx. Length mismatch (color_sgr_prefix return != expected) -> CF_ERR_SGR_LEN_MISMATCH + sgr_idx. Suffix mismatch inside case 2 -> CF_ERR_SUFFIX_MISMATCH (no idx add -- there's only one suffix golden). Five callee-save pushes (rbx=sgr_idx for error math, r12=expected len, r13=golden addr, r14=scratch addr, r15=loop idx); 5*8 = 40; entry rsp % 16 == 8; 8 + 40 = 48; 48 % 16 == 0 at every nested call (color_sgr_prefix, color_sgr_suffix). paideia-as conformance: no test; largest cmp immediate 5 (SGR expected len) or 3 (case dispatch); 0xFFFFEBxx sentinels are mov rax, imm64 emissions. Labels prefixed cfrs_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                            // rbx = sgr_idx
+
+        // Bounds check.
+        cmp rbx, 3;                              // CF_SGR_COUNT
+        jae cfrs_bad_idx;
+
+        // ---- Dispatch on sgr_idx -------------------------------------
+        cmp rbx, 0;
+        je  cfrs_palette0;
+        cmp rbx, 1;
+        je  cfrs_palette1;
+        // Fall-through: sgr_idx == 2 (palette 5).
+
+      cfrs_palette5:
+        // color_sgr_prefix(&scratch, 16, 5) -> expected 5.
+        lea r11, [rip + _cf_sgr_scratch];
+        mov rdi, r11;
+        mov rsi, 16;
+        mov rdx, 5;
+        call color_sgr_prefix;
+
+        mov r12, 5;
+        cmp rax, r12;
+        jne cfrs_len_fail;
+
+        // Byte-diff scratch against _cf_sgr_p5.
+        lea r13, [rip + _cf_sgr_p5];
+        lea r14, [rip + _cf_sgr_scratch];
+        xor r15, r15;
+
+      cfrs_p5_loop:
+        cmp r15, r12;
+        jae cfrs_p5_done;
+        mov r11, r13;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];
+        mov r10, rax;                            // r10 = golden byte
+        mov r11, r14;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];
+        cmp rax, r10;
+        jne cfrs_byte_fail;
+        add r15, 1;
+        jmp cfrs_p5_loop;
+
+      cfrs_p5_done:
+        // Now exercise the suffix (in-place; overwrite scratch).
+        lea r11, [rip + _cf_sgr_scratch];
+        mov rdi, r11;
+        mov rsi, 16;
+        call color_sgr_suffix;
+
+        mov r12, 4;
+        cmp rax, r12;
+        jne cfrs_suffix_fail;
+
+        lea r13, [rip + _cf_sgr_suf];
+        lea r14, [rip + _cf_sgr_scratch];
+        xor r15, r15;
+
+      cfrs_suf_loop:
+        cmp r15, r12;
+        jae cfrs_ok;
+        mov r11, r13;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];
+        mov r10, rax;
+        mov r11, r14;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];
+        cmp rax, r10;
+        jne cfrs_suffix_fail;
+        add r15, 1;
+        jmp cfrs_suf_loop;
+
+      cfrs_palette1:
+        // color_sgr_prefix(&scratch, 16, 1) -> expected 5.
+        lea r11, [rip + _cf_sgr_scratch];
+        mov rdi, r11;
+        mov rsi, 16;
+        mov rdx, 1;
+        call color_sgr_prefix;
+
+        mov r12, 5;
+        cmp rax, r12;
+        jne cfrs_len_fail;
+
+        lea r13, [rip + _cf_sgr_p1];
+        lea r14, [rip + _cf_sgr_scratch];
+        xor r15, r15;
+
+      cfrs_p1_loop:
+        cmp r15, r12;
+        jae cfrs_ok;
+        mov r11, r13;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];
+        mov r10, rax;
+        mov r11, r14;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];
+        cmp rax, r10;
+        jne cfrs_byte_fail;
+        add r15, 1;
+        jmp cfrs_p1_loop;
+
+      cfrs_palette0:
+        // color_sgr_prefix(&scratch, 16, 0) -> expected 0 (no diff).
+        lea r11, [rip + _cf_sgr_scratch];
+        mov rdi, r11;
+        mov rsi, 16;
+        mov rdx, 0;
+        call color_sgr_prefix;
+
+        cmp rax, 0;
+        jne cfrs_len_fail;
+        jmp cfrs_ok;
+
+      cfrs_ok:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cfrs_len_fail:
+        mov rax, 0xFFFFEB50;                     // CF_ERR_SGR_LEN_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cfrs_byte_fail:
+        mov rax, 0xFFFFEB60;                     // CF_ERR_SGR_BYTE_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cfrs_suffix_fail:
+        mov rax, 0xFFFFEB70;                     // CF_ERR_SUFFIX_MISMATCH
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cfrs_bad_idx:
+        mov rax, 0xFFFFEB7F;                     // CF_ERR_BAD_CASE_IDX
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // color_fixtures_run(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI (input): case_idx  (0..12)
+  //     0..9  -> dispatch case; delegates to color_fixtures_run_dispatch
+  //     10..12 -> SGR case (sgr_idx = case_idx - 10); delegates to
+  //               color_fixtures_run_sgr
+  //   RAX (output): 0 on pass; sub-band sentinel on fail.
+  //
+  // Register plan (non-leaf; one callee-save push for alignment):
+  //   rbx = case_idx (survives across the sub-call in the SGR branch)
+  //
+  // Alignment: 1 push + sub rsp,8 pad = 16 bytes; entry rsp % 16 ==
+  // 8; 8 + 16 = 24; 24 % 16 == 8. That's misaligned. Need 1 push +
+  // 0 pad or 1 push + sub rsp,0. Actually: 1 push = 8 bytes; entry
+  // rsp % 16 == 8; 8 + 8 = 16; 16 % 16 == 0. No pad needed.
+  // ==========================================================================
+  pub let color_fixtures_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-001 (#11): the harness-facing dispatcher over the 13 fixture cases. Case indices 0..9 route to color_fixtures_run_dispatch; 10..12 route to color_fixtures_run_sgr (sgr_idx = case_idx - 10). One callee-save push (rbx=case_idx for the -10 subtraction that must survive nothing since we only need it for the ONE sub-call, but the push doubles as SysV alignment). Entry rsp % 16 == 8; 1 push = 8 bytes; total 16; aligned. Bounds check (case_idx >= 13) -> CF_ERR_BAD_CASE_IDX. paideia-as conformance: no test mnemonic; cmp against 10 (dispatch cap) + 13 (total cap) fits imm32. Labels prefixed cfr_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+
+        // Bounds check.
+        cmp rbx, 13;                             // CF_CASE_COUNT
+        jae cfr_bad_idx;
+
+        cmp rbx, 10;                             // CF_DISPATCH_COUNT
+        jae cfr_sgr;
+
+        // Dispatch case: rdi already holds case_idx.
+        call color_fixtures_run_dispatch;
+        pop rbx;
+        ret;
+
+      cfr_sgr:
+        // SGR case: sgr_idx = case_idx - 10.
+        mov rdi, rbx;
+        sub rdi, 10;
+        call color_fixtures_run_sgr;
+        pop rbx;
+        ret;
+
+      cfr_bad_idx:
+        mov rax, 0xFFFFEB7F;                     // CF_ERR_BAD_CASE_IDX
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // color_fixtures_verify_all() -> u64
+  //
+  // Signature: () -> u64 !{mem} @{}
+  //   RAX (output): 0 iff every case passes; else first-fail sentinel.
+  //
+  // Walks case_idx 0..12; on any non-zero return, propagates verbatim.
+  //
+  // Register plan (non-leaf; two callee-save pushes for pipeline
+  // stability across the nested color_fixtures_run):
+  //   rbx = loop counter (0..12)
+  //   r12 = case-count constant (13)
+  //   rdi = current case_idx
+  //   rax = per-case return
+  //
+  // Alignment: 2 pushes = 16 bytes; entry rsp % 16 == 8; 8 + 16 = 24;
+  // 24 % 16 == 8. Need pad. sub rsp,8 -> 24 + 8 = 32; aligned.
+  // ==========================================================================
+  pub let color_fixtures_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-001 (#11): walk every fixture case (0..12), fail-fast on the first non-zero return so a harness sees which case drifted. Two callee-save pushes (rbx=loop idx, r12=case-count constant) + sub rsp,8 pad = 24 bytes; entry rsp % 16 == 8; 8 + 24 = 32; aligned at color_fixtures_run call site. Matched add rsp,8 + 2 pops before every ret. paideia-as conformance: no test mnemonic; cmp against 13 fits imm32. Labels prefixed cfva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 13;                             // CF_CASE_COUNT
+
+      cfva_loop:
+        cmp rbx, r12;
+        jae cfva_ok;
+
+        mov rdi, rbx;
+        call color_fixtures_run;
+        cmp rax, 0;
+        jne cfva_out;
+
+        add rbx, 1;
+        jmp cfva_loop;
+
+      cfva_ok:
+        xor rax, rax;                            // CF_OK
+      cfva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

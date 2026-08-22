@@ -1,18 +1,14 @@
 # ls — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M3 (semantic-pipe / audit integration) —
-CLOSED. M3-001 flipped `Runner::runner_ls` from `LS_RUN_STUB` to a
-real iteration body against the R42-PREP-008 substrate (sysno 71
-sys_pdxfs_open + sysno 72 sys_pdxfs_dir_readnext + KIND_TTY 0x197)
-and wired the schema-bound `PdxFsDirEntry[]` emission on the stdout
-endpoint. M3-002 extended the emitted record from 128 to 144 bytes,
-appending an owner Cap wire `(kind=KIND_USER, target_ptr=user_row)`
-— the D2 literal owner-as-cap-ref shape at the schema level. M3-003
-wrapped the whole Runner body in a libpdx-audit begin/commit pair
-(`DirListRecord` frame) so the D3 audit-first invariant holds: no
-user-visible byte on KIND_TTY or the stdout endpoint escapes before
-the audit frame is open. M4 (correctness matrix) is next.
+**Current milestone:** M4 (tests + smoke matrix) — IN PROGRESS.
+M4-001 landed `tests/color_fixtures.pdx` with 10 palette-dispatch
+cases covering every branch of the plan-doc §4.4 schema-first /
+kind-fallback table plus 3 byte-exact SGR goldens for the ANSI
+prefix / suffix emitters. Fixture entry-point contract
+(`<name>_case_count`, `<name>_run`, `<name>_verify_all`) is pinned
+for the remaining M4 modules to inherit. M4-002 through M4-004
+follow.
 
 ## Milestone rollup
 
@@ -28,6 +24,7 @@ the audit frame is open. M4 (correctness matrix) is next.
 | M3-001 (#8)     | PdxFsDirEntry[] schema bind + emit on stdout                   | LANDED |
 | M3-002 (#9)     | owner field emits as cap ref, not text uid (D2 literal)        | LANDED |
 | M3-003 (#10)    | DirListRecord via libpdx-audit before first byte               | LANDED |
+| M4-001 (#11)    | coloring test against known-schema fixture corpus              | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -79,7 +76,9 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   the shared Runner epilogue). M3-003.
 - `caps.decl` — the four caps ls receives at exec (KIND_USER,
   KIND_TTY, KIND_PDXFS_FILE, KIND_IPC_ENDPOINT).
-- `tests/` — empty until `ls.M4-001` lands the fixture matrix.
+- `tests/color_fixtures.pdx` — `ColorFixtures` module (M4-001):
+  10 dispatch cases + 3 SGR byte-exact goldens for
+  `ColorPicker`.
 - `.plans/` — per-milestone implementation notes.
 
 ## Kernel-side substrate (M3 wave)
