@@ -1,0 +1,424 @@
+// src/color_picker.pdx -- ls.M2-004 (paideia-os/ls#7)
+//
+// ColorPicker module: schema/MIME-driven color palette selection +
+// ANSI SGR prefix/suffix emit. This is the plan doc §4.4 load-
+// bearing difference from POSIX `ls --color`: coloring is chosen by
+// the file's declared MIME/schema, NOT by POSIX file-type bits.
+// The kind-nibble is a secondary hint only (used when no schema id
+// is available, e.g. before the M3 semantic pipe wires
+// PdxFsDirEntry to the ColorPicker input).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Three entry points:
+//
+//   color_pick(kind_nibble, mode_bits, schema_id) -> palette_id
+//
+//     Deterministic mapping from a (kind, mode, schema) triple to a
+//     palette id in 0..9. Palette 0 = no color. See §PALETTE below.
+//
+//   color_sgr_prefix(dst_ptr, dst_cap, palette_id) -> bytes | CP_ERR_OVERFLOW
+//
+//     Emit the ANSI SGR set-color prefix for `palette_id` into the
+//     caller-owned buffer. Format: `ESC [ N m` (4 bytes for a
+//     one-digit code, 5 bytes for two-digit).  Palette 0 emits 0
+//     bytes (returns 0).
+//
+//   color_sgr_suffix(dst_ptr, dst_cap) -> bytes | CP_ERR_OVERFLOW
+//
+//     Emit the ANSI SGR reset (`ESC [ 0 m`, 4 bytes) into the
+//     caller-owned buffer.  Always writes 4 bytes on success --
+//     callers pair every non-zero prefix emission with exactly one
+//     suffix so a terminal reader never sees a lingering color
+//     state after an entry.
+//
+// =============================================================================
+// PALETTE
+// =============================================================================
+//
+//   id  role              SGR code   ANSI meaning
+//   ---------------------------------------------------------------
+//    0  none                (none)   default terminal colors
+//    1  dir                 34       blue
+//    2  symlink             36       cyan
+//    3  exec-file           32       green
+//    4  image               35       magenta
+//    5  video               95       bright magenta
+//    6  audio               33       yellow
+//    7  code                92       bright green
+//    8  doc                 94       bright blue
+//    9  unknown-schema      37       white (visible, non-alarming)
+//
+// The palette is deliberately small at M2 -- 10 slots so the SGR
+// codes fit in one or two decimal digits and the emit path avoids
+// the general u64->decimal cost. M3 extends the palette when the
+// schema registry publishes real schema-hash values; the
+// dispatch shape (integer palette_id -> SGR code) is stable.
+//
+// =============================================================================
+// SCHEMA_ID DISPATCH (M2 SHAPE)
+// =============================================================================
+//
+// The `schema_id` argument is a 32-bit BLAKE3-truncated schema
+// fingerprint (per libpdx-semantic-pipe §3.2). The plan doc §5.11
+// binds a schema-registry lookup via `svc.schema-registry` at
+// libpdx-semantic-pipe M3; that service is not up until R49
+// semantic-pipe M3 lands.
+//
+// Until then, ColorPicker treats `schema_id == 0` as
+// "no-schema-known" and falls through to the kind_nibble +
+// mode_bits secondary path.  Non-zero schema_ids at M2 route to
+// palette 9 (unknown-schema, white) so the palette dispatch is
+// exercised end-to-end but no fabricated color is chosen against a
+// schema id we cannot resolve. M3 replaces the "non-zero -> 9"
+// branch with a real registry lookup by schema hash.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ColorPicker`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF.  Largest
+//     immediate is 0x8 (mode's exec-bit test).  Sentinels stage
+//     into r11.
+//   - Byte reads via `xor rax; mov_b rax, [ptr]` (#1248).
+//   - Byte writes via `mov_b [dst], reg` through Render.
+//   - r11 scratch for LEA to _cp_sgr_codes + sentinel staging.
+//   - color_pick is LEAF (pure dispatch; no calls).
+//   - color_sgr_prefix / color_sgr_suffix are non-leaf (call
+//     render_byte_write repeatedly).  Both use 4 callee-save
+//     pushes (rbx/r12/r13/r14) which leave rsp % 16 == 8 at nested
+//     call sites; a fifth push (r15) or a `sub rsp, 8` pad
+//     restores alignment.  Both prefix and suffix use the 4-push +
+//     pad shape.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   render_byte_write   -- Render (src/render.pdx)
+//   render_dec_u64      -- Render (src/render.pdx)  [for two-digit codes]
+//
+// Read (via lea):
+//   _cp_sgr_codes       -- local .rodata: SGR code per palette_id
+
+module ColorPicker = structure {
+
+  // ==========================================================================
+  // Return codes / palette ids
+  // ==========================================================================
+  pub let CP_OK              : u64 = 0
+  pub let CP_ERR_OVERFLOW    : u64 = 0xFFFFFFFFFFFFFFFF
+
+  pub let CP_PAL_NONE        : u64 = 0
+  pub let CP_PAL_DIR         : u64 = 1
+  pub let CP_PAL_SYMLINK     : u64 = 2
+  pub let CP_PAL_EXEC        : u64 = 3
+  pub let CP_PAL_IMAGE       : u64 = 4
+  pub let CP_PAL_VIDEO       : u64 = 5
+  pub let CP_PAL_AUDIO       : u64 = 6
+  pub let CP_PAL_CODE        : u64 = 7
+  pub let CP_PAL_DOC         : u64 = 8
+  pub let CP_PAL_UNKNOWN     : u64 = 9
+  pub let CP_PAL_MAX         : u64 = 10
+
+  // ==========================================================================
+  // SGR code table indexed by palette id (0..9).
+  //
+  // Slot 0 = 0 sentinel (unused; palette 0 short-circuits before
+  // consulting the table). Values match the ANSI SGR standard:
+  //   34=blue 36=cyan 32=green 35=magenta 95=bright-magenta
+  //   33=yellow 92=bright-green 94=bright-blue 37=white
+  // ==========================================================================
+  pub let _cp_sgr_codes : [u8; 10] = [
+      0, 34, 36, 32, 35, 95, 33, 92, 94, 37
+  ]
+
+  // ==========================================================================
+  // color_pick(kind_nibble, mode_bits, schema_id) -> palette_id
+  //
+  // Signature: (u64, u64, u64) -> u64 !{} @{}
+  //   RDI: kind_nibble  -- PdxFS-v1 file-type nibble (0..15)
+  //   RSI: mode_bits    -- POSIX-analog mode bits (for exec detection)
+  //   RDX: schema_id    -- 32-bit BLAKE3-truncated schema hash
+  //   RAX: palette id in 0..9
+  //
+  // Dispatch precedence:
+  //   1. schema_id != 0 -> palette 9 (unknown-schema) at M2; M3
+  //      replaces this with a real registry lookup.
+  //   2. kind_nibble == 0x4 (dir)      -> palette 1 (dir)
+  //   3. kind_nibble == 0xA (symlink)  -> palette 2 (symlink)
+  //   4. kind_nibble == 0x8 (file) && (mode_bits & 0x040) != 0 -> palette 3 (exec)
+  //      (0x040 == owner-execute bit; a file with owner-exec set is
+  //      treated as executable by the coloring convention -- matches
+  //      the POSIX exec-color heuristic, retained here as the
+  //      kind_nibble-driven fallback until the schema is available.)
+  //   5. otherwise -> palette 0 (no color)
+  //
+  // Leaf function (no calls). Register plan:
+  //   rdi/rsi/rdx = inputs
+  //   rax        = palette id (return)
+  //   r10        = mask constant scratch
+  // ==========================================================================
+  pub let color_pick : (u64, u64, u64) -> u64 !{} @{} =
+    fn (kind_nibble: u64) (mode_bits: u64) (schema_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.M2-004 (#7): the schema/MIME-driven palette dispatch. Precedence: schema first (falls through to kind+mode only when schema_id == 0), then dir/symlink/exec fallbacks from kind_nibble + mode's owner-exec bit. schema_id != 0 routes to palette 9 (unknown-schema) at M2 because the schema-registry service (libpdx-semantic-pipe M3) is not up yet; M3 replaces the branch with a real registry lookup by schema hash. Leaf function -- no callee-save touched, no push/pop parity to preserve. paideia-as conformance: no `test`; largest immediate 0x40 (owner-exec bit) or 0xF (nibble mask); no byte access. Labels prefixed cp_.",
+      block: {
+        // 1. schema route
+        cmp rdx, 0;
+        jne cp_pick_unknown_schema;
+
+        // 2. kind_nibble == 0x4 -> dir
+        cmp rdi, 0x4;
+        je  cp_pick_dir;
+
+        // 3. kind_nibble == 0xA -> symlink
+        cmp rdi, 0xA;
+        je  cp_pick_symlink;
+
+        // 4. kind_nibble == 0x8 && (mode & 0x40) -> exec
+        cmp rdi, 0x8;
+        jne cp_pick_none;
+        mov rax, rsi;
+        and rax, 0x40;
+        cmp rax, 0;
+        je  cp_pick_none;
+        mov rax, 3;                          // CP_PAL_EXEC
+        ret;
+
+      cp_pick_dir:
+        mov rax, 1;                          // CP_PAL_DIR
+        ret;
+      cp_pick_symlink:
+        mov rax, 2;                          // CP_PAL_SYMLINK
+        ret;
+      cp_pick_unknown_schema:
+        mov rax, 9;                          // CP_PAL_UNKNOWN
+        ret;
+      cp_pick_none:
+        xor rax, rax;                        // CP_PAL_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // color_sgr_prefix(dst_ptr, dst_cap, palette_id) -> bytes | CP_ERR_OVERFLOW
+  //
+  // Signature: (u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI: dst_ptr
+  //   RSI: dst_cap
+  //   RDX: palette_id  (0..9)
+  //   RAX: bytes written (0 for palette 0), or CP_ERR_OVERFLOW
+  //
+  // Format:
+  //   palette 0                     -> emits 0 bytes; returns 0
+  //   palette 1..9 with SGR < 100   -> emits `ESC [ digit digit m`
+  //                                    (may be 1 or 2 digits per
+  //                                    render_dec_u64) -- 4 or 5 bytes
+  //
+  // Register plan (non-leaf, 4 callee-save + pad = 40 bytes; entry
+  // rsp % 16 == 8; 8 + 40 = 48; 48 % 16 == 0 at every nested call):
+  //   rbx = anchor
+  //   r12 = cursor
+  //   r13 = cap remaining
+  //   r14 = SGR code (loaded from _cp_sgr_codes[palette_id])
+  // ==========================================================================
+  pub let color_sgr_prefix : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst_ptr: u64) (dst_cap: u64) (palette_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M2-004 (#7): emit the ANSI SGR set-color prefix `ESC [ N m` for palette_id 1..9. Palette 0 short-circuits to 0 bytes so a caller composing a per-entry emit sequence can call unconditionally without a pre-branch. The SGR code loads from _cp_sgr_codes[palette_id]; palette_id >= CP_PAL_MAX (10) refuses defensively with CP_ERR_OVERFLOW (a caller passing an out-of-range id would otherwise dereference outside the table). ESC = 0x1B; '[' = 0x5B; 'm' = 0x6D. Numeric code emits via render_dec_u64 for uniform 1-or-2-digit handling (95 is the largest, fits in 2 digits). Four callee-save pushes + sub rsp, 8 pad = 40 bytes; entry rsp % 16 == 8, +40 = 48, aligned. paideia-as conformance: byte writes via render_byte_write (mov_b); no `test`; imm <= 0x7F. Labels prefixed csp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // anchor
+        mov r12, rdi;                        // cursor
+        mov r13, rsi;                        // cap remaining
+
+        // palette 0 -> 0 bytes
+        cmp rdx, 0;
+        je  csp_done_zero;
+
+        // bounds check
+        mov r10, 10;                         // CP_PAL_MAX
+        cmp rdx, r10;
+        jae csp_overflow;
+
+        // Load SGR code.
+        lea r11, [rip + _cp_sgr_codes];
+        xor r14, r14;
+        mov_b r14, [r11 + rdx];
+
+        // Emit ESC (0x1B)
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x1B;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  csp_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // Emit '[' (0x5B)
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x5B;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  csp_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // Emit decimal(SGR)
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        call render_dec_u64;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  csp_overflow;
+        add r12, rax;
+        sub r13, rax;
+
+        // Emit 'm' (0x6D)
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x6D;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  csp_overflow;
+        add r12, 1;
+
+        // Return cursor - anchor.
+        mov rax, r12;
+        sub rax, rbx;
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      csp_done_zero:
+        xor rax, rax;
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      csp_overflow:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // color_sgr_suffix(dst_ptr, dst_cap) -> bytes (always 4) | CP_ERR_OVERFLOW
+  //
+  // Signature: (u64, u64) -> u64 !{mem} @{}
+  //   RDI: dst_ptr
+  //   RSI: dst_cap
+  //   RAX: 4 on success, CP_ERR_OVERFLOW on refusal
+  //
+  // Emits the ANSI reset sequence `ESC [ 0 m` -- fixed 4 bytes.
+  // Callers pair every non-zero prefix emission with exactly one
+  // suffix so a terminal reader never sees a lingering color state.
+  //
+  // Register plan (non-leaf, 3 pushes + pad = 32; rsp % 16 == 0):
+  //   rbx = anchor
+  //   r12 = cursor
+  //   r13 = cap remaining
+  // ==========================================================================
+  pub let color_sgr_suffix : (u64, u64) -> u64 !{mem} @{} =
+    fn (dst_ptr: u64) (dst_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M2-004 (#7): emit the ANSI SGR reset `ESC [ 0 m` (fixed 4 bytes). Every non-zero prefix is paired with exactly one suffix so a terminal reader never sees a lingering color state after an entry. Three callee-save pushes + sub rsp, 8 pad = 32 bytes; entry rsp % 16 == 8, +32 = 40; 40 % 16 == 8 (NOT aligned).  A four-push shape gives 40 bytes -> 48 -> aligned; simpler: pad is 8, three pushes = 24, total 32 = misaligned; use `sub rsp, 16` pad OR drop one push.  Four render_byte_write calls -- alignment matters.  Adopting: 3 pushes + `sub rsp, 16` = 40, giving rsp % 16 == 0 at every call site. Labels prefixed css_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 16;                         // 3 pushes + 16 pad = 40; aligned
+
+        mov rbx, rdi;                        // anchor
+        mov r12, rdi;                        // cursor
+        mov r13, rsi;                        // cap remaining
+
+        // ESC (0x1B)
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x1B;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  css_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // '['
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x5B;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  css_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // '0'
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x30;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  css_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // 'm'
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x6D;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  css_overflow;
+        add r12, 1;
+
+        mov rax, r12;
+        sub rax, rbx;
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      css_overflow:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

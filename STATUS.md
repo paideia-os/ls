@@ -1,11 +1,13 @@
 # ls — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M2 (core implementation) — IN PROGRESS.
-Rendering primitives (`-l` long-format, `-a` hidden filter, `-h`
-human size, schema/MIME color) land as pure functions; Runner
-stays STUB until the R42 PdxFS-v1 directory-iterator substrate
-lands (see kernel-side gap below).
+**Current milestone:** M2 (core implementation) — CLOSED. All four
+rendering primitives (`-l` long-format, `-a` hidden filter, `-h`
+human size, schema/MIME color) ship as pure functions ready for
+M3 to compose with the readdir loop. Ready for M3 (semantic-pipe
+`PdxFsDirEntry[]` emission + libpdx-audit integration) once the
+R42 PdxFS-v1 directory-iterator substrate lands (see kernel-side
+gap below).
 
 ## Milestone rollup
 
@@ -17,6 +19,7 @@ lands (see kernel-side gap below).
 | M2-001 (#4)     | -l long-format layout (kind, size, mtime, owner)               | LANDED |
 | M2-002 (#5)     | owner-column via KIND_USER_ref decode through libpdx-cap       | LANDED |
 | M2-003 (#6)     | -a hidden-files toggle + -h human-readable size                | LANDED |
+| M2-004 (#7)     | coloring driven by declared schema/MIME (not POSIX bits)       | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -45,6 +48,8 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
 - `src/long_format.pdx` — `LongFormat` module (the `-l` line
   renderer: kind, mode, owner, size, mtime, name; composes
   OwnerCol + HumanSize + Render). M2-001.
+- `src/color_picker.pdx` — `ColorPicker` module (schema-first
+  color palette + ANSI SGR prefix/suffix emit). M2-004.
 - `caps.decl` — the four caps ls receives at exec (KIND_USER,
   KIND_TTY, KIND_PDXFS_FILE, KIND_IPC_ENDPOINT).
 - `tests/` — empty until `ls.M4-001` lands the fixture matrix.
