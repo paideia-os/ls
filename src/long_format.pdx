@@ -21,23 +21,22 @@
 //
 //   long_format_line(dst_ptr, dst_cap,
 //                    name_ptr,
-//                    kind_nibble,
-//                    mode_bits,
+//                    kind_mode_flags,
 //                    size_bytes,
-//                    mtime_ns,
-//                    owner_row,
-//                    human_size_flag)
+//                    extra_ptr)
 //     -> bytes_written | LF_ERR_OVERFLOW
 //
-// Nine arguments so the caller can hand every field it already has
-// from a decoded PdxFsDirEntry without a struct-typed detour.  Not a
-// wide "everything at once" API by choice -- each field is a leaf
-// value the caller pulls from a different source (name from the
-// entry blob; kind_nibble + mode_bits + size + mtime from the
-// KIND_PDXFS_FILE cap's row via pdxfs_file_row_mode / _len / _mtime;
-// owner_row from a KIND_USER decode).  Bundling them into a struct
-// would force every M4 fixture to build the struct just to render
-// one line.
+// paideia-as caps a lambda at 6 register-passed parameters (System-V
+// register cap; P0276), so the field set is packed rather than the
+// nine independent leaf values an unpacked API would prefer:
+//   kind_mode_flags = (kind_nibble & 0xF)
+//                     | ((mode_bits & 0x1FF) << 4)
+//                     | ((human_size_flag & 1) << 13)
+//   extra_ptr -> 16-byte caller-owned scratch: [0..8) = mtime_ns,
+//                [8..16) = owner_row.
+// name from the entry blob; kind_nibble + mode_bits + size + mtime
+// from the KIND_PDXFS_FILE cap's row via pdxfs_file_row_mode / _len /
+// _mtime; owner_row from a KIND_USER decode.
 //
 // =============================================================================
 // COLUMN SEMANTICS
@@ -91,15 +90,14 @@
 //   - Byte writes via `mov_b [dst], reg` (through Render, or inline
 //     inside the name copy loop through render_byte_write).
 //   - r11 is scratch for LEA + sentinel + short-lived constants.
-//   - Non-leaf; many nested calls.  Callee-save discipline: 6
-//     pushes (rbx, r12, r13, r14, r15, rbp) + `sub rsp, 8` pad =
-//     56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at
-//     every nested-call site.
-//   - Stack args (SysV places args 7..9 at [rsp+8], [rsp+16],
-//     [rsp+24] AT ENTRY, before the prologue).  After the 56-byte
-//     prologue they live at [rsp+64], [rsp+72], [rsp+80] --
-//     accessed by explicit `mov reg, [rsp + N]` reloads at their
-//     consume site.
+//   - Non-leaf; many nested calls.  Callee-save discipline: 7
+//     pushes (rbx, r12, r13, r14, r15, rbp, r9) = 56 bytes; entry
+//     rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at every nested-call
+//     site.
+//   - extra_ptr (the caller-save r9 register arg) is spilled to
+//     [rsp+0] in the prologue -- r9 is caller-saved and would
+//     otherwise be clobbered by the first nested call -- and
+//     reloaded at each consume site (`mov r10, [rsp]`).
 //
 // =============================================================================
 // CROSS-MODULE SYMBOLS
@@ -135,25 +133,32 @@ module LongFormat = structure {
   ]
 
   // ==========================================================================
-  // long_format_line(dst_ptr, dst_cap, name_ptr, kind_nibble,
-  //                  mode_bits, size_bytes, mtime_ns, owner_row,
-  //                  human_size_flag) -> bytes_written | LF_ERR_OVERFLOW
+  // long_format_line(dst_ptr, dst_cap, name_ptr, kind_mode_flags,
+  //                  size_bytes, extra_ptr) -> bytes_written | LF_ERR_OVERFLOW
+  //
+  // kind_mode_flags packs three small fields the 6-param register cap
+  // (P0276) no longer leaves room to pass independently:
+  //   bits [3:0]   = kind_nibble
+  //   bits [12:4]  = mode_bits (9 bits)
+  //   bit  [13]    = human_size_flag
+  // extra_ptr points at a 16-byte caller-owned scratch: [0..8) = mtime_ns,
+  // [8..16) = owner_row.
   //
   // Register allocation across the twelve-step emit sequence:
   //   rbx = anchor  (dst_ptr; never changes; final total = cursor - anchor)
   //   r12 = cursor  (advances after each emit)
   //   r13 = cap remaining
-  //   r14 = mode_bits (spilled from r8 at prologue; consumed at step 3)
-  //   r15 = size_bytes (spilled from r9 at prologue; consumed at step 7)
+  //   r14 = (mode_bits | human_size_flag << 9), unpacked from rcx at
+  //         prologue; mode_bits consumed at step 3 (bits 0..8), the
+  //         flag at step 7 (bit 9) -- they never collide.
+  //   r15 = size_bytes (spilled from r8 at prologue; consumed at step 7)
   //   rbp = name_ptr (spilled from rdx at prologue; consumed at step 11)
-  //
-  // Values loaded from stack at their consume site:
-  //   [rsp + 64] = mtime_ns
-  //   [rsp + 72] = owner_row
-  //   [rsp + 80] = human_size_flag
+  //   [rsp + 0] = extra_ptr (spilled from r9 at prologue -- r9 is
+  //               caller-saved and would be clobbered by the first
+  //               nested call); reloaded at each consume site.
   //
   // kind_nibble is consumed at step 1 BEFORE any nested call so it
-  // stays in its entry register (rcx) and needs no spill.
+  // reads directly from rcx's low 4 bits and needs no spill.
   //
   // Overflow discipline: every nested call's return is compared
   // against 0xFFFFFFFFFFFFFFFF staged in r11; any child overflow
@@ -166,12 +171,11 @@ module LongFormat = structure {
   // schema no downstream consumer will read.
   // ==========================================================================
   pub let long_format_line
-    : (u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
     fn (dst_ptr: u64) (dst_cap: u64) (name_ptr: u64)
-       (kind_nibble: u64) (mode_bits: u64) (size_bytes: u64)
-       (mtime_ns: u64) (owner_row: u64) (human_size_flag: u64) -> unsafe {
+       (kind_mode_flags: u64) (size_bytes: u64) (extra_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "ls.M2-001 (#4): the `-l` long-format line renderer. Nine-argument entry avoids a struct-typed detour so every M4 fixture and every M3 readdir caller can hand pre-decoded fields directly. Twelve emit steps between callee-save pushes; each nested call checks the r11-staged 0xFFFFFFFFFFFFFFFF sentinel and short-circuits on overflow to lf_overflow. Column order (kind, mode, owner, size, mtime, name) adds one column (mode) beyond the plan doc §4.4 four-column base so a text-layer reader without the schema pipe still sees permission bits; the drop-swap point is the three-digit block starting at lf_emit_mode. Kind letter derived by table lookup at _lf_kind_letters[nibble & 0xF], with '?' fallback for unknown nibbles. Mode rendered as three raw octal digits from mode_bits[8:0]; the POSIX rwxrwxrwx glyph translation lands with the M3 schema-driven palette. Mtime rendered as `ns:<decimal>` because pdx-time doesn't ship until R54 (plan §3.6); the prefix keeps the column self-describing so a downstream typed consumer can recover the raw i128 value. Size dispatches to human_size_render (M2-003) or render_dec_u64 by the human_size_flag stack arg. Name copied byte-by-byte until NUL through inline mov_b loads (#1248 mitigation) forwarded to render_byte_write.  Callee-save + rsp discipline: 6 pushes (rbx, r12..r15, rbp) + sub rsp, 8 = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at every nested-call site. Stack args (mtime_ns, owner_row, human_size_flag) live at [rsp+64/72/80] post-prologue and load at their consume site so no seventh callee-save is needed. paideia-as conformance: no `test`; largest immediate 0x7F (ASCII); byte writes via mov_b [dst], reg through Render. Labels prefixed lf_.",
+      justification: "ls.M2-001 (#4): the `-l` long-format line renderer. Six-argument entry is the System-V register-passed cap (P0276); kind_nibble/mode_bits/human_size_flag pack into kind_mode_flags and mtime_ns/owner_row move behind extra_ptr (a 16-byte caller-owned scratch) since paideia-as lambdas do not support stack-passed args. Twelve emit steps between callee-save pushes; each nested call checks the r11-staged 0xFFFFFFFFFFFFFFFF sentinel and short-circuits on overflow to lf_overflow. Column order (kind, mode, owner, size, mtime, name) adds one column (mode) beyond the plan doc §4.4 four-column base so a text-layer reader without the schema pipe still sees permission bits; the drop-swap point is the three-digit block starting at lf_emit_mode. Kind letter derived by table lookup at _lf_kind_letters[nibble & 0xF], with '?' fallback for unknown nibbles. Mode rendered as three raw octal digits from mode_bits[8:0]; the POSIX rwxrwxrwx glyph translation lands with the M3 schema-driven palette. Mtime rendered as `ns:<decimal>` because pdx-time doesn't ship until R54 (plan §3.6); the prefix keeps the column self-describing so a downstream typed consumer can recover the raw i128 value. Size dispatches to human_size_render (M2-003) or render_dec_u64 by the human_size_flag bit. Name copied byte-by-byte until NUL through inline mov_b loads (#1248 mitigation) forwarded to render_byte_write.  Callee-save + rsp discipline: 7 pushes (rbx, r12..r15, rbp, r9) = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at every nested-call site. extra_ptr lives at [rsp+0] post-prologue and reloads at each consume site (mtime_ns at step 9b, owner_row at step 5) via `mov r10, [rsp]`. paideia-as conformance: no `test`; largest immediate 0x7F (ASCII); byte writes via mov_b [dst], reg through Render; mov_b addressing is [reg] only so every indexed byte load computes its address into r11 first. Labels prefixed lf_.",
       block: {
         // ---- prologue ------------------------------------------------
         push rbx;
@@ -180,13 +184,16 @@ module LongFormat = structure {
         push r14;
         push r15;
         push rbp;
-        sub rsp, 8;
+        push r9;                             // extra_ptr (caller-saved;
+                                              // spill before first call)
 
         mov rbx, rdi;                        // anchor
         mov r12, rdi;                        // cursor
         mov r13, rsi;                        // cap remaining
-        mov r14, r8;                         // mode_bits
-        mov r15, r9;                         // size_bytes
+        mov r14, rcx;                        // unpack mode_bits | flag<<9
+        shr r14, 4;
+        and r14, 0x3FF;
+        mov r15, r8;                         // size_bytes
         mov rbp, rdx;                        // name_ptr
 
         // ---- step 1: emit kind letter -------------------------------
@@ -194,8 +201,9 @@ module LongFormat = structure {
         mov rax, rcx;
         and rax, 0xF;
         lea r11, [rip + _lf_kind_letters];
+        add r11, rax;                        // r11 = &_lf_kind_letters[nibble]
         xor rdx, rdx;
-        mov_b rdx, [r11 + rax];              // kind letter into rdx
+        mov_b rdx, [r11];                    // kind letter into rdx
 
         mov rdi, r12;
         mov rsi, r13;
@@ -275,8 +283,9 @@ module LongFormat = structure {
         add r12, 1;
         sub r13, 1;
 
-        // ---- step 5: emit owner via OwnerCol (owner_row @ [rsp+72]) -
-        mov rdx, [rsp + 72];                 // owner_row
+        // ---- step 5: emit owner via OwnerCol (owner_row via extra_ptr) -
+        mov r10, [rsp];                      // r10 = extra_ptr
+        mov rdx, [r10 + 8];                  // owner_row
         mov rdi, r12;
         mov rsi, r13;
         call owner_col_render_from_row;
@@ -298,7 +307,9 @@ module LongFormat = structure {
         sub r13, 1;
 
         // ---- step 7: emit size (human vs raw dec) -------------------
-        mov rax, [rsp + 80];                 // human_size_flag
+        mov rax, r14;                        // human_size_flag = bit 9
+        shr rax, 9;
+        and rax, 1;
         cmp rax, 0;
         je  lf_size_raw;
 
@@ -368,8 +379,9 @@ module LongFormat = structure {
         add r12, 1;
         sub r13, 1;
 
-        // ---- step 9b: emit decimal(mtime_ns @ [rsp+64]) -------------
-        mov rdx, [rsp + 64];
+        // ---- step 9b: emit decimal(mtime_ns via extra_ptr) ----------
+        mov r10, [rsp];                      // r10 = extra_ptr
+        mov rdx, [r10];                      // mtime_ns
         mov rdi, r12;
         mov rsi, r13;
         call render_dec_u64;
@@ -424,7 +436,7 @@ module LongFormat = structure {
         // ---- success: return cursor - anchor -----------------------
         mov rax, r12;
         sub rax, rbx;
-        add rsp, 8;
+        pop r9;                               // discard spilled extra_ptr
         pop rbp;
         pop r15;
         pop r14;
@@ -435,7 +447,7 @@ module LongFormat = structure {
 
       lf_overflow:
         mov rax, 0xFFFFFFFFFFFFFFFF;
-        add rsp, 8;
+        pop r9;                               // discard spilled extra_ptr
         pop rbp;
         pop r15;
         pop r14;
