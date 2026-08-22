@@ -1,0 +1,176 @@
+// src/runner.pdx -- ls.M1-003 (paideia-os/ls#3)
+//
+// Runner module: the operation body -- open a KIND_PDXFS_FILE(read)
+// at the given path, iterate its directory entries, and write each
+// entry name to KIND_TTY(write), one per line. M1 SKELETON.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The M1 skeleton of ls's main operation. It ships the wrapper shape,
+// the path-argument gating, and the counter-bumping so the Ls stats
+// table records every run attempt / error the way the M2 body will.
+// On the happy path it returns LS_RUN_STUB (0xFFFFEB20) -- the "we
+// validated the args, we would open KIND_PDXFS_FILE(read) and write
+// the entry names to KIND_TTY(write) if either substrate existed, but
+// neither does yet" signal.
+//
+// This mirrors libpdx-elevate's ELVC_STUB and shell's LR_STUB / EX_STUB
+// idiom. The rationale is the same in three parts:
+//
+//   * KIND_PDXFS_FILE has landed as a mirror-only ordinal at
+//     paideia-os src/kernel/core/cap/kind_pdxfs_file.pdx (0x195) but
+//     the CoW walker + directory-iterate primitives that back it (per
+//     r49-r50-plan.md §2.4) still ship at R42.  Opening a directory
+//     via sys_pdxfs_open + iterating it via sys_pdxfs_dir_readnext
+//     requires primitives that do not yet exist at HEAD 2026-08-21.
+//
+//   * KIND_TTY has no ordinal at HEAD -- kind_tty.pdx does not exist;
+//     the LS_KIND_TTY = 0x196 mirror in Ls is provisional and is
+//     pinned at the KIND_TTY substrate PR.  A userspace sys_write
+//     wrapper against KIND_TTY(write) predates the KIND itself.
+//
+//   * Manufacturing entry names ls did not actually read would defeat
+//     D3 audit-first. A tool that "lists" a directory it never opened
+//     lies to its own audit journal (which lands at M3-003 via
+//     libpdx-audit). The STUB return is the correct signal that M1
+//     validated everything up to the substrate boundary and stopped
+//     before manufacturing bytes.
+//
+// =============================================================================
+// M2 EVOLUTION (documented, not yet built)
+// =============================================================================
+//
+// At M2, runner_ls:
+//
+//   (1) If path_ptr == 0, substitute a pointer to a constant ".\0"
+//       string. In M1 this branch just returns LS_RUN_STUB without
+//       needing the "." constant on hand.
+//
+//   (2) Call the userspace wrapper for sys_pdxfs_open(path_ptr,
+//       R_PDXFS_FILE_READ) which returns a KIND_PDXFS_FILE cap slot
+//       number, or an errno-band value on failure. Cap denied ->
+//       LS_ERR_CAP_DENIED (0xFFFFEB22, allocated at ls.M2). Any other
+//       failure -> LS_ERR_OPEN (0xFFFFEB23, allocated at ls.M2).
+//
+//   (3) Loop:
+//         - sys_pdxfs_dir_readnext(slot, entry_buf, entry_buf_len).
+//           On PDXFS_DIR_EOF, break.
+//         - Extract the NUL-terminated name field from entry_buf.
+//         - Write it (plus '\n') to KIND_TTY(write) via a userspace
+//           sys_write wrapper.
+//         - Bump LS_ST_ENTRIES.
+//
+//   (4) Close the KIND_PDXFS_FILE cap and return LS_OK (0xFFFFEB00).
+//
+// Steps 1 and 2 are single-line replacements of the M1 stub tail. The
+// loop and the KIND_TTY write are the whole M2 body -- the shape of
+// the call chain is what M1 pins.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Runner`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. M1's compares are
+//     `cmp r12, 0` (path ptr non-null) and `cmp rax, 0` (byte0 non-NUL
+//     for the empty-string reject). The 0xFFFFEB2x return sentinels
+//     are `mov rax, imm` emissions, not compares.
+//   - Byte reads always use `xor rax, rax; mov_b rax, [ptr]` (#1248
+//     mitigation). One such read at M1: the byte0 empty-string check
+//     on path_ptr.
+//   - r11 is scratch (not used in M1; the M2 sys_pdxfs_open + sys_
+//     write path will use it for the LEA-to-constant-string reach).
+//   - Two callee-save pushes (r12=path_ptr, r13=flag_bits) preserve
+//     the args through one nested call (ls_note). `sub rsp, 8` on
+//     entry balances rsp % 16 to 0 for the SysV call; matched `add
+//     rsp, 8` before pop at every ret. Same idiom as line_reader
+//     read_line in shell.
+
+module Runner = structure {
+
+  // ==========================================================================
+  // runner_ls(path_ptr, flag_bits) -> u64
+  //
+  // Signature: runner_ls : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): path_ptr   -- NUL-terminated path, or 0 for default "."
+  // RSI (input): flag_bits  -- OR of ArgvSurface::AS_BIT_* (unused at M1;
+  //                            preserved through the call so the M2
+  //                            body can dispatch -l / -a / -h without
+  //                            a signature change)
+  // RAX (output): LS_RUN_STUB on the M1 happy path; LS_ERR_BAD_PATH
+  //               if path_ptr is non-zero but points to an empty
+  //               string; LS_OK (M2+) when a real iteration succeeds.
+  //
+  // M1 semantics (skeleton):
+  //   path_ptr == 0                            -> LS_RUN_STUB (default '.')
+  //   path_ptr != 0 && path_ptr[0] == '\0'     -> LS_ERR_BAD_PATH
+  //   path_ptr != 0 && path_ptr[0] != '\0'     -> LS_RUN_STUB
+  //
+  // Bumps LS_ST_RUNS unconditionally at entry (line_reader precedent);
+  // bumps LS_ST_ERRORS on the empty-string reject.
+  //
+  // Register plan:
+  //   r12 = path_ptr   (callee-save; preserved through ls_note)
+  //   r13 = flag_bits  (callee-save; unused at M1 -- captured so the
+  //                     M2 body can dispatch without a resignature)
+  //   rax = byte load / return value
+  //   rdi = which slot (bumped between calls)
+  //
+  // Push count: 2 callee-saves (r12, r13). Entry rsp % 16 == 8; after
+  // 2 pushes rsp % 16 == 8. `sub rsp, 8` puts rsp % 16 == 0 for the
+  // ls_note call. Matched `add rsp, 8` before every ret.
+  // ==========================================================================
+  pub let runner_ls : (u64, u64) -> u64 !{mem} @{} =
+    fn (path_ptr: u64) (flag_bits: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M1-003 (#3): the runner skeleton. Two callee-save pushes (r12=path_ptr, r13=flag_bits) preserve the args across nested ls_note calls at LS_ST_RUNS / LS_ST_ERRORS so the argument sources are unambiguous at every fork. `sub rsp, 8` balances rsp % 16 to 0 for the nested SysV call, matching the elevate_client_lookup_broker / shell line_reader_read_line idiom. path_ptr == 0 is the caller's cue to default to '.' and always resolves to the LS_RUN_STUB tail at M1 (the M2 body substitutes a pointer to a constant '.\\0' string). path_ptr != 0 with byte0 == '\\0' is an empty-string reject (LS_ERR_BAD_PATH); the byte load uses xor rax + mov_b per #1248 mitigation. Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (compares are against 0 only). LS_RUN_STUB (0xFFFFEB20) is the M1 happy-path sentinel -- KIND_PDXFS_FILE walker + KIND_TTY have not landed in the paideia-os kernel at HEAD (2026-08-21), and manufacturing entry names we did not actually read would defeat D3 audit-first (see design/architecture.md §4). M2 replaces the LS_RUN_STUB tail with the sys_pdxfs_open + sys_pdxfs_dir_readnext + sys_write loop; every consumer already spells the entry point correctly. Labels prefixed rn_ls_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                          // align rsp % 16 for ls_note
+
+        mov r12, rdi;                        // path_ptr
+        mov r13, rsi;                        // flag_bits (unused at M1)
+
+        // Bump LS_ST_RUNS unconditionally so the counter records every
+        // ATTEMPT, not every success -- the failed-path case is still
+        // a run entry the tool wants to see in its stats.
+        mov rdi, 2;                          // LS_ST_RUNS
+        call ls_note;
+
+        // path_ptr == 0 means the caller asked us to default to '.'.
+        // At M1 that always resolves to LS_RUN_STUB (the M2 body
+        // substitutes a real constant '.\0' string).
+        cmp r12, 0;
+        je  rn_ls_stub;
+
+        // path_ptr != 0. Check byte0 != 0. A non-null path that
+        // points to an empty string is a caller bug -- refuse with
+        // LS_ERR_BAD_PATH.
+        xor rax, rax;
+        mov_b rax, [r12];
+        cmp rax, 0;
+        je  rn_ls_bad_path;
+
+        // Fallthrough: path_ptr valid. M1 stub.
+      rn_ls_stub:
+        mov rax, 0xFFFFEB20;                 // LS_RUN_STUB
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      rn_ls_bad_path:
+        mov rdi, 4;                          // LS_ST_ERRORS
+        call ls_note;
+        mov rax, 0xFFFFEB21;                 // LS_ERR_BAD_PATH
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}
