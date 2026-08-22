@@ -14,6 +14,7 @@ lands (see kernel-side gap below).
 | M1-001 (#1)     | scaffold + caps.decl                                           | LANDED |
 | M1-002 (#2)     | argv surface via libpdx-argv                                   | LANDED |
 | M1-003 (#3)     | first runnable: entry-name print to KIND_TTY                   | LANDED |
+| M2-002 (#5)     | owner-column via KIND_USER_ref decode through libpdx-cap       | LANDED |
 | M2-003 (#6)     | -a hidden-files toggle + -h human-readable size                | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
@@ -37,6 +38,9 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   dot-prefix filter). M2-003.
 - `src/human_size.pdx` — `HumanSize` module (the `-h`
   base-2 K/M/G/T/P/E renderer). M2-003.
+- `src/owner_col.pdx` — `OwnerCol` module (the `-l` owner
+  column: `u:<row>` from a raw row or a KIND_USER wire Cap).
+  M2-002. Shim for libpdx-cap.M3-001 (KIND_USER_ref decoder).
 - `caps.decl` — the four caps ls receives at exec (KIND_USER,
   KIND_TTY, KIND_PDXFS_FILE, KIND_IPC_ENDPOINT).
 - `tests/` — empty until `ls.M4-001` lands the fixture matrix.

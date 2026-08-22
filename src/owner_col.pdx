@@ -1,0 +1,296 @@
+// src/owner_col.pdx -- ls.M2-002 (paideia-os/ls#5)
+//
+// OwnerCol module: renders the `-l` long-format owner column from
+// either a raw KIND_USER row id or a wire-form Cap record carrying
+// a KIND_USER reference.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Two entry points:
+//
+//   owner_col_render_from_row(dst_ptr, dst_cap, user_row)
+//     -> bytes_written | OC_ERR_OVERFLOW
+//
+//     Renders "u:<row>" into a caller-owned buffer. `user_row` is the
+//     row id in the kernel's `_user_table` (see paideia-os
+//     src/kernel/core/cap/kind_user.pdx SECTION 1) -- the 16-bit
+//     value the kernel dispenses via `user_row_of_slot`.
+//
+//   owner_col_render_from_wire(dst_ptr, dst_cap, cap_wire_ptr)
+//     -> bytes_written | OC_ERR_NOT_USER | OC_ERR_OVERFLOW
+//
+//     Decodes a 16-byte wire-form Cap record via libpdx-cap::cap_unpack,
+//     verifies `unpacked_kind == KIND_USER = 0x190`, extracts the row
+//     from the low 16 bits of `unpacked_target_ptr` (the same slot the
+//     kernel packs into descriptor[16] per InitCap sidecar convention
+//     -- see kind_user's user_row_of_slot at
+//     paideia-os src/kernel/core/cap/kind_user.pdx SECTION 5), and
+//     delegates to owner_col_render_from_row.  Refuses with
+//     OC_ERR_NOT_USER if the wire record's kind is anything else.
+//
+// =============================================================================
+// LIBPDX-CAP DEPENDENCY (M2 shim)
+// =============================================================================
+//
+// The plan doc (`design/tooling/r49-r50-plan.md` §5.10) allocates the
+// KIND_USER_ref decoder to `libpdx-cap.M3-001` (KIND_USER_ref decode
+// helpers for ls --long owner rendering).  libpdx-cap M2 (the current
+// shipped tier) provides `cap_unpack` + `unpacked_*` singleton slots
+// but does NOT yet ship a first-class KIND_USER_ref decoder.
+//
+// OwnerCol therefore hand-decodes the KIND_USER row here as an M2
+// shim: cap_unpack populates the four singletons, then this module
+// reads `unpacked_kind` + `unpacked_target_ptr` directly.  When
+// libpdx-cap.M3 lands `kind_user_ref_decode(cap_ptr) -> user_row`,
+// owner_col_render_from_wire drops the inline decode and calls the
+// library helper instead.  The wire format is stable across the
+// transition (16-byte Cap record) and the numeric result (a user_row
+// index) is the same, so consumers of OwnerCol see no behavioural
+// change across the swap -- only the module-internal call site moves
+// from `cap_unpack; read unpacked_*` to `kind_user_ref_decode(cap)`.
+//
+// The M2 shim keeps ls's `-l` owner column live before libpdx-cap.M3
+// ships, and pins the decode discipline (kind check first, extract
+// second) that libpdx-cap.M3 will inherit.
+//
+// =============================================================================
+// TEXT FORMAT
+// =============================================================================
+//
+// "u:%d" for the row.  A future release (post-libpdx-cap.M4 when a
+// name-resolution service exists) will replace the numeric render
+// with the username; the "u:" prefix pins the column semantics
+// distinctly from a raw digit column so a downstream schema-typed
+// consumer parsing text-layer output can distinguish "owner: row N"
+// from "size: N".  Same prefix discipline the plan doc D3 audit
+// records use for the audit_id column.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`OwnerCol`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. KIND_USER (0x190)
+//     fits imm32 trivially; the widening sentinels
+//     (OC_ERR_*, mostly 0xFFFF...) stage into r11 for the compare.
+//   - No byte reads (this module never scans a name string --
+//     cap_unpack does the wire read for us and stashes into u64
+//     singletons).
+//   - Byte writes go through render_byte_write (Render module).
+//   - r11 is scratch for LEA + sentinel staging.
+//   - owner_col_render_from_row is non-leaf (calls Render helpers +
+//     render_dec_u64).  Five callee-save pushes (rbx/r12/r13/r14/r15)
+//     leave rsp % 16 == 0 at every nested-call site (entry rsp % 16
+//     == 8; 5 * 8 = 40 additional; 8 + 40 = 48; 48 % 16 == 0).
+//   - owner_col_render_from_wire is non-leaf (calls cap_unpack +
+//     owner_col_render_from_row).  Three callee-save pushes
+//     (rbx/r12/r13) + `sub rsp, 8` pad leave rsp % 16 == 0 at every
+//     nested-call site.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   render_dec_u64          -- Render (src/render.pdx)
+//   render_byte_write       -- Render (src/render.pdx)
+//   cap_unpack              -- libpdx-cap::Cap (src/cap.pdx)
+//
+// Read (via lea):
+//   unpacked_kind           -- libpdx-cap::Cap .bss singleton
+//   unpacked_target_ptr     -- libpdx-cap::Cap .bss singleton
+//
+// KIND constants:
+//   LS_KIND_USER (0x190)    -- Ls (src/ls.pdx)
+
+module OwnerCol = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let OC_OK              : u64 = 0
+  pub let OC_ERR_OVERFLOW    : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let OC_ERR_NOT_USER    : u64 = 0xFFFFEB30    // 0xFFFFEB3x = OwnerCol sub-band
+
+  // ==========================================================================
+  // owner_col_render_from_row(dst_ptr, dst_cap, user_row)
+  //   -> bytes_written | OC_ERR_OVERFLOW
+  //
+  // Signature: (u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI (input): dst_ptr   -- caller-owned buffer
+  //   RSI (input): dst_cap   -- max bytes buffer can accept
+  //   RDX (input): user_row  -- kernel `_user_table` row id (< USER_MAX)
+  //   RAX (output): bytes written, or OC_ERR_OVERFLOW
+  //
+  // Emit sequence:
+  //   'u' -> ':' -> decimal(user_row)
+  //
+  // Register plan (non-leaf, five callee-save pushes for pipeline
+  // stability across the three nested calls):
+  //   rbx = anchor (original dst_ptr; for final total)
+  //   r12 = cursor
+  //   r13 = cap remaining
+  //   r14 = user_row (survives across render_byte_write calls to
+  //         re-emit at the render_dec_u64 site)
+  //   r15 = unused (reserved -- keeping the same 5-push shape as
+  //         HumanSize for consistency; a future -l unit-preserve
+  //         variant may need it)
+  // ==========================================================================
+  pub let owner_col_render_from_row : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst_ptr: u64) (dst_cap: u64) (user_row: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M2-002 (#5): the `-l` owner column from a raw KIND_USER row. Three-step emit: 'u' (0x75), ':' (0x3A), decimal(row). Every nested call's overflow refuses via the r11-staged 0xFFFFFFFFFFFFFFFF sentinel (does not sign-extend from imm32). Anchor kept in rbx so final total = cursor - anchor recovers the byte count without recomputing from a lost input. Five callee-save pushes + no rsp pad (rsp entry % 16 == 8; +40 = 48; 48 % 16 == 0 at every nested-call site). paideia-as conformance: no `test`; no cmp imm > 0x7FFFFFFF (ASCII bytes only); r11 scratch. Labels prefixed ocr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                        // anchor
+        mov r12, rdi;                        // cursor
+        mov r13, rsi;                        // cap remaining
+        mov r14, rdx;                        // user_row (survives calls)
+
+        // ---- emit 'u' ------------------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x75;                       // 'u'
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  ocr_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // ---- emit ':' ------------------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x3A;                       // ':'
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  ocr_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // ---- emit decimal(user_row) ---------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        call render_dec_u64;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  ocr_overflow;
+        add r12, rax;
+
+        // ---- return total = cursor - anchor -------------------------
+        mov rax, r12;
+        sub rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ocr_overflow:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // owner_col_render_from_wire(dst_ptr, dst_cap, cap_wire_ptr)
+  //   -> bytes_written | OC_ERR_NOT_USER | OC_ERR_OVERFLOW
+  //
+  // Signature: (u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI (input): dst_ptr       -- caller-owned buffer
+  //   RSI (input): dst_cap       -- max bytes buffer can accept
+  //   RDX (input): cap_wire_ptr  -- 16-byte Cap record (8-byte aligned)
+  //   RAX (output): bytes written | OC_ERR_NOT_USER | OC_ERR_OVERFLOW
+  //
+  // Flow:
+  //   1. Call cap_unpack(cap_wire_ptr) to populate libpdx-cap's four
+  //      unpacked_* singletons.  cap_unpack (M1) always returns
+  //      CAP_OK; a future cap_unpack_checked variant would refuse on
+  //      manifest violation, but the KIND filter below handles the
+  //      "wrong-kind" case directly.
+  //   2. Load unpacked_kind.  Refuse with OC_ERR_NOT_USER if != 0x190.
+  //   3. Load unpacked_target_ptr.  Mask to low 16 bits (the row id
+  //      the kernel packed into descriptor[16] per
+  //      paideia-os src/kernel/core/cap/kind_user.pdx SECTION 5).
+  //   4. Delegate to owner_col_render_from_row.
+  //
+  // Register plan (non-leaf, three callee-save pushes + pad):
+  //   rbx = dst_ptr  (spilled from rdi; survives cap_unpack)
+  //   r12 = dst_cap  (spilled from rsi; survives cap_unpack)
+  //   r13 = user_row (extracted; live to the render call)
+  //   r11 = LEA / sentinel scratch
+  //
+  // rsp alignment: 3 pushes (-24 bytes); entry rsp % 16 == 8;
+  // 8 + 24 = 32; 32 % 16 == 0 already.  No pad needed.  But we call
+  // both cap_unpack and owner_col_render_from_row across the same
+  // stack frame; three pushes is sufficient for a leaf-alignment
+  // frame between them.  Kept explicit for review.
+  // ==========================================================================
+  pub let owner_col_render_from_wire : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst_ptr: u64) (dst_cap: u64) (cap_wire_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M2-002 (#5): decode a KIND_USER wire-form Cap and render its user row into the `-l` owner column. M2 shim: hand-decodes by calling libpdx-cap::cap_unpack (M1 API) and reading the unpacked_kind + unpacked_target_ptr singletons directly, because libpdx-cap.M3-001 (KIND_USER_ref decode helpers) has not landed.  When libpdx-cap.M3 ships, the six-line decode block below collapses to a one-line `call kind_user_ref_decode; mov r13, rax;` -- wire format + row-id semantics stay identical across the swap.  Kind check precedes the extract so a wrong-kind cap is refused with OC_ERR_NOT_USER (0xFFFFEB30 -- OwnerCol sub-band of the ls error family per design/architecture.md §6) before any row-id extraction runs. Three callee-save pushes; rsp entry % 16 == 8, +24 = 32, aligned at cap_unpack and at owner_col_render_from_row. paideia-as conformance: KIND_USER (0x190) fits imm32; NOT_USER + OVERFLOW sentinels stage into r11 for compares; no `test`; r11 scratch for LEA to libpdx-cap singletons. Labels prefixed ocw_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // dst_ptr
+        mov r12, rsi;                        // dst_cap
+
+        // ---- Step 1: cap_unpack -------------------------------------
+        mov rdi, rdx;                        // cap_wire_ptr
+        call cap_unpack;
+
+        // ---- Step 2: kind check -------------------------------------
+        lea r11, [rip + unpacked_kind];
+        mov rax, [r11];
+        mov r11, 0x190;                      // KIND_USER
+        cmp rax, r11;
+        jne ocw_not_user;
+
+        // ---- Step 3: extract row (low 16 bits of target_ptr) --------
+        lea r11, [rip + unpacked_target_ptr];
+        mov rax, [r11];
+        mov r11, 0xFFFF;
+        and rax, r11;
+        mov r13, rax;                        // user_row
+
+        // ---- Step 4: delegate to from_row ---------------------------
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        call owner_col_render_from_row;
+        // owner_col_render_from_row's return propagates verbatim
+        // (byte count on success, OC_ERR_OVERFLOW on refusal).
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ocw_not_user:
+        mov rax, 0xFFFFEB30;                 // OC_ERR_NOT_USER
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
