@@ -1,7 +1,8 @@
 # ls — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M5 (signed 1.0 release) — IN PROGRESS.
+**Version:** 1.0.0
+**Current milestone:** M5 (signed 1.0 release) — CLOSED.
 M5-001 landed `manifest.pdxproj` (version bumped 0.4→1.0.0), `CHANGELOG.md`
 with the 1.0.0 entry freezing the argv surface + PdxFsDirEntry wire body +
 exit-code map + caps.decl at 1.0, `doc/ls.pdxdoc` (man-equivalent per I7
@@ -9,8 +10,14 @@ for the `doc ls` back-end), and `design/release-1.0.md` pinning the
 `manifest.pdxsig` wire shape KV-record-by-record in the scaffold epoch
 (all-zero signature slots → SIG_UNSIGNED_SCAFFOLD verdict per
 `design/drivers/blob-policy.md` §1.7 in paideia-os; live re-sign at R32
-bumps `created_unix_secs` only). M5-002 (mirror push + `pkg install ls`
-end-to-end witness + `v1.0.0` tag) is next.
+bumps `created_unix_secs` only). M5-002 landed `design/mirror-push.md`
+(mirror tree layout + five-step release-day runbook + four-way byte-
+identity invariant across compose/in-tar/mirror-standalone/mirror-in-tar
+copies of `manifest.pdxsig` + the ten-step `pkg install ls` end-to-end
+path), `tests/pkg_install_e2e.md` (17-row scaffold-epoch/R32-flip matrix
+witness), and tagged `v1.0.0` on `main`. Live QEMU smoke is deferred to
+pkg-repo M5-002 which reads this repo's matrix row order to compose its
+own assertions against a live pkg substrate.
 
 M4 recap: M4-001 landed `tests/color_fixtures.pdx` (10 dispatch + 3 SGR
 goldens). M4-002 landed `tests/owner_fixtures.pdx` (7 row + 2
@@ -43,7 +50,7 @@ semantic-pipe substrate).
 | M4-003 (#13)    | exit-code matrix (empty=0, missing=2, cap-denied=4)            | LANDED |
 | M4-004 (#14)    | --schema output validates against libpdx-semantic-pipe golden  | LANDED |
 | M5-001 (#15)    | dual-signed release + .pdxdoc                                  | LANDED |
-| M5-002 (#16)    | mirror push + verify `pkg install ls` works end-to-end         | OPEN   |
+| M5-002 (#16)    | mirror push + verify `pkg install ls` works end-to-end         | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -123,6 +130,15 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   §1 scaffold epoch, §2 `manifest.pdxsig` KV-record-by-record,
   §3 release process, §4 byte-identity invariant with the mirror
   copy, §5 what freezes at 1.0.
+- `design/mirror-push.md` — mirror-push runbook + `pkg install
+  ls` end-to-end path (M5-002): §1 mirror tree, §2 five-step
+  release-day runbook, §3 four-way byte-identity invariant,
+  §4 ten-step install path against ls-1.0.0, §5 close criterion
+  + deferred live QEMU witness.
+- `tests/pkg_install_e2e.md` — 17-row fixture matrix (M5-002):
+  one row per observable in the install path; each row records
+  the scaffold-epoch expectation and the R32 promotion criterion.
+  Bridges to the pkg-repo M5-002 live harness.
 - `.plans/` — per-milestone implementation notes.
 
 ## Kernel-side substrate (M3 wave)
