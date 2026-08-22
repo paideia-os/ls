@@ -254,8 +254,9 @@ module ColorPicker = structure {
 
         // Load SGR code.
         lea r11, [rip + _cp_sgr_codes];
+        add r11, rdx;                        // r11 = &_cp_sgr_codes[palette_id]
         xor r14, r14;
-        mov_b r14, [r11 + rdx];
+        mov_b r14, [r11];
 
         // Emit ESC (0x1B)
         mov rdi, r12;
