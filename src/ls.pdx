@@ -73,19 +73,19 @@ module Ls = structure {
   //   LS_KIND_IPC_ENDPOINT   src/kernel/core/cap/kind.pdx:72
   //   LS_KIND_USER           src/kernel/core/cap/kind_user.pdx:122
   //   LS_KIND_PDXFS_FILE     src/kernel/core/cap/kind_pdxfs_file.pdx:82
-  //   LS_KIND_TTY            placeholder ordinal 0x196 -- reserved for
-  //                          the KIND_TTY landing in a paideia-os round
-  //                          adjacent to R49 (kind_tty.pdx has not
-  //                          landed at HEAD 2026-08-21). ls's caps.decl
-  //                          names it symbolically; this constant is
-  //                          the numeric hook the M2 InitCap sidecar
-  //                          consumer will read. Same provisional
-  //                          treatment as shell.M1-001's SH_KIND_TTY.
+  //   LS_KIND_TTY            0x197 -- landed at paideia-os R30-PREP
+  //                          (#1631, src/kernel/core/cap/kind_tty.pdx).
+  //                          M2 provisionally mirrored 0x196 which
+  //                          collided with KIND_PDXFS_TXN; ls.M3-001
+  //                          re-pins to the real ordinal. Consumers of
+  //                          this constant (the InitCap sidecar and any
+  //                          M4 fixture that stamps a TTY cap into ls's
+  //                          cap_table) read the correct value from here.
   // ==========================================================================
   pub let LS_KIND_IPC_ENDPOINT : u64 = 5
   pub let LS_KIND_USER         : u64 = 0x190
   pub let LS_KIND_PDXFS_FILE   : u64 = 0x195
-  pub let LS_KIND_TTY          : u64 = 0x196    // provisional, pin at substrate PR
+  pub let LS_KIND_TTY          : u64 = 0x197    // R30-PREP #1631 (kind_tty.pdx)
 
   // ==========================================================================
   // Return-code band 0xFFFFEBxx (ls layer)
@@ -110,6 +110,11 @@ module Ls = structure {
   // Runner stubs and errors (0xFFFFEB2x)
   pub let LS_RUN_STUB              : u64 = 0xFFFFEB20   // M1: validated, no live iterate
   pub let LS_ERR_BAD_PATH          : u64 = 0xFFFFEB21   // path ptr non-zero but empty
+  pub let LS_ERR_READDIR           : u64 = 0xFFFFEB22   // sys_pdxfs_dir_readnext errno
+  pub let LS_ERR_TTY_WRITE         : u64 = 0xFFFFEB23   // sys_write to KIND_TTY errno
+  pub let LS_ERR_EMIT_BIND         : u64 = 0xFFFFEB24   // semantic-pipe bind refused
+  pub let LS_ERR_EMIT_SEND         : u64 = 0xFFFFEB25   // send_record refused
+  pub let LS_ERR_AUDIT             : u64 = 0xFFFFEB26   // audit_begin / commit / output failed
 
   // ==========================================================================
   // Tool-level stats -- eight u64 slots, cache-line aligned.

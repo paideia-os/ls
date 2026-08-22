@@ -1,0 +1,160 @@
+// src/pdxfs_shim.pdx -- ls.M3-001 (paideia-os/ls#8)
+//
+// PdxfsShim module: userspace syscall trampolines for the KIND_PDXFS_FILE
+// directory-iterator primitives Runner needs at ls.M3.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Two trampolines, both LEAF and both matching the arity-<= 4 template
+// from paideia-os src/user/syscall_shim.pdx §3.2 (no r10 shuffle needed
+// -- both bodies have arity 2, so SysV rdi/rsi map straight to SYSCALL
+// rdi/rsi):
+//
+//   pdxfs_open_dir(parent_slot, mode_flags) -> cap_slot | -errno   [sysno 71]
+//     Mint a KIND_PDXFS_FILE (mode nibble = DIR bit 0x2000 for a dir
+//     open) from a parent KIND_MEMORY cap carrying RIGHT_MINT. See
+//     paideia-os src/kernel/core/syscall/handlers/sys_pdxfs_open.pdx
+//     for the parent-slot / mode_flags contract and the full errno
+//     taxonomy (SYS_PDXFS_OPEN_EINVAL = -22, SYS_PDXFS_OPEN_ENFILE
+//     = -33, PFF_MINT_BAD_PARENT and other PFF_TAIL_ENOSPC sentinels
+//     in the 0xFFFFEC2* band). ls itself does not currently hold a
+//     mintable KIND_MEMORY parent -- shell.M2 InitCap will hand ls a
+//     pre-narrowed KIND_PDXFS_FILE(read, <arg-path>) cap directly per
+//     r49-r50-plan.md §4.4 -- so Runner does NOT call this trampoline
+//     at M3. It ships for architectural symmetry with pdxfs_dir_
+//     readnext and to give a future variant of ls that DOES hold a
+//     mintable memory cap (say, an M4 fixture that stitches a synthetic
+//     directory tree) a stable local API to call.
+//
+//   pdxfs_dir_readnext(dir_cap_slot, entry_buf_va) -> 1 | 0 | -errno  [sysno 72]
+//     Fetch one directory entry from a held KIND_PDXFS_FILE cap whose
+//     mode nibble marks it as DIR. entry_buf_va points at a caller-
+//     owned 128-byte buffer that receives the PdxFsDirEntry record
+//     (layout: paideia-os src/kernel/core/cap/pdxfs_dir_iter.pdx §1).
+//     Return codes:
+//       1 = entry written; the buffer holds a live record.
+//       0 = end-of-directory; buffer left untouched.
+//       -EFAULT (0xFFFF...F2) = user-buf VA rejected by user_ptr_ok
+//                               (kernel-half address or unmapped).
+//       -EBADF  (0xFFFF...F7) = dir_cap_slot is not a live
+//                               KIND_PDXFS_FILE with DIR mode.
+//     Runner reads the return via `cmp rax, 1; jne <exit>` -- the
+//     entry-vs-EOD-vs-error branch is one instruction because 1 is
+//     the only value that means "keep going". Same idiom as cp's
+//     pdxfs_read return-code inspection at src/pdxfs.pdx L155.
+//
+// =============================================================================
+// WHY A THIN LOCAL SHIM (NOT LIBPDX-PDXFS)
+// =============================================================================
+//
+// The R49 tooling wave does not currently ship a libpdx-pdxfs library
+// -- every tool that talks to KIND_PDXFS_FILE (cp, cat, rm, mv, mkdir,
+// pkg, and now ls) inlines its own two-instruction trampoline per
+// syscall. See paideia-os/cp src/pdxfs.pdx §1 for the precedent
+// (open/read/write/close as inlined `mov rax, N; syscall; ret`). ls
+// follows the same pattern: two-line trampolines local to the tool
+// keep the ABI compare visible at every call site and defer the
+// consolidation into libpdx-pdxfs to the R51+ library round when the
+// tools' syscall vocabulary is fully audited.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`PdxfsShim`), no directory prefix.
+//   - No `test` mnemonic; no zero-checks (both are pass-through leaves).
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Neither trampoline
+//     issues a compare -- sysno 71 and 72 are loaded via `mov rax, imm`.
+//   - No byte reads (both bodies are pure syscall pass-throughs).
+//   - r11 is scratch (paideia-as reserved); the syscall instruction
+//     itself clobbers rcx + r11 per Intel SDM Vol.2A §SYSCALL, which is
+//     why both bodies declare !{mem, sysreg}.
+//   - Both are LEAF functions -- no callee-save touched, no push/pop
+//     parity to preserve. Entry rsp % 16 == 8 stays 8 through the
+//     syscall; the kernel dispatch handles alignment.
+
+module PdxfsShim = structure {
+
+  // ==========================================================================
+  // Syscall numbers (mirror paideia-os src/kernel/core/syscall/dispatch.pdx
+  // L1583 / L1626).
+  // ==========================================================================
+  pub let PSH_SYSNO_PDXFS_OPEN         : u64 = 71
+  pub let PSH_SYSNO_PDXFS_DIR_READNEXT : u64 = 72
+
+  // ==========================================================================
+  // Mode flag bits (mirror paideia-os src/kernel/core/cap/kind_pdxfs_file.pdx
+  // §mode_bits). Bits [15:12] hold the file-type nibble; DIR is 0x2000.
+  // ==========================================================================
+  pub let PSH_MODE_NIBBLE_DIR : u64 = 0x2000
+
+  // ==========================================================================
+  // Result-code discriminators (documented; callers compare literally).
+  //   1 = one entry written to entry_buf.
+  //   0 = end-of-directory.
+  //   values with bit 63 set = negative-errno u64.
+  // ==========================================================================
+  pub let PSH_READNEXT_RC_ENTRY : u64 = 1
+  pub let PSH_READNEXT_RC_EOD   : u64 = 0
+
+  // ==========================================================================
+  // pdxfs_open_dir(parent_slot, mode_flags) -> cap_slot | -errno
+  //
+  // Signature: (u64, u64) -> u64 !{mem, sysreg} @{cap}
+  //   RDI (input): parent_slot -- KIND_MEMORY cap slot carrying RIGHT_MINT
+  //   RSI (input): mode_flags  -- low-16 PdxFS mode bits; DIR nibble
+  //                               (bit 0x2000) MUST be set for a dir open
+  //   RAX (output): cap_slot in [0, 256) on success; negative-errno u64
+  //                 otherwise.
+  //
+  // Arity 2 <= 4 so no r10 shuffle. Bodies of this shape use
+  // `mov rax, N; syscall; ret` per the cp/pdxfs.pdx precedent.
+  //
+  // Register plan (leaf; syscall is the only op):
+  //   rax = sysno (input) then return code
+  //   rdi = parent_slot (SysV arg0 -> SYSCALL arg0, no move)
+  //   rsi = mode_flags  (SysV arg1 -> SYSCALL arg1, no move)
+  // ==========================================================================
+  pub let pdxfs_open_dir : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (parent_slot: u64) (mode_flags: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "ls.M3-001 (#8): trampoline for paideia-os sysno 71 (sys_pdxfs_open). Two SysV args map straight to SYSCALL rdi/rsi (arity 2 < 4 so no r10 shuffle -- paideia-os src/user/syscall_shim.pdx §3.2 template). Return value is verbatim from the syscall: cap_slot in [0, 256) on success, negative-errno u64 on failure (SYS_PDXFS_OPEN_EINVAL = 0xFFFFFFFFFFFFFFEA if mode_flags > 0xFFFF; SYS_PDXFS_OPEN_ENFILE = 0xFFFFFFFFFFFFFFDF if cap_table full; PFF_MINT_BAD_PARENT + other 0xFFFFEC2* sentinels for mint-side rejects -- see paideia-os src/kernel/core/syscall/handlers/sys_pdxfs_open.pdx §Contract). Effects {mem, sysreg} @{cap} match the kernel body's effects declaration verbatim. Leaf trampoline: no callee-save touched, no push/pop parity to preserve; the SYSCALL instruction clobbers rcx and r11 per Intel SDM Vol.2A §SYSCALL, hence the sysreg effect. Runner does NOT call this at M3 -- shell.M2 InitCap hands ls a pre-narrowed KIND_PDXFS_FILE(read, <arg-path>) directly per r49-r50-plan.md §4.4 -- this trampoline ships for architectural symmetry with pdxfs_dir_readnext and to give an M4 fixture (or a future variant of ls that holds a mintable KIND_MEMORY cap) a stable local API.",
+      block: {
+        mov rax, 71;                             // PSH_SYSNO_PDXFS_OPEN
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_dir_readnext(dir_cap_slot, entry_buf_va) -> 1 | 0 | -errno
+  //
+  // Signature: (u64, u64) -> u64 !{mem, sysreg} @{cap}
+  //   RDI (input): dir_cap_slot -- held KIND_PDXFS_FILE cap slot
+  //                                (DIR mode nibble required by the
+  //                                 kernel body).
+  //   RSI (input): entry_buf_va -- caller-owned buffer VA, at least
+  //                                128 bytes (PDXFS_DIR_ENTRY_SIZE),
+  //                                writable by user_write_bytes_via_walk.
+  //   RAX (output): 1 (entry written) | 0 (EOD) | -errno.
+  //
+  // Arity 2 <= 4 so no r10 shuffle.
+  //
+  // Register plan (leaf; syscall is the only op):
+  //   rax = sysno (input) then return code
+  //   rdi = dir_cap_slot (SysV arg0 -> SYSCALL arg0, no move)
+  //   rsi = entry_buf_va (SysV arg1 -> SYSCALL arg1, no move)
+  // ==========================================================================
+  pub let pdxfs_dir_readnext : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (dir_cap_slot: u64) (entry_buf_va: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "ls.M3-001 (#8): trampoline for paideia-os sysno 72 (sys_pdxfs_dir_readnext). Two SysV args map straight to SYSCALL rdi/rsi (arity 2 < 4 so no r10 shuffle -- paideia-os src/user/syscall_shim.pdx §3.2 template). Return-code discriminator: rax == 1 means one entry written to entry_buf; rax == 0 means end-of-directory (buffer untouched); any other value is a negative-errno u64 (-EFAULT = 0xFFFFFFFFFFFFFFF2 if entry_buf_va rejected by user_ptr_ok; -EBADF = 0xFFFFFFFFFFFFFFF7 if dir_cap_slot is not a live KIND_PDXFS_FILE with DIR mode). Runner reads the return via `cmp rax, 1; jne <exit>` because 1 is the only value that means 'keep going' -- same idiom as cp's pdxfs_read return-code inspection at src/pdxfs.pdx L155. Effects {mem, sysreg} @{cap} match the kernel body's declaration -- mem for the KPTI walker's write into user pages, sysreg for the SYSCALL clobber (rcx + r11), cap for the pdxfs_file_row_of_slot lookup that resolves the cap slot to a row_id. Leaf trampoline: no callee-save touched, no push/pop parity to preserve.",
+      block: {
+        mov rax, 72;                             // PSH_SYSNO_PDXFS_DIR_READNEXT
+        syscall;
+        ret
+      }
+    }
+}

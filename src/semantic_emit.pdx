@@ -1,0 +1,338 @@
+// src/semantic_emit.pdx -- ls.M3-001 (paideia-os/ls#8)
+//
+// SemanticEmit module: schema-bind + per-entry PdxFsDirEntry record
+// emission on ls's stdout KIND_IPC_ENDPOINT.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Two entry points:
+//
+//   sem_emit_bind_stdout() -> u64
+//     Idempotent bind of ls's stdout endpoint slot to the PdxFsDirEntry
+//     schema. Delegates to libpdx-semantic-pipe::Binding::libpdx_
+//     semantic_pipe_bind(fd = LS_STDOUT_ENDPOINT_SLOT, hash_ptr =
+//     &_se_pdxfsdirentry_hash). Returns 0 on success, LS_ERR_EMIT_BIND
+//     (0xFFFFEB24) on refusal.
+//
+//   sem_emit_entry(kernel_entry_ptr) -> u64
+//     Emit ONE PdxFsDirEntry record over the pre-bound stdout endpoint.
+//     The kernel_entry_ptr points at a 128-byte kernel-visible
+//     PdxFsDirEntry (paideia-os src/kernel/core/cap/pdxfs_dir_iter.pdx
+//     §1); this function copies it verbatim into a .bss scratch and
+//     calls libpdx-semantic-pipe::Send::send_record. Returns 0 on
+//     success, LS_ERR_EMIT_SEND (0xFFFFEB25) on refusal.
+//
+// =============================================================================
+// WIRE RECORD SHAPE (M3-001)
+// =============================================================================
+//
+// M3-001 emits the kernel-visible PdxFsDirEntry as-is: 128 bytes,
+// laid out per pdxfs_dir_iter.pdx §1 (inode @0, kind @8, name_len @16,
+// name[104] @24). The receiver decodes with the bound schema.
+//
+// M3-002 (#9) EXTENDS this record to 144 bytes with a 16-byte owner
+// Cap wire appended at [128..144]: owner_kind (u64) @128 = KIND_USER
+// (0x190), owner_target_ptr (u64) @136 = user_row (low 16 bits from
+// the file's KIND_USER_ref, zero-extended). At M3-001, ls does not
+// yet know the file's owner (kernel PdxFsDirEntry does not carry an
+// owner field), so the M3-001 record shape stops at 128 bytes; the
+// M3-002 commit adds the owner slot without changing the semantics of
+// bytes [0..128], so a schema decoder that reads the M3-002 record
+// with an M3-001 expectation still sees a valid prefix.
+//
+// =============================================================================
+// SCHEMA HASH (M3-001 STUB)
+// =============================================================================
+//
+// libpdx-semantic-pipe::Binding requires a non-zero 32-byte hash
+// (SP_ERR_NULL_HASH refuses schema_id == 0 -- see binding.pdx §40).
+// The canonical hash is BLAKE3-truncated("PdxFsDirEntry@0.1") -- a
+// computation that lives in libpdx-schema-registry (R51+, not yet
+// present in the scratchpad checkout). For M3-001 the .bss slot
+// _se_pdxfsdirentry_hash carries a fixed 32-byte stub whose first
+// byte is 0x01 (all-other-bytes zero) so the bind gate passes and
+// the wire prefix is round-trippable by an M4 fixture that pins the
+// same stub. When libpdx-schema-registry.M1 lands, ls-side reset
+// code will overwrite this .bss slot with the real hash at process
+// start; consumers of the constant (send_record's prefix write)
+// never see the swap because the binding table cached the hash at
+// bind time.
+//
+// =============================================================================
+// STDOUT ENDPOINT SLOT
+// =============================================================================
+//
+// LS_STDOUT_ENDPOINT_SLOT = 3 is the placeholder for the
+// KIND_IPC_ENDPOINT cap slot the shell.M2 InitCap will populate at
+// exec time. libpdx-semantic-pipe treats the "fd" arg as a u64 key
+// into its internal binding table; whatever value ls picks here is
+// consistent with the value ls hands to sys_ipc_send (Send::send_
+// record calls it) so long as the two agree. Slot 3 is chosen to
+// sit just above the three seed caps (KIND_USER @0, KIND_TTY @1,
+// KIND_PDXFS_FILE @2) declared in caps.decl; the M4 InitCap witness
+// pins this convention.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`SemanticEmit`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0` (or the
+//     wire-value discriminator in the sub-band error return).
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediate
+//     is 128 (PDXFS_DIR_ENTRY_SIZE) or the SP_SEND_OK sentinel (0);
+//     the 0xFFFFEB2x error returns are `mov rax, imm64` emissions.
+//   - Byte reads (per-byte copy of the 128-byte kernel record into
+//     the .bss scratch) use `xor rax; mov_b rax, [ptr]` per #1248.
+//   - Byte writes via `mov_b [dst], reg` at every store.
+//   - r11 is scratch for LEA staging + short-lived intermediates.
+//   - sem_emit_bind_stdout: non-leaf (calls libpdx_semantic_pipe_bind).
+//     Two callee-save pushes (r12 = flag_bits sink unused here / kept
+//     for symmetry with the M3-002 extension that needs r13 for the
+//     owner_row) + `sub rsp, 8` pad -> rsp % 16 == 0 at every nested
+//     call site.
+//   - sem_emit_entry: non-leaf (calls send_record). Three callee-save
+//     pushes (r12 = kernel_entry_ptr survivor, r13 = copy cursor,
+//     r14 = length) -> 3*8 = 24 bytes; entry rsp % 16 == 8; 8 + 24 =
+//     32; 32 % 16 == 0 at every nested call site.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   libpdx_semantic_pipe_bind      -- libpdx-semantic-pipe::Binding
+//   send_record                    -- libpdx-semantic-pipe::Send
+//
+// Written / read:
+//   _se_pdxfsdirentry_hash         -- 32-byte schema hash stub (this
+//                                     module's .bss)
+//   _se_wire_scratch               -- 128-byte record composition
+//                                     buffer at M3-001; extended to
+//                                     144 bytes at M3-002 (this
+//                                     module's .bss)
+//   _ls_stats                      -- via ls_note (LS_ST_ENTRIES bump)
+
+module SemanticEmit = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let SE_OK               : u64 = 0
+  pub let SE_ERR_BIND         : u64 = 0xFFFFEB24    // LS_ERR_EMIT_BIND mirror
+  pub let SE_ERR_SEND         : u64 = 0xFFFFEB25    // LS_ERR_EMIT_SEND mirror
+
+  // ==========================================================================
+  // Wire constants
+  // ==========================================================================
+  //
+  // The stdout endpoint cap slot ls consumes at exec time (shell.M2
+  // InitCap convention; see file header). u64 because Binding::fd is
+  // typed u64 even though at M3 the value fits in a byte.
+  pub let LS_STDOUT_ENDPOINT_SLOT : u64 = 3
+
+  // Kernel PdxFsDirEntry size (mirror
+  // paideia-os src/kernel/core/cap/pdxfs_dir_iter.pdx §1).
+  pub let SE_KERNEL_ENTRY_SIZE : u64 = 128
+
+  // Wire record body size on the semantic pipe.  M3-001 emits the
+  // kernel record verbatim (128 bytes); M3-002 extends to 144 by
+  // appending a 16-byte owner Cap wire.  Kept as a named constant so
+  // the M3-002 commit is a one-line edit.
+  pub let SE_WIRE_RECORD_SIZE : u64 = 128
+
+  // ==========================================================================
+  // .bss storage
+  // ==========================================================================
+  //
+  // _se_pdxfsdirentry_hash -- 32 bytes = 4 u64 lanes.  BLAKE3-truncated
+  // hash of the PdxFsDirEntry@0.1 schema.  M3-001 stub: first byte
+  // 0x01, remaining 31 bytes zero.  A .bss `uninit` starts zeroed at
+  // load, so we do NOT need a reset entry point that writes it -- the
+  // first-byte stub is imprinted by a static init helper below
+  // (sem_emit_reset), called once from Runner before its first bind
+  // call.  Aligned to 8 so the four qword lanes are naturally aligned.
+  pub let mut _se_pdxfsdirentry_hash : [u64; 4] = uninit @align(8)
+
+  // _se_wire_scratch -- 128 bytes at M3-001 (16 u64 lanes).  Extended
+  // to 144 bytes (18 lanes) at M3-002 to hold the appended owner Cap
+  // wire.  Sized as 18 lanes up front so the M3-002 commit does not
+  // reshape the .bss layout -- only the SE_WIRE_RECORD_SIZE constant
+  // and the sem_emit_entry marshal tail change.
+  pub let mut _se_wire_scratch       : [u64; 18] = uninit @align(8)
+
+  // ==========================================================================
+  // sem_emit_reset() -> ()
+  //
+  // Imprint the stub schema hash into _se_pdxfsdirentry_hash so
+  // Binding::libpdx_semantic_pipe_bind's SP_ERR_NULL_HASH gate
+  // (binding.pdx §40) passes.  Called once from Runner before the
+  // first bind attempt.  Safe to call more than once; second and
+  // subsequent calls are idempotent stores of the same bytes.
+  //
+  // Real hash (BLAKE3-truncated("PdxFsDirEntry@0.1")) arrives via
+  // libpdx-schema-registry.M1 (R51+); at that point sem_emit_reset
+  // fetches from the registry rather than imprinting a constant.
+  //
+  // Register plan (leaf):
+  //   r11 = LEA scratch
+  //   rax = 0x01 seed / zero for the tail lanes
+  // ==========================================================================
+  pub let sem_emit_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M3-001 (#8): imprint a stub PdxFsDirEntry@0.1 schema hash so libpdx-semantic-pipe::Binding's SP_ERR_NULL_HASH gate (binding.pdx §40) passes at bind time. Four qword lanes: lane 0 gets the byte 0x01 in position 0 with the remaining 7 bytes zero; lanes 1..3 stay zero. The first-byte-0x01 stub is a fixed marker any M4 fixture pins symmetrically so the wire prefix round-trips. Real BLAKE3(PdxFsDirEntry@0.1) lands with libpdx-schema-registry.M1 (R51+); at that point this function reads from the registry rather than imprinting a constant. Leaf; r11 scratch for the LEA; no cmp needed. No test mnemonic. Labels prefixed serst_.",
+      block: {
+        lea r11, [rip + _se_pdxfsdirentry_hash];
+        mov rax, 1;                              // low byte 0x01, rest zero
+        mov [r11 + 0], rax;
+        xor rax, rax;
+        mov [r11 + 8], rax;
+        mov [r11 + 16], rax;
+        mov [r11 + 24], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sem_emit_bind_stdout() -> u64
+  //
+  // Signature: () -> u64 !{mem, sysreg} @{cap}
+  //   RAX (output): 0 on success; SE_ERR_BIND (0xFFFFEB24) on refusal.
+  //
+  // Idempotent: libpdx-semantic-pipe::Binding::libpdx_semantic_pipe_
+  // bind returns SP_OK (0) when the fd is already bound to the same
+  // hash and SP_ERR_ALREADY_BOUND (3) when bound to a DIFFERENT hash;
+  // for ls's fixed-hash bind, the second-call return is SP_OK.
+  //
+  // Register plan (non-leaf, one callee-save push for alignment):
+  //   rdi = fd (LS_STDOUT_ENDPOINT_SLOT constant)
+  //   rsi = hash_ptr (LEA _se_pdxfsdirentry_hash)
+  //   rax = call return / SE_ERR_BIND on refusal
+  //   r11 = LEA scratch
+  //   r12 = alignment pad (SysV callee-save discipline; unused here
+  //         but pushed to keep rsp % 16 == 0 for the nested call)
+  // ==========================================================================
+  pub let sem_emit_bind_stdout : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "ls.M3-001 (#8): idempotent bind of LS_STDOUT_ENDPOINT_SLOT (3) to the PdxFsDirEntry@0.1 schema. Calls libpdx-semantic-pipe::Binding::libpdx_semantic_pipe_bind(fd, hash_ptr). Return 0 (SP_OK) is treated as success; every other return (SP_ERR_INVALID_FD 1, SP_ERR_NULL_HASH 2, SP_ERR_ALREADY_BOUND 3, SP_ERR_TABLE_FULL 4) collapses to SE_ERR_BIND (0xFFFFEB24). ALREADY_BOUND would only fire if some other module previously bound the same slot to a DIFFERENT hash -- ls owns its stdout slot, so this cannot happen in a well-formed process; treating it as an error is defence-in-depth. Single r12 push for SysV alignment across the nested call: entry rsp % 16 == 8; one push -> rsp % 16 == 0 for libpdx_semantic_pipe_bind's SysV call site. Matched pop before every ret. Immediates 3 (endpoint slot) and 0 (SP_OK compare) fit imm32 trivially; SE_ERR_BIND stages via r11 (does not fit sign-extended imm32). paideia-as conformance: no test mnemonic; no cmp reg, imm > 0x7FFFFFFF. r11 for LEA + sentinel staging. Effects {mem, sysreg} @{cap} match libpdx_semantic_pipe_bind's effects (which is a pure .bss write today but is documented for the M3 registry-lookup extension that will syscall into svc.schema-registry). Labels prefixed sebs_.",
+      block: {
+        push r12;                                // SysV callee-save + alignment
+
+        // Arg marshalling: rdi = fd, rsi = &hash.
+        mov rdi, 3;                              // LS_STDOUT_ENDPOINT_SLOT
+        lea r11, [rip + _se_pdxfsdirentry_hash];
+        mov rsi, r11;                            // hash_ptr
+
+        call libpdx_semantic_pipe_bind;
+
+        // Return: SP_OK (0) -> SE_OK (0), anything else -> SE_ERR_BIND.
+        cmp rax, 0;
+        jne sebs_bind_fail;
+        xor rax, rax;                            // SE_OK
+        pop r12;
+        ret;
+
+      sebs_bind_fail:
+        mov rax, 0xFFFFEB24;                     // SE_ERR_BIND
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sem_emit_entry(kernel_entry_ptr) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem, sysreg} @{cap}
+  //   RDI (input): kernel_entry_ptr -- 128-byte kernel-visible
+  //                                     PdxFsDirEntry (see
+  //                                     paideia-os pdxfs_dir_iter.pdx §1)
+  //   RAX (output): 0 on success; SE_ERR_SEND on send_record refusal.
+  //
+  // Sequence:
+  //   (1) Copy kernel_entry_ptr[0..128] into _se_wire_scratch[0..128]
+  //       byte-by-byte (paideia-as #1248 mitigation: xor rax, rax
+  //       before every mov_b load).
+  //   (2) Call Send::send_record(fd = LS_STDOUT_ENDPOINT_SLOT,
+  //                              rec_ptr = &_se_wire_scratch,
+  //                              rec_len = SE_WIRE_RECORD_SIZE).
+  //   (3) Return SE_OK on send_record's SP_SEND_OK; else SE_ERR_SEND.
+  //
+  // Register plan (non-leaf, 3 callee-save pushes for alignment + carry):
+  //   r12 = kernel_entry_ptr (survives across the copy loop and the send)
+  //   r13 = copy loop cursor / wire base pointer during send
+  //   r14 = reserved for M3-002 owner_row survival (unused at M3-001)
+  //   rax = load byte / return
+  //   r11 = LEA scratch + sentinel staging
+  //   rcx = copy counter (caller-save; recomputed as needed)
+  //
+  // Alignment: 3 pushes = 24 bytes; entry rsp % 16 == 8; 8 + 24 = 32;
+  // 32 % 16 == 0 at every nested call site.
+  // ==========================================================================
+  pub let sem_emit_entry : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (kernel_entry_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "ls.M3-001 (#8): copy the 128-byte kernel PdxFsDirEntry into _se_wire_scratch and call libpdx-semantic-pipe::Send::send_record(LS_STDOUT_ENDPOINT_SLOT, scratch, SE_WIRE_RECORD_SIZE). Byte-by-byte copy loop with the #1248 mitigation (xor rax, rax; mov_b rax, [src]; mov_b [dst], rax) -- the 128-byte kernel record is small enough that a qword-wide copy has no material saving vs. the byte loop's uop cost, and the byte loop shape is symmetric with libpdx-semantic-pipe::Send::send_record's own body copy. Send return: SP_SEND_OK (0) -> SE_OK (0); every other value collapses to SE_ERR_SEND (0xFFFFEB25). This translation preserves the tool-level error taxonomy (0xFFFFEB2x = Runner sub-band) rather than surfacing library-internal codes to _start. Three callee-save pushes (r12=kernel_entry_ptr for pipeline stability, r13=wire scratch base, r14=reserved for M3-002 owner_row survival) -> rsp % 16 == 0 at every nested call site (entry rsp %16 ==8; 3*8=24; 8+24=32; 32%16==0). Matched pops before every ret. paideia-as conformance: r11 scratch for LEA + sentinel; no test mnemonic; largest cmp immediate is 128 (SE_KERNEL_ENTRY_SIZE); SE_ERR_SEND stages via mov rax, imm64 (return path, not compare). Effects {mem, sysreg} @{cap} match send_record's effects tail. Labels prefixed seme_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                            // r12 = kernel_entry_ptr
+        lea r13, [rip + _se_wire_scratch];       // r13 = &_se_wire_scratch (dst)
+
+        // ---- (1) byte-by-byte copy kernel_entry[0..128] -> scratch --
+        // rcx = 0..128; each iteration:
+        //   xor rax; mov_b rax, [r12 + rcx]; mov_b [r13 + rcx], rax; rcx++.
+        // r11 is the address-holder scratch (LEA-per-iter isn't needed
+        // because we can address via base + index directly, but paideia-
+        // as's mov_b addressing uses [reg] only, so we compute r11 =
+        // r12 + rcx and r10 = r13 + rcx per iteration).
+        xor rcx, rcx;
+
+      seme_copy_head:
+        cmp rcx, 128;                            // SE_KERNEL_ENTRY_SIZE
+        jae seme_copy_done;
+
+        // r11 = &src[rcx]
+        mov r11, r12;
+        add r11, rcx;
+        xor rax, rax;                            // #1248 mitigation
+        mov_b rax, [r11];
+
+        // r10 = &dst[rcx]
+        mov r10, r13;
+        add r10, rcx;
+        mov_b [r10], rax;
+
+        add rcx, 1;
+        jmp seme_copy_head;
+
+      seme_copy_done:
+        // ---- (2) send_record(fd, rec_ptr, rec_len) ------------------
+        mov rdi, 3;                              // LS_STDOUT_ENDPOINT_SLOT
+        mov rsi, r13;                            // &_se_wire_scratch
+        mov rdx, 128;                            // SE_WIRE_RECORD_SIZE (M3-001)
+        call send_record;
+
+        // ---- (3) translate return ------------------------------------
+        cmp rax, 0;                              // SP_SEND_OK
+        jne seme_send_fail;
+        xor rax, rax;                            // SE_OK
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      seme_send_fail:
+        mov rax, 0xFFFFEB25;                     // SE_ERR_SEND
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}

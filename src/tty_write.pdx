@@ -1,0 +1,108 @@
+// src/tty_write.pdx -- ls.M3-001 (paideia-os/ls#8)
+//
+// TtyWrite module: userspace syscall trampoline for writing rendered
+// text bytes to the KIND_TTY(write) sink Runner emits per-entry names
+// through.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// One trampoline:
+//
+//   tty_write(buf_ptr, len) -> bytes_written | -errno   [sysno 1]
+//
+// The KIND_TTY substrate (paideia-os src/kernel/core/cap/kind_tty.pdx
+// R30-PREP #1631) landed the KIND ordinal (0x197), the mint gate, the
+// rights (R_TTY_WRITE = 0x002, R_TTY_INVOKE = 0x008), and the row
+// layout, but explicitly deferred the "syscall wire that pumps bytes
+// from userspace through KIND_TTY into tty_write" to R49.M1 (see
+// kind_tty.pdx §17). At M3-001, ls therefore writes text to KIND_TTY
+// via the POSIX-compatibility fd=1 path -- sys_write(fd=1, buf, len)
+// takes the UART fast-path per paideia-os
+// src/kernel/core/syscall/dispatch.pdx L515: "Fast-path: fd 1 or 2 ->
+// UART (preserves stdout/stderr until init opens TTY fds)". Every
+// other R49 tool that writes to stdout (cp, cat, pkg, mkdir) uses the
+// same path (see paideia-os/cp src/print.pdx §1 and src/pdxfs.pdx L186
+// for the precedent). When the R49.M1 KIND_TTY write wire lands, this
+// module's body flips from `mov rdi, 1; mov rax, 1; syscall` to a
+// `cap_invoke(_ls_tty_slot, TTY_OP_WRITE, buf, len)` sequence; the
+// external ABI stays `tty_write(buf, len) -> bytes | -errno`, so
+// Runner and SemanticEmit's error-handling structure keep their shape.
+//
+// LS_TTY_STDOUT_FD is the constant name for the "fd 1" placeholder;
+// consumers spell it symbolically so the R49.M1 flip is a
+// search-and-replace on the constant + the syscall body, not on
+// callers. Same convention shell.M1's SH_KIND_TTY (also provisional)
+// uses. When the syscall wire lands, LS_TTY_STDOUT_FD retires and
+// consumers read the KIND_TTY cap slot from Ls::_ls_tty_slot (a M4
+// InitCap-populated .bss singleton mirroring shell.M2's precedent).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TtyWrite`), no directory prefix.
+//   - No `test` mnemonic; no zero-checks (leaf pass-through).
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. This module issues
+//     no compares -- sysno 1 and fd 1 are `mov reg, imm` emissions.
+//   - No byte reads.
+//   - r11 is scratch (paideia-as reserved); SYSCALL clobbers rcx + r11
+//     per Intel SDM Vol.2A §SYSCALL (hence sysreg).
+//   - LEAF; no callee-save touched. Entry rsp % 16 == 8 stays 8
+//     through the syscall.
+//
+// =============================================================================
+// ARG SHUFFLE
+// =============================================================================
+//
+// Caller ABI:  tty_write(buf_ptr, len)  -- SysV: rdi=buf_ptr, rsi=len
+// Kernel ABI:  sys_write(fd, buf, len)  -- SysV: rdi=fd, rsi=buf, rdx=len
+//
+// So the shuffle is: rdx <- rsi (len), rsi <- rdi (buf), rdi <- 1 (fd).
+// Order matters -- do rdx first (uses the original rsi), then rsi
+// (uses the original rdi), then rdi (the fd constant last, since
+// nothing else depends on rdi's original value here).
+
+module TtyWrite = structure {
+
+  // ==========================================================================
+  // Sysno + placeholder fd (see file header for the flip-plan).
+  // ==========================================================================
+  pub let TW_SYSNO_WRITE     : u64 = 1
+  pub let LS_TTY_STDOUT_FD   : u64 = 1
+
+  // ==========================================================================
+  // tty_write(buf_ptr, len) -> bytes_written | -errno
+  //
+  // Signature: (u64, u64) -> u64 !{mem, sysreg} @{}
+  //   RDI (input): buf_ptr -- caller-owned bytes to emit
+  //   RSI (input): len     -- number of bytes to emit
+  //   RAX (output): bytes_written in [0, len] on success (short-write
+  //                 possible on quota exhaustion); negative-errno u64
+  //                 on failure (SYS_WRITE_ERR_EBADF = -9,
+  //                 SYS_WRITE_ERR_EIO = -5). Callers gate with
+  //                 `cmp rax, len; jne partial` when they need the
+  //                 short-write path, or `cmp rax, 0; jl err` when
+  //                 they only care about hard failure.
+  //
+  // Register plan (leaf):
+  //   rax = sysno (input) then return
+  //   rdi = fd 1 (set after rsi/rdx are shuffled -- see file header)
+  //   rsi = buf_ptr (shuffled from original rdi)
+  //   rdx = len     (shuffled from original rsi)
+  // ==========================================================================
+  pub let tty_write : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (buf_ptr: u64) (len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "ls.M3-001 (#8): trampoline for paideia-os sysno 1 (sys_write) targeting fd 1 -- the UART fast-path per src/kernel/core/syscall/dispatch.pdx L515 (fd 1/2 short-circuit before the vnode write path). This is the M3 compat shim for KIND_TTY(write) until the R49.M1 KIND_TTY write wire (kind_tty.pdx §17) lands; when it does, this body flips to a cap_invoke(_ls_tty_slot, TTY_OP_WRITE, buf, len) sequence and the external ABI is unchanged. Arg shuffle: caller ABI (buf, len) -> kernel ABI (fd, buf, len) requires rdx <- rsi FIRST (uses original rsi=len), then rsi <- rdi (uses original rdi=buf), then rdi <- 1 (constant fd). Order-dependent because each intermediate step clobbers the source of a later step. Return-code shape is verbatim from sys_write: bytes_written in [0, len] on success (short-write possible on quota), negative-errno u64 on failure. Effects {mem, sysreg} match the kernel body -- mem for the read from buf's user pages, sysreg for the SYSCALL clobber (rcx + r11). No @{cap} because the UART fast-path does not consume a KIND_TTY cap at M3 (the flip to a cap_invoke wire adds @{cap} at R49.M1). Leaf trampoline: no callee-save, no push/pop parity, no compare (immediates 1 and 1 are `mov reg, imm` emissions, not compares).",
+      block: {
+        mov rdx, rsi;                            // len (from original rsi)
+        mov rsi, rdi;                            // buf (from original rdi)
+        mov rdi, 1;                              // fd = LS_TTY_STDOUT_FD
+        mov rax, 1;                              // TW_SYSNO_WRITE
+        syscall;
+        ret
+      }
+    }
+}

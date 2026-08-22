@@ -1,13 +1,14 @@
 # ls — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M2 (core implementation) — CLOSED. All four
-rendering primitives (`-l` long-format, `-a` hidden filter, `-h`
-human size, schema/MIME color) ship as pure functions ready for
-M3 to compose with the readdir loop. Ready for M3 (semantic-pipe
-`PdxFsDirEntry[]` emission + libpdx-audit integration) once the
-R42 PdxFS-v1 directory-iterator substrate lands (see kernel-side
-gap below).
+**Current milestone:** M3 (semantic-pipe / audit integration) — IN
+FLIGHT. M2 shipped four rendering primitives; M3-001 has flipped
+`Runner::runner_ls` from `LS_RUN_STUB` to a real iteration body
+against the R42-PREP-008 substrate (sysno 71 sys_pdxfs_open + sysno
+72 sys_pdxfs_dir_readnext + KIND_TTY 0x197) and wired the M3-001
+schema-bound `PdxFsDirEntry[]` emission on the stdout endpoint.
+M3-002 (owner as cap ref) and M3-003 (`DirListRecord` via libpdx-
+audit) land next.
 
 ## Milestone rollup
 
@@ -20,6 +21,9 @@ gap below).
 | M2-002 (#5)     | owner-column via KIND_USER_ref decode through libpdx-cap       | LANDED |
 | M2-003 (#6)     | -a hidden-files toggle + -h human-readable size                | LANDED |
 | M2-004 (#7)     | coloring driven by declared schema/MIME (not POSIX bits)       | LANDED |
+| M3-001 (#8)     | PdxFsDirEntry[] schema bind + emit on stdout                   | LANDED |
+| M3-002 (#9)     | owner field emits as cap ref, not text uid (D2 literal)        | OPEN   |
+| M3-003 (#10)    | DirListRecord via libpdx-audit before first byte               | OPEN   |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -31,9 +35,12 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
 - `src/ls.pdx` — `Ls` module (KIND mirrors + error band + stats).
 - `src/argv_surface.pdx` — `ArgvSurface` module (flag-bit recogniser
   around `libpdx-argv::Parser`).
-- `src/runner.pdx` — `Runner` module (`runner_ls` skeleton — validates
-  path, returns `LS_RUN_STUB` until the KIND_PDXFS_FILE + KIND_TTY
-  substrates land).
+- `src/runner.pdx` — `Runner` module (`runner_ls` -- real iteration
+  body at M3-001; opens the pre-handed KIND_PDXFS_FILE dir cap,
+  loops sys_pdxfs_dir_readnext, writes name+`\n` to KIND_TTY,
+  emits one PdxFsDirEntry record per accepted entry. At M3-003
+  wraps the whole body in an audit_begin / record_output / commit
+  triple).
 - `src/dispatch.pdx` — `Dispatch` module (`ls_dispatch` composition
   entry point that wires ArgvSurface into Runner).
 - `src/render.pdx` — `Render` module (shared M2 utility:
@@ -50,17 +57,33 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   OwnerCol + HumanSize + Render). M2-001.
 - `src/color_picker.pdx` — `ColorPicker` module (schema-first
   color palette + ANSI SGR prefix/suffix emit). M2-004.
+- `src/pdxfs_shim.pdx` — `PdxfsShim` module (userspace syscall
+  trampolines for sysno 71 sys_pdxfs_open + sysno 72
+  sys_pdxfs_dir_readnext against the R42-PREP-008 substrate).
+  M3-001.
+- `src/tty_write.pdx` — `TtyWrite` module (sysno 1 sys_write to
+  fd 1 for KIND_TTY text output; M3 compat shim, flips to
+  cap_invoke(KIND_TTY, TTY_OP_WRITE) at R49.M1). M3-001.
+- `src/semantic_emit.pdx` — `SemanticEmit` module (schema-bound
+  PdxFsDirEntry emission on the stdout KIND_IPC_ENDPOINT via
+  libpdx-semantic-pipe::Binding + Send). M3-001 (128-byte kernel
+  record).
 - `caps.decl` — the four caps ls receives at exec (KIND_USER,
   KIND_TTY, KIND_PDXFS_FILE, KIND_IPC_ENDPOINT).
 - `tests/` — empty until `ls.M4-001` lands the fixture matrix.
 - `.plans/` — per-milestone implementation notes.
 
-## Kernel-side gap (M2 wave)
+## Kernel-side substrate (M3 wave)
 
-The R42 PdxFS-v1 directory-iterator primitives (a userspace
-`sys_pdxfs_dir_readnext`-shaped syscall + a `sys_pdxfs_open` that
-returns a directory-capable `KIND_PDXFS_FILE`) do NOT exist in
-the paideia-os kernel at HEAD (2026-08-21). `Runner::runner_ls`
-therefore stays STUB across M2; the M2 rendering primitives are
-pure functions ready for M3 to compose with a real readdir loop
-once the substrate lands.
+The R42-PREP-008 substrate landed at paideia-os HEAD (2026-08-21):
+sysno 71 `sys_pdxfs_open` mints a KIND_PDXFS_FILE (dir mode) cap
+from a KIND_MEMORY parent; sysno 72 `sys_pdxfs_dir_readnext` walks
+a per-open cursor over a fixed 3-entry stub set (`.`, `..`,
+`hello.pdx`). `KIND_TTY = 0x197` landed at R30-PREP #1631 (mint
+gate + rights + row layout; the byte-pump write wire is a
+follow-up at R49.M1, so ls.M3-001 writes text through the fd=1
+UART fast-path). `Runner::runner_ls` flips to the real iteration
+body at M3-001; live emission lights up once shell.M2 InitCap
+populates ls's cap_table (LS_DIR_CAP_SLOT = 2 for the pre-narrowed
+KIND_PDXFS_FILE(read, `<arg-path>`); LS_STDOUT_ENDPOINT_SLOT = 3
+for the KIND_IPC_ENDPOINT stdout sink).

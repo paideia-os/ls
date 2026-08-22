@@ -1,72 +1,95 @@
-// src/runner.pdx -- ls.M1-003 (paideia-os/ls#3)
+// src/runner.pdx -- ls.M1-003 + ls.M3-001 (paideia-os/ls#3 + #8)
 //
-// Runner module: the operation body -- open a KIND_PDXFS_FILE(read)
-// at the given path, iterate its directory entries, and write each
-// entry name to KIND_TTY(write), one per line. M1 SKELETON.
+// Runner module: the operation body -- iterate a held KIND_PDXFS_FILE
+// (directory) cap via sys_pdxfs_dir_readnext (sysno 72), write each
+// entry's name to KIND_TTY(write) one per line, and emit one typed
+// PdxFsDirEntry record per entry to the stdout semantic-pipe endpoint.
 //
 // =============================================================================
 // SCOPE
 // =============================================================================
 //
-// The M1 skeleton of ls's main operation. It ships the wrapper shape,
-// the path-argument gating, and the counter-bumping so the Ls stats
-// table records every run attempt / error the way the M2 body will.
-// On the happy path it returns LS_RUN_STUB (0xFFFFEB20) -- the "we
-// validated the args, we would open KIND_PDXFS_FILE(read) and write
-// the entry names to KIND_TTY(write) if either substrate existed, but
-// neither does yet" signal.
+// At ls.M3-001 (#8) Runner FLIPS from LS_RUN_STUB to a real iteration
+// body. The M1 STUB shape is preserved on unreachable paths (the
+// path-argument gates still return the same LS_ERR_BAD_PATH they did
+// at M1 for the empty-string reject) so the M4 correctness matrix
+// keeps its M1 vocabulary; the LS_RUN_STUB return retires at M3 --
+// every well-formed argv now resolves through the real syscall path
+// to either LS_OK or one of the substrate-error sub-band codes:
 //
-// This mirrors libpdx-elevate's ELVC_STUB and shell's LR_STUB / EX_STUB
-// idiom. The rationale is the same in three parts:
-//
-//   * KIND_PDXFS_FILE has landed as a mirror-only ordinal at
-//     paideia-os src/kernel/core/cap/kind_pdxfs_file.pdx (0x195) but
-//     the CoW walker + directory-iterate primitives that back it (per
-//     r49-r50-plan.md §2.4) still ship at R42.  Opening a directory
-//     via sys_pdxfs_open + iterating it via sys_pdxfs_dir_readnext
-//     requires primitives that do not yet exist at HEAD 2026-08-21.
-//
-//   * KIND_TTY has no ordinal at HEAD -- kind_tty.pdx does not exist;
-//     the LS_KIND_TTY = 0x196 mirror in Ls is provisional and is
-//     pinned at the KIND_TTY substrate PR.  A userspace sys_write
-//     wrapper against KIND_TTY(write) predates the KIND itself.
-//
-//   * Manufacturing entry names ls did not actually read would defeat
-//     D3 audit-first. A tool that "lists" a directory it never opened
-//     lies to its own audit journal (which lands at M3-003 via
-//     libpdx-audit). The STUB return is the correct signal that M1
-//     validated everything up to the substrate boundary and stopped
-//     before manufacturing bytes.
+//   LS_OK              (0xFFFFEB00)  entries iterated and emitted
+//   LS_ERR_BAD_PATH    (0xFFFFEB21)  path_ptr != 0 && byte0 == 0
+//   LS_ERR_READDIR     (0xFFFFEB22)  sys_pdxfs_dir_readnext returned -errno
+//   LS_ERR_TTY_WRITE   (0xFFFFEB23)  sys_write (fd 1) returned -errno
+//   LS_ERR_EMIT_BIND   (0xFFFFEB24)  libpdx-semantic-pipe bind refused
+//   LS_ERR_EMIT_SEND   (0xFFFFEB25)  send_record refused
 //
 // =============================================================================
-// M2 EVOLUTION (documented, not yet built)
+// PRE-OPENED DIR CAP CONVENTION
 // =============================================================================
 //
-// At M2, runner_ls:
+// The kernel's sys_pdxfs_open (sysno 71) is a MINT operation whose
+// parent argument must be a KIND_MEMORY cap carrying RIGHT_MINT (see
+// paideia-os src/kernel/core/syscall/handlers/sys_pdxfs_open.pdx §
+// pdxfs_file_cap_mint_inner requirements). ls does NOT hold such a
+// parent -- read-only tools cannot mint filesystem caps. Instead,
+// shell.M2 will hand ls a pre-narrowed KIND_PDXFS_FILE(read, <arg-
+// path>) at exec time via the InitCap sidecar per r49-r50-plan.md
+// §4.4 ("the tool's cap request narrows to exactly the argument
+// path"). The M3-001 Runner therefore does NOT call sys_pdxfs_open;
+// it calls sys_pdxfs_dir_readnext on the pre-handed cap slot pinned
+// at LS_DIR_CAP_SLOT (2).
 //
-//   (1) If path_ptr == 0, substitute a pointer to a constant ".\0"
-//       string. In M1 this branch just returns LS_RUN_STUB without
-//       needing the "." constant on hand.
+// LS_DIR_CAP_SLOT = 2 is chosen to match the caps.decl order:
+//   slot 0: KIND_USER
+//   slot 1: KIND_TTY(write)
+//   slot 2: KIND_PDXFS_FILE(read, <arg-path>)   <-- Runner reads here
+//   slot 3: KIND_IPC_ENDPOINT                    <-- SemanticEmit uses this
 //
-//   (2) Call the userspace wrapper for sys_pdxfs_open(path_ptr,
-//       R_PDXFS_FILE_READ) which returns a KIND_PDXFS_FILE cap slot
-//       number, or an errno-band value on failure. Cap denied ->
-//       LS_ERR_CAP_DENIED (0xFFFFEB22, allocated at ls.M2). Any other
-//       failure -> LS_ERR_OPEN (0xFFFFEB23, allocated at ls.M2).
+// At M3, when ls runs without shell.M2 having populated the cap_table
+// yet, sys_pdxfs_dir_readnext returns -EBADF and Runner surfaces
+// LS_ERR_READDIR -- correct substrate-wiring behaviour; the emission
+// path lights up in a live end-to-end run once shell.M2 lands. This
+// matches the "substrate wiring shipped, live behavior gated on the
+// cap-handoff round" idiom every M3 R49 tool uses.
 //
-//   (3) Loop:
-//         - sys_pdxfs_dir_readnext(slot, entry_buf, entry_buf_len).
-//           On PDXFS_DIR_EOF, break.
-//         - Extract the NUL-terminated name field from entry_buf.
-//         - Write it (plus '\n') to KIND_TTY(write) via a userspace
-//           sys_write wrapper.
-//         - Bump LS_ST_ENTRIES.
+// =============================================================================
+// FLOW (M3-001)
+// =============================================================================
 //
-//   (4) Close the KIND_PDXFS_FILE cap and return LS_OK (0xFFFFEB00).
+//   (1) Gate path_ptr as at M1 (empty string -> LS_ERR_BAD_PATH; null
+//       path is legal at M3 and means "default to the pre-opened
+//       LS_DIR_CAP_SLOT cap" -- the shell narrows to the concrete arg
+//       path at exec, so ls does not resolve paths itself at M3).
+//   (2) sem_emit_reset() -- imprint the schema hash stub.
+//   (3) sem_emit_bind_stdout() -- bind LS_STDOUT_ENDPOINT_SLOT to
+//       PdxFsDirEntry@0.1. On refusal return LS_ERR_EMIT_BIND.
+//   (4) Loop:
+//       (a) pdxfs_dir_readnext(LS_DIR_CAP_SLOT, &_rn_entry_buf) -> rc
+//       (b) rc == 1 -> entry written; proceed.
+//           rc == 0 -> end-of-directory; break.
+//           other  -> LS_ERR_READDIR (propagate).
+//       (c) Extract name_ptr = _rn_entry_buf + PDXFS_DIR_ENT_OFF_NAME
+//           and name_len = *(_rn_entry_buf + PDXFS_DIR_ENT_OFF_NAME_LEN)
+//       (d) hidden_filter_accept(name_ptr, flag_bits & AS_BIT_A):
+//           reject -> ls_note(LS_ST_HIDDEN); continue loop.
+//           accept -> proceed.
+//       (e) Compose name + '\n' into _rn_line_buf (name_len + 1 bytes);
+//           tty_write(&_rn_line_buf, name_len + 1). On refusal
+//           return LS_ERR_TTY_WRITE.
+//       (f) sem_emit_entry(&_rn_entry_buf). On refusal return
+//           LS_ERR_EMIT_SEND.
+//       (g) ls_note(LS_ST_ENTRIES); continue loop.
+//   (5) Return LS_OK.
 //
-// Steps 1 and 2 are single-line replacements of the M1 stub tail. The
-// loop and the KIND_TTY write are the whole M2 body -- the shape of
-// the call chain is what M1 pins.
+// =============================================================================
+// AS_BIT_A DEPENDENCY
+// =============================================================================
+//
+// Runner reads bit 1 of flag_bits (AS_BIT_A per ArgvSurface). Value
+// mirrored locally as RN_BIT_A_MASK = 0x2 so this file does not have
+// to import ArgvSurface's constants -- the bit position is stable
+// across the R49 wave (see design/architecture.md §3.1 bit table).
 //
 // =============================================================================
 // PAIDEIA-AS CONFORMANCE
@@ -74,102 +97,292 @@
 //
 //   - Module name PascalCase basename (`Runner`), no directory prefix.
 //   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
-//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. M1's compares are
-//     `cmp r12, 0` (path ptr non-null) and `cmp rax, 0` (byte0 non-NUL
-//     for the empty-string reject). The 0xFFFFEB2x return sentinels
-//     are `mov rax, imm` emissions, not compares.
-//   - Byte reads always use `xor rax, rax; mov_b rax, [ptr]` (#1248
-//     mitigation). One such read at M1: the byte0 empty-string check
-//     on path_ptr.
-//   - r11 is scratch (not used in M1; the M2 sys_pdxfs_open + sys_
-//     write path will use it for the LEA-to-constant-string reach).
-//   - Two callee-save pushes (r12=path_ptr, r13=flag_bits) preserve
-//     the args through one nested call (ls_note). `sub rsp, 8` on
-//     entry balances rsp % 16 to 0 for the SysV call; matched `add
-//     rsp, 8` before pop at every ret. Same idiom as line_reader
-//     read_line in shell.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Immediates in this
+//     module: 0 (null-check), 1 (readnext-entry discriminator), 2
+//     (RN_BIT_A_MASK), 16 (PDXFS_DIR_ENT_OFF_NAME_LEN), 24
+//     (PDXFS_DIR_ENT_OFF_NAME), 104 (PDXFS_DIR_NAME_MAX + 1 line-cap
+//     bound). The 0xFFFFEB2x error returns are `mov rax, imm64`
+//     emissions, not compares.
+//   - Byte reads (name-copy loop into _rn_line_buf) use `xor rax;
+//     mov_b rax, [ptr]` per #1248.
+//   - Byte writes (name-copy loop tail + '\n' terminator) use
+//     `mov_b [dst], reg`.
+//   - r11 is scratch; r10 is scratch (both used as ephemeral address
+//     holders in the copy loop).
+//   - Non-leaf; many nested calls. Six callee-save pushes (rbx =
+//     dir_cap_slot copy for pipeline stability across readnext + tty_
+//     write + sem_emit_entry, r12 = path_ptr, r13 = flag_bits, r14 =
+//     name_len for the current entry, r15 = _rn_line_buf base, rbp =
+//     name_ptr) + `sub rsp, 8` pad = 56 bytes; entry rsp % 16 == 8;
+//     8 + 56 = 64; 64 % 16 == 0 at every nested-call site. Every ret
+//     path unwinds through rn_ls_epilogue which does the 6 pops + the
+//     rsp restore in one place.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   ls_note                -- Ls (src/ls.pdx)
+//   pdxfs_dir_readnext     -- PdxfsShim (src/pdxfs_shim.pdx)
+//   tty_write              -- TtyWrite (src/tty_write.pdx)
+//   hidden_filter_accept   -- HiddenFilter (src/hidden_filter.pdx)
+//   sem_emit_reset         -- SemanticEmit (src/semantic_emit.pdx)
+//   sem_emit_bind_stdout   -- SemanticEmit (src/semantic_emit.pdx)
+//   sem_emit_entry         -- SemanticEmit (src/semantic_emit.pdx)
 
 module Runner = structure {
 
   // ==========================================================================
+  // Constants (locally mirrored so this file does not depend on
+  // ArgvSurface's bit vocabulary; the M4 smoke matrix catches drift).
+  // ==========================================================================
+
+  // ArgvSurface AS_BIT_A mask (mirrored -- see design/architecture.md §3.1)
+  pub let RN_BIT_A_MASK           : u64 = 0x2
+
+  // Kernel PdxFsDirEntry offsets (mirror paideia-os
+  // src/kernel/core/cap/pdxfs_dir_iter.pdx §1).
+  pub let RN_ENT_OFF_NAME_LEN     : u64 = 16
+  pub let RN_ENT_OFF_NAME         : u64 = 24
+  pub let RN_ENT_NAME_MAX         : u64 = 104
+  pub let RN_ENT_SIZE             : u64 = 128
+
+  // Pre-opened directory cap slot (see file header).
+  pub let LS_DIR_CAP_SLOT         : u64 = 2
+
+  // sys_pdxfs_dir_readnext discriminators.
+  pub let RN_READNEXT_ENTRY       : u64 = 1
+  pub let RN_READNEXT_EOD         : u64 = 0
+
+  // Stat slot ids (mirror Ls; kept as local constants so this file
+  // does not have to import Ls's slot names).
+  pub let RN_STAT_RUNS            : u64 = 2
+  pub let RN_STAT_ENTRIES         : u64 = 3
+  pub let RN_STAT_ERRORS          : u64 = 4
+  pub let RN_STAT_HIDDEN          : u64 = 5
+
+  // ==========================================================================
+  // .bss
+  // ==========================================================================
+  //
+  // _rn_entry_buf -- 128-byte scratch that sys_pdxfs_dir_readnext
+  // writes into (one entry at a time). 16 u64 lanes.
+  //
+  // _rn_line_buf -- name + '\n' composition buffer for the tty_write
+  // call. Sized RN_ENT_NAME_MAX + 1 = 105 bytes = 14 u64 lanes rounded
+  // up.
+  pub let mut _rn_entry_buf : [u64; 16] = uninit @align(8)
+  pub let mut _rn_line_buf  : [u64; 14] = uninit @align(8)
+
+  // ==========================================================================
   // runner_ls(path_ptr, flag_bits) -> u64
   //
-  // Signature: runner_ls : (u64, u64) -> u64 !{mem} @{}
-  // RDI (input): path_ptr   -- NUL-terminated path, or 0 for default "."
-  // RSI (input): flag_bits  -- OR of ArgvSurface::AS_BIT_* (unused at M1;
-  //                            preserved through the call so the M2
-  //                            body can dispatch -l / -a / -h without
-  //                            a signature change)
-  // RAX (output): LS_RUN_STUB on the M1 happy path; LS_ERR_BAD_PATH
-  //               if path_ptr is non-zero but points to an empty
-  //               string; LS_OK (M2+) when a real iteration succeeds.
+  // Signature: (u64, u64) -> u64 !{mem, sysreg} @{cap}
+  //   RDI (input): path_ptr   -- NUL-terminated path (informational at
+  //                              M3 -- shell narrows the dir cap at
+  //                              exec; kept in the signature for the
+  //                              R51+ path-multiplex round).
+  //   RSI (input): flag_bits  -- OR of ArgvSurface::AS_BIT_*.
+  //   RAX (output): LS_OK on success; one of the substrate-error
+  //                 sub-band codes (see file header) on refusal.
   //
-  // M1 semantics (skeleton):
-  //   path_ptr == 0                            -> LS_RUN_STUB (default '.')
-  //   path_ptr != 0 && path_ptr[0] == '\0'     -> LS_ERR_BAD_PATH
-  //   path_ptr != 0 && path_ptr[0] != '\0'     -> LS_RUN_STUB
-  //
-  // Bumps LS_ST_RUNS unconditionally at entry (line_reader precedent);
-  // bumps LS_ST_ERRORS on the empty-string reject.
-  //
-  // Register plan:
-  //   r12 = path_ptr   (callee-save; preserved through ls_note)
-  //   r13 = flag_bits  (callee-save; unused at M1 -- captured so the
-  //                     M2 body can dispatch without a resignature)
-  //   rax = byte load / return value
-  //   rdi = which slot (bumped between calls)
-  //
-  // Push count: 2 callee-saves (r12, r13). Entry rsp % 16 == 8; after
-  // 2 pushes rsp % 16 == 8. `sub rsp, 8` puts rsp % 16 == 0 for the
-  // ls_note call. Matched `add rsp, 8` before every ret.
+  // See file header §Flow for the step-by-step body.
   // ==========================================================================
-  pub let runner_ls : (u64, u64) -> u64 !{mem} @{} =
+  pub let runner_ls : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
     fn (path_ptr: u64) (flag_bits: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "ls.M1-003 (#3): the runner skeleton. Two callee-save pushes (r12=path_ptr, r13=flag_bits) preserve the args across nested ls_note calls at LS_ST_RUNS / LS_ST_ERRORS so the argument sources are unambiguous at every fork. `sub rsp, 8` balances rsp % 16 to 0 for the nested SysV call, matching the elevate_client_lookup_broker / shell line_reader_read_line idiom. path_ptr == 0 is the caller's cue to default to '.' and always resolves to the LS_RUN_STUB tail at M1 (the M2 body substitutes a pointer to a constant '.\\0' string). path_ptr != 0 with byte0 == '\\0' is an empty-string reject (LS_ERR_BAD_PATH); the byte load uses xor rax + mov_b per #1248 mitigation. Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (compares are against 0 only). LS_RUN_STUB (0xFFFFEB20) is the M1 happy-path sentinel -- KIND_PDXFS_FILE walker + KIND_TTY have not landed in the paideia-os kernel at HEAD (2026-08-21), and manufacturing entry names we did not actually read would defeat D3 audit-first (see design/architecture.md §4). M2 replaces the LS_RUN_STUB tail with the sys_pdxfs_open + sys_pdxfs_dir_readnext + sys_write loop; every consumer already spells the entry point correctly. Labels prefixed rn_ls_.",
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "ls.M3-001 (#8): Runner flips from LS_RUN_STUB to a real iteration body. Uses pdxfs_dir_readnext (sysno 72) against a pre-handed KIND_PDXFS_FILE(read, <arg-path>) at LS_DIR_CAP_SLOT (2, per caps.decl order). Bumps LS_ST_RUNS on entry unconditionally so the counter records every ATTEMPT. Argument gates preserve the M1 shape: null path_ptr resolves through the read loop with the pre-handed cap (informational path; shell narrowed the cap already); non-null path_ptr with byte0 == 0 refuses with LS_ERR_BAD_PATH. Emit prelude: sem_emit_reset + sem_emit_bind_stdout must succeed before the read loop; bind refusal returns LS_ERR_EMIT_BIND. Loop: pdxfs_dir_readnext(LS_DIR_CAP_SLOT, &_rn_entry_buf); rc == 1 -> proceed; rc == 0 -> break; else LS_ERR_READDIR. Per-entry: extract name_len (offset 16) + name_ptr (offset 24) from the 128-byte record; hidden_filter_accept(name_ptr, flag_bits & AS_BIT_A) -- rejects bump LS_ST_HIDDEN and loop; accepts compose name + '\\n' in _rn_line_buf (byte copy loop with #1248 mitigation) and tty_write; tty_write refusal (negative rax) -> LS_ERR_TTY_WRITE; then sem_emit_entry (128-byte record over the bound stdout endpoint) -> LS_ERR_EMIT_SEND on refusal; bump LS_ST_ENTRIES; continue. Six callee-save pushes (rbx = LS_DIR_CAP_SLOT copy; r12 = path_ptr; r13 = flag_bits; r14 = name_len for the current entry; r15 = _rn_line_buf base for the tty_write call; rbp = name_ptr for the tty_write + hidden_filter_accept chain) + sub rsp,8 pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at every nested-call site (ls_note, pdxfs_dir_readnext, hidden_filter_accept, tty_write, sem_emit_entry). Matched add rsp,8 + 6 pops before every ret via the shared rn_ls_epilogue label. paideia-as conformance: r11 + r10 for LEA + byte-address scratch; no test mnemonic; largest cmp immediate 128 (RN_ENT_SIZE) fits imm32; the 0xFFFFEB2x return sentinels are mov rax, imm64 emissions, not compares. Effects widened to !{mem, sysreg} @{cap} matching the union of the callees (pdxfs_dir_readnext + tty_write + sem_emit_entry all carry {mem, sysreg}; pdxfs_dir_readnext + sem_emit_entry carry @{cap}). Labels prefixed rn_ls_.",
       block: {
+        // ---- 6-push prologue + 8-byte alignment pad ------------------
+        push rbx;
         push r12;
         push r13;
-        sub rsp, 8;                          // align rsp % 16 for ls_note
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;                              // rsp % 16 == 0 for nested calls
 
-        mov r12, rdi;                        // path_ptr
-        mov r13, rsi;                        // flag_bits (unused at M1)
+        mov r12, rdi;                            // path_ptr
+        mov r13, rsi;                            // flag_bits
 
-        // Bump LS_ST_RUNS unconditionally so the counter records every
-        // ATTEMPT, not every success -- the failed-path case is still
-        // a run entry the tool wants to see in its stats.
-        mov rdi, 2;                          // LS_ST_RUNS
+        // ---- Bump LS_ST_RUNS -----------------------------------------
+        mov rdi, 2;                              // RN_STAT_RUNS
         call ls_note;
 
-        // path_ptr == 0 means the caller asked us to default to '.'.
-        // At M1 that always resolves to LS_RUN_STUB (the M2 body
-        // substitutes a real constant '.\0' string).
+        // ---- Path arg gate (empty-string reject preserved from M1) --
         cmp r12, 0;
-        je  rn_ls_stub;
-
-        // path_ptr != 0. Check byte0 != 0. A non-null path that
-        // points to an empty string is a caller bug -- refuse with
-        // LS_ERR_BAD_PATH.
+        je  rn_ls_pre_emit;                      // null path -> proceed
         xor rax, rax;
         mov_b rax, [r12];
         cmp rax, 0;
         je  rn_ls_bad_path;
 
-        // Fallthrough: path_ptr valid. M1 stub.
-      rn_ls_stub:
-        mov rax, 0xFFFFEB20;                 // LS_RUN_STUB
-        add rsp, 8;
-        pop r13;
-        pop r12;
-        ret;
+      rn_ls_pre_emit:
+        // ---- Emit prelude: schema-imprint + bind ---------------------
+        call sem_emit_reset;
+        call sem_emit_bind_stdout;
+        cmp rax, 0;                              // SE_OK
+        jne rn_ls_bind_fail;
+
+        // ---- Load LS_DIR_CAP_SLOT into rbx for the loop --------------
+        mov rbx, 2;                              // LS_DIR_CAP_SLOT
+
+      rn_ls_loop:
+        // ---- pdxfs_dir_readnext(LS_DIR_CAP_SLOT, &_rn_entry_buf) ----
+        mov rdi, rbx;                            // dir_cap_slot
+        lea r11, [rip + _rn_entry_buf];
+        mov rsi, r11;                            // entry_buf_va
+        call pdxfs_dir_readnext;
+
+        // rc discriminate.
+        cmp rax, 1;                              // RN_READNEXT_ENTRY
+        je  rn_ls_have_entry;
+        cmp rax, 0;                              // RN_READNEXT_EOD
+        je  rn_ls_done;
+
+        // Any other value -> negative-errno; propagate as LS_ERR_READDIR.
+        jmp rn_ls_readdir_fail;
+
+      rn_ls_have_entry:
+        // ---- Load name_len (offset 16) and name_ptr (offset 24) ------
+        lea r11, [rip + _rn_entry_buf];
+        mov r14, [r11 + 16];                     // name_len
+
+        lea r11, [rip + _rn_entry_buf];
+        add r11, 24;                             // name_ptr = &entry + 24
+        mov rbp, r11;                            // rbp = name_ptr
+
+        // ---- hidden_filter_accept(name_ptr, flag_bits & AS_BIT_A) ---
+        mov rdi, rbp;
+        mov rsi, r13;
+        mov r10, 2;                              // RN_BIT_A_MASK
+        and rsi, r10;                            // show_hidden = flag_bits & AS_BIT_A
+        call hidden_filter_accept;
+
+        cmp rax, 0;
+        je  rn_ls_hidden;                        // filtered out
+
+        // ---- Compose _rn_line_buf: copy name bytes + '\n' -----------
+        //
+        // Bound the name copy at min(name_len, RN_ENT_NAME_MAX) so a
+        // corrupt name_len from a broken upstream cannot overflow
+        // _rn_line_buf.
+        mov rcx, r14;                            // name_len
+        mov r10, 104;                            // RN_ENT_NAME_MAX
+        cmp rcx, r10;
+        jbe rn_ls_len_ok;
+        mov rcx, r10;                            // clamp
+
+      rn_ls_len_ok:
+        // r14 = actual bytes-to-copy (clamped)
+        mov r14, rcx;
+
+        lea r15, [rip + _rn_line_buf];           // dst base
+
+        // Byte-copy loop: rax = index 0..rcx (using rcx as remaining).
+        // We use a fresh index r10 inside the loop; r14 holds the
+        // authoritative clamped length.
+        xor r10, r10;                            // idx = 0
+
+      rn_ls_copy_head:
+        cmp r10, r14;                            // idx < len ?
+        jae rn_ls_copy_done;
+
+        mov r11, rbp;                            // &src[0]
+        add r11, r10;                            // &src[idx]
+        xor rax, rax;                            // #1248 mitigation
+        mov_b rax, [r11];
+
+        mov r11, r15;                            // &dst[0]
+        add r11, r10;                            // &dst[idx]
+        mov_b [r11], rax;
+
+        add r10, 1;
+        jmp rn_ls_copy_head;
+
+      rn_ls_copy_done:
+        // ---- Append '\n' -----------------------------------------
+        mov r11, r15;
+        add r11, r14;                            // &dst[len]
+        mov rax, 0x0A;                           // '\n'
+        mov_b [r11], rax;
+
+        // ---- tty_write(&_rn_line_buf, len + 1) ------------------------
+        mov rdi, r15;
+        mov rsi, r14;
+        add rsi, 1;                              // len + 1 (name + '\n')
+        call tty_write;
+
+        // sys_write returns bytes_written on success; negative-errno on
+        // failure. Detect failure with cmp rax, 0; jl (signed) -- if
+        // rax has bit 63 set, it is a negative-errno.
+        cmp rax, 0;
+        jl  rn_ls_tty_fail;
+
+        // ---- sem_emit_entry(&_rn_entry_buf) --------------------------
+        lea r11, [rip + _rn_entry_buf];
+        mov rdi, r11;
+        call sem_emit_entry;
+
+        cmp rax, 0;                              // SE_OK
+        jne rn_ls_send_fail;
+
+        // ---- Bump LS_ST_ENTRIES + continue loop ----------------------
+        mov rdi, 3;                              // RN_STAT_ENTRIES
+        call ls_note;
+
+        jmp rn_ls_loop;
+
+      rn_ls_hidden:
+        // ---- Hidden: bump LS_ST_HIDDEN + continue --------------------
+        mov rdi, 5;                              // RN_STAT_HIDDEN
+        call ls_note;
+        jmp rn_ls_loop;
+
+      rn_ls_done:
+        // ---- Success --------------------------------------------------
+        mov rax, 0xFFFFEB00;                     // LS_OK
+        jmp rn_ls_epilogue;
 
       rn_ls_bad_path:
-        mov rdi, 4;                          // LS_ST_ERRORS
+        mov rdi, 4;                              // RN_STAT_ERRORS
         call ls_note;
-        mov rax, 0xFFFFEB21;                 // LS_ERR_BAD_PATH
+        mov rax, 0xFFFFEB21;                     // LS_ERR_BAD_PATH
+        jmp rn_ls_epilogue;
+
+      rn_ls_bind_fail:
+        mov rdi, 4;
+        call ls_note;
+        mov rax, 0xFFFFEB24;                     // LS_ERR_EMIT_BIND
+        jmp rn_ls_epilogue;
+
+      rn_ls_readdir_fail:
+        mov rdi, 4;
+        call ls_note;
+        mov rax, 0xFFFFEB22;                     // LS_ERR_READDIR
+        jmp rn_ls_epilogue;
+
+      rn_ls_tty_fail:
+        mov rdi, 4;
+        call ls_note;
+        mov rax, 0xFFFFEB23;                     // LS_ERR_TTY_WRITE
+        jmp rn_ls_epilogue;
+
+      rn_ls_send_fail:
+        mov rdi, 4;
+        call ls_note;
+        mov rax, 0xFFFFEB25;                     // LS_ERR_EMIT_SEND
+        jmp rn_ls_epilogue;
+
+      rn_ls_epilogue:
         add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
         pop r13;
         pop r12;
+        pop rbx;
         ret
       }
     }
