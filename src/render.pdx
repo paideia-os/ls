@@ -1,0 +1,199 @@
+// src/render.pdx -- ls.M2-003 (paideia-os/ls#6) prerequisite
+//
+// Render module: shared rendering utilities used by every ls M2 layout
+// module (HumanSize, OwnerCol, LongFormat, ColorPicker). Each helper is
+// pure -- no syscalls, no caps, deterministic given inputs -- so a M4
+// fixture can exercise it against a known-answer table without a live
+// readdir.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Two entry points:
+//
+//   render_dec_u64(dst_ptr, dst_cap, val)
+//     -- write the decimal ASCII digits of `val` into a caller-owned
+//     buffer of length `dst_cap`. On overflow (`n_digits > dst_cap`)
+//     the buffer is left untouched and RENDER_ERR_OVERFLOW is returned.
+//
+//   render_byte_write(dst_ptr, dst_cap, byte_val)
+//     -- write one ASCII byte into a caller-owned buffer of length
+//     `dst_cap`. Returns 1 on success, RENDER_ERR_OVERFLOW on
+//     dst_cap == 0. The one-byte-append primitive every other M2
+//     module leans on for column separators + suffix letters (unit
+//     for HumanSize, ':' for OwnerCol, '\n' for LongFormat's line
+//     terminator) without redeclaring the store.
+//
+// Both are LEAF functions. Callers push/pop their own callee-saves
+// around invocation.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Render`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. All immediates in
+//     this module are <= 10 (the base-10 divisor) or ASCII bytes
+//     (<= 0x7F). RENDER_ERR_OVERFLOW is a `mov rax, imm64` emission,
+//     never a compare.
+//   - Byte writes use `mov_b [dst], reg`; byte reads (none in this
+//     module -- Render is a pure writer) would use `xor rax; mov_b
+//     rax, [src]` per #1248.
+//   - r11 is scratch (paideia-as reserved); r10 holds the divisor
+//     constant across the digit-count and digit-write loops.
+//   - Both entry points are LEAF. render_dec_u64 has four callee-save
+//     pushes (r12, r13, r14, r15) for pipeline stability across the
+//     two-pass digit walk; leaf discipline requires no rsp alignment
+//     but matched push/pop parity is preserved. render_byte_write is
+//     a true single-store leaf -- no callee-save touched.
+
+module Render = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  //
+  // The overflow return distinguishes from a byte count via the high
+  // bit (0xFFFF... range vs 0..N). A caller can either compare
+  // literally or check for the sign bit.
+  pub let RENDER_OK              : u64 = 0
+  pub let RENDER_ERR_OVERFLOW    : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
+  // render_dec_u64(dst_ptr, dst_cap, val) -> bytes_written | RENDER_ERR_OVERFLOW
+  //
+  // Signature: (u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI (input): dst_ptr  -- caller-owned buffer
+  //   RSI (input): dst_cap  -- max bytes the buffer can accept
+  //   RDX (input): val      -- value to render
+  //   RAX (output): number of bytes written, or RENDER_ERR_OVERFLOW
+  //
+  // Two-pass render:
+  //   Pass 1: count digits (n). Special-cases val == 0 as n = 1.
+  //   Pass 2: if n <= dst_cap, write digits right-to-left starting at
+  //           dst_ptr + n - 1 so the natural order (MSB-first) is
+  //           preserved without a reverse step. If n > dst_cap, leave
+  //           dst untouched and return RENDER_ERR_OVERFLOW.
+  //
+  // Register plan (leaf, four callee-save pushes for parity):
+  //   r12 = dst_ptr (spilled from rdi; survives the two passes)
+  //   r13 = dst_cap (spilled from rsi; compared against r15 for bound)
+  //   r14 = val     (spilled from rdx; consumed by pass 2's divmod)
+  //   r15 = n       (digit count from pass 1; live through pass 2)
+  //   r10 = 10 constant (divisor for both passes)
+  //   r8  = write cursor (dst_ptr + n - 1, decremented per digit in pass 2)
+  //   r9  = digit-remaining counter in pass 2 (n .. 1)
+  //   rax = divmod quotient
+  //   rdx = divmod remainder (also the ASCII digit after adding 0x30)
+  //   rcx = tmp value across the divmod loops
+  // ==========================================================================
+  pub let render_dec_u64 : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst_ptr: u64) (dst_cap: u64) (val: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M2-003 (#6) prerequisite: two-pass decimal render. Pass 1 counts digits via successive /10 in a divmod loop (val=0 is the n=1 special case; every other value walks at least one divmod before rcx falls below 10). Pass 2 writes digits right-to-left from dst+n-1 so the caller reads MSB-first without a reverse. Overflow is a signed-sentinel return (0xFFFFFFFFFFFFFFFF) rather than a partial write so a caller that recycles a buffer sees its old contents on refusal, matching the cap_pack precedent (paideia-os libpdx-cap src/cap.pdx L188). paideia-as conformance: divisor 10 staged in r10 (fits imm32 trivially but the load hoists out of the inner loop for consistency with the humansize idiom); no `test` mnemonic; no cmp with imm > 0x7FFFFFFF (max immediate 10); byte store uses mov_b [r8], rdx per libpdx-argv precedent (src/parser.pdx L177); r11 unused in this leaf; four callee-save pushes for parity even though a leaf does not need rsp alignment. Labels prefixed rd_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                        // dst_ptr
+        mov r13, rsi;                        // dst_cap
+        mov r14, rdx;                        // val
+        mov r10, 10;                         // divisor
+
+        // ---- Pass 1: count digits into r15 ----------------------------
+        mov r15, 1;                          // n = 1 (covers val == 0)
+        mov rcx, r14;                        // tmp = val
+
+      rd_count_loop:
+        cmp rcx, 10;
+        jb  rd_count_done;
+        xor rdx, rdx;
+        mov rax, rcx;
+        div r10;                             // rax = tmp/10
+        mov rcx, rax;                        // tmp = tmp/10
+        add r15, 1;
+        jmp rd_count_loop;
+
+      rd_count_done:
+        // Bound check.
+        cmp r15, r13;
+        ja  rd_overflow;
+
+        // ---- Pass 2: write digits right-to-left -----------------------
+        // cursor = dst + n - 1
+        mov r8, r12;
+        add r8, r15;
+        sub r8, 1;
+
+        mov r9, r15;                         // remaining = n
+        mov rcx, r14;                        // fresh val copy
+
+      rd_write_loop:
+        xor rdx, rdx;
+        mov rax, rcx;
+        div r10;                             // rax = tmp/10; rdx = tmp%10
+        add rdx, 0x30;                       // ASCII '0'
+        mov_b [r8], rdx;
+        sub r8, 1;
+        mov rcx, rax;
+        sub r9, 1;
+        cmp r9, 0;
+        jne rd_write_loop;
+
+        // Success: return n.
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      rd_overflow:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // render_byte_write(dst_ptr, dst_cap, byte_val)
+  //   -> 1 | RENDER_ERR_OVERFLOW
+  //
+  // Signature: (u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI (input): dst_ptr  -- caller-owned buffer
+  //   RSI (input): dst_cap  -- max bytes buffer can accept
+  //   RDX (input): byte_val -- byte to write (low 8 bits used)
+  //   RAX (output): 1 on success, RENDER_ERR_OVERFLOW on dst_cap == 0
+  //
+  // The one-byte-append primitive every other M2 module leans on for
+  // column separators + suffix letters. Not a memcpy -- deliberately
+  // ONE byte so a caller composing a formatted line sees each store
+  // as a discrete operation with its own bound check.
+  //
+  // Register plan (leaf, no callee-save):
+  //   rax = return value
+  //   rdi, rsi, rdx = inputs, untouched
+  // ==========================================================================
+  pub let render_byte_write : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst_ptr: u64) (dst_cap: u64) (byte_val: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M2-003 (#6) prerequisite: single-byte append. Refuses on dst_cap == 0 before touching dst so a caller recycling a buffer preserves its old byte0 on refusal (mirrors cap_pack's discipline). Fits in a leaf with no callee-save. paideia-as conformance: no `test` (uses cmp rsi, 0); no imm > 0x7FFFFFFF; byte store via mov_b [rdi], rdx per libpdx-argv precedent. Labels prefixed rb_.",
+      block: {
+        cmp rsi, 0;
+        je  rb_overflow;
+        mov_b [rdi], rdx;
+        mov rax, 1;
+        ret;
+      rb_overflow:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+}

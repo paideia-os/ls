@@ -1,0 +1,287 @@
+// src/human_size.pdx -- ls.M2-003 (paideia-os/ls#6)
+//
+// HumanSize module: the `-h` size renderer. Produces the compact
+// "1.2K"/"3.4M"/"5.6G"/"7.8T"/"1.2P"/"3.4E" family used by the
+// `-l -h` long-format size column.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// One entry point:
+//
+//   human_size_render(dst_ptr, dst_cap, bytes)
+//     -> bytes_written | HS_ERR_OVERFLOW
+//
+// Rendering rules (POSIX-compatible with GNU `ls -h` defaults for the
+// common path; deterministic against a M4 known-answer table):
+//
+//   bytes < 1024        -> raw decimal digits, no suffix
+//   bytes < 1024 * 1024 -> "N.dK" (N = bytes/1024; .d = tenth)
+//   bytes < 1024^3      -> "N.dM"
+//   bytes < 1024^4      -> "N.dG"
+//   bytes < 1024^5      -> "N.dT"
+//   bytes < 1024^6      -> "N.dP"
+//   bytes >= 1024^6     -> "N.dE" (E caps -- 64-bit unsigned max is
+//                          15.99 EiB so this is always sufficient)
+//
+// Base-2 (1024) chosen over base-10 (1000) because the R42 PdxFS-v1
+// block sizes are power-of-two aligned: a 4096-byte block renders as
+// "4.0K" base-2 rather than "4.1K" base-10. Same choice GNU `ls -h`
+// makes by default.
+//
+// Tenth-digit derivation: prev = val_before_last_shift; the last
+// shift moved 10 bits out, so the 10-bit residue at (prev & 0x3FF)
+// is the fractional-thousandths-of-the-unit's-block. The tenth
+// digit is `residue * 10 >> 10` -- a truncating multiply that
+// matches GNU `ls -h`'s "away-from-zero-in-tenths" default without
+// invoking a divide by 1024 (the shift is exact).
+//
+// M2 does NOT wire this into `Runner::runner_ls` yet -- Runner is
+// still STUB pending the R42 substrate. M3 wires human_size_render
+// into the readdir loop through LongFormat when the substrate
+// arrives; M2 delivers the primitive so M4 fixtures + M3 integration
+// land against a known-good renderer.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`HumanSize`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediate
+//     is 1024 (0x400) for the unit-step compare.
+//   - Byte writes via `mov_b [dst], reg` (through Render helpers).
+//   - Byte reads (unit letter table) via `xor rax; mov_b rax, [ptr]`
+//     per #1248.
+//   - r11 is scratch for the LEA to _hs_units and overflow-sentinel
+//     staging.
+//   - Non-leaf: calls render_dec_u64 twice (integer part + tenth)
+//     and render_byte_write twice (dot + unit letter). Six callee-
+//     save pushes (rbx, r12, r13, r14, r15, rbp) + sub rsp, 8 pad
+//     leaves rsp % 16 == 0 at every nested call site (entry rsp %
+//     16 == 8; 6 * 8 = 48 additional + 8 pad = 56; 8 + 56 = 64;
+//     64 % 16 == 0).
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   render_dec_u64     -- Render (src/render.pdx)
+//   render_byte_write  -- Render (src/render.pdx)
+//
+// Read (via lea):
+//   _hs_units          -- local .rodata unit-letter table
+
+module HumanSize = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let HS_OK            : u64 = 0
+  pub let HS_ERR_OVERFLOW  : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
+  // Unit-letter table
+  //
+  // Indexed by unit_index (1..6). Slot 0 is a NUL placeholder -- the
+  // unit_index == 0 fast path emits raw digits and never consults the
+  // table.  ASCII: K=0x4B M=0x4D G=0x47 T=0x54 P=0x50 E=0x45.
+  // ==========================================================================
+  pub let _hs_units : [u8; 7] = [0, 0x4B, 0x4D, 0x47, 0x54, 0x50, 0x45]
+
+  // ==========================================================================
+  // human_size_render(dst_ptr, dst_cap, bytes) -> bytes_written | HS_ERR_OVERFLOW
+  //
+  // Signature: (u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI (input): dst_ptr  -- caller-owned buffer
+  //   RSI (input): dst_cap  -- max bytes buffer can accept
+  //   RDX (input): bytes    -- value to render
+  //   RAX (output): bytes written, or HS_ERR_OVERFLOW
+  //
+  // Algorithm phases:
+  //   Phase A: precompute all format inputs BEFORE any writes so the
+  //   emit sequence is a straight cursor-advancing chain (integer,
+  //   '.', tenth, letter). Precomputing means no live-across-call
+  //   value depends on `prev` or on the loop state.
+  //   Phase B: emit into caller buffer through Render helpers.
+  //   Phase C: return cursor - anchor.
+  //
+  // Register plan (non-leaf, 6 callee-save + 8-byte pad):
+  //   rbx = anchor  (original dst_ptr; never advances, used for total)
+  //   r12 = cursor  (advances after each emit)
+  //   r13 = cap_rem (decrements after each emit)
+  //   r14 = integer (val after /1024 loop; single digit 1..1023 for
+  //                  unit > 0, or original val for unit == 0 fast path)
+  //   r15 = tenth   (single digit 0..9 for unit > 0; unused for unit == 0)
+  //   rbp = letter  (single byte from _hs_units[unit]; unused for
+  //                  unit == 0)
+  //
+  // Overflow discipline: every nested call's return is compared
+  // against HS_ERR_OVERFLOW (staged into r11 because the sentinel does
+  // not sign-extend from a 32-bit immediate); any child overflow
+  // short-circuits to hs_overflow which returns HS_ERR_OVERFLOW
+  // without further stores.
+  // ==========================================================================
+  pub let human_size_render : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst_ptr: u64) (dst_cap: u64) (bytes: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M2-003 (#6): the `-h` size renderer. Base-2 units (K..E, 1024-based) matching GNU `ls -h` defaults so round-power-of-two PdxFS block sizes render as round values. Precompute-then-emit phase separation avoids keeping `prev` alive across nested calls: the tenth digit is computed once in phase A and stashed in r15 for phase B, and the loop-local `prev` never crosses a call boundary. Two-path structure: fast path (bytes < 1024) delegates to render_dec_u64 with no suffix; slow path emits integer + '.' + tenth + letter. Unit index clamps at 6 (E) which is enough for the 64-bit unsigned range (max value 15.99 EiB). paideia-as conformance: no `test`; largest immediate 1024 (imm32); overflow sentinel 0xFFFFFFFFFFFFFFFF staged via r11 because it does not sign-extend from imm32 (same idiom libpdx-elevate uses at elevate_client_lookup_broker). Six callee-save pushes + sub rsp, 8 = 56 bytes; entry rsp % 16 == 8, + 56 = 64, aligned. Labels prefixed hs_.",
+      block: {
+        // ---- prologue ------------------------------------------------
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;                          // align rsp % 16 for callees
+
+        mov rbx, rdi;                        // anchor = dst_ptr
+        mov r12, rdi;                        // cursor
+        mov r13, rsi;                        // cap remaining
+
+        // ---- Fast path: bytes < 1024 -> raw digits, no suffix -------
+        mov r10, 1024;
+        cmp rdx, r10;
+        jae hs_slow;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        // rdx already carries bytes
+        call render_dec_u64;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  hs_overflow;
+        add r12, rax;
+        // sub r13 not needed -- we're about to return
+        jmp hs_out;
+
+        // ---- Slow path: precompute integer, tenth, letter -----------
+      hs_slow:
+        // rdx = bytes (input, still intact). Walk /1024 loop.
+        // rcx = val; r8 = prev; r9 = unit
+        mov rcx, rdx;                        // val = bytes
+        mov r8,  rdx;                        // prev = bytes (initial)
+        xor r9,  r9;                         // unit = 0
+
+      hs_step:
+        mov r8, rcx;                         // prev = val
+        shr rcx, 10;                         // val /= 1024
+        add r9, 1;                           // unit++
+
+        // Clamp unit at 6 (E).  When we already stepped to unit == 6,
+        // r8 (prev) holds val-at-unit-5, which is what we want for the
+        // tenth digit's residue; any residue above the 10-bit window
+        // at that scale is < 1/1024 of an E and drops into the same
+        // rounding class the tenth already represents.
+        cmp r9, 6;
+        jae hs_clamped;
+
+        mov r10, 1024;
+        cmp rcx, r10;
+        jae hs_step;
+        jmp hs_precompute_done;
+
+      hs_clamped:
+        // Force unit to exactly 6 and stop iterating.  rcx and r8 are
+        // final at this point.
+        mov r9, 6;
+
+      hs_precompute_done:
+        mov r14, rcx;                        // integer
+        mov r15, r9;                         // temporarily hold unit
+                                             // (letter loaded after
+                                             // tenth compute so we
+                                             // do not consume r11)
+        // tenth = ((prev & 0x3FF) * 10) >> 10
+        mov rax, r8;
+        mov r10, 0x3FF;
+        and rax, r10;
+        mov r10, 10;
+        mul r10;                             // rdx:rax = residue * 10
+        shr rax, 10;
+        // rax now holds tenth (0..9).  Stash in a temporary before we
+        // load the letter into rbp (rax is caller-save; safe to
+        // clobber during nested calls once stashed).
+        mov rbp, rax;                        // reuse rbp briefly
+        // Load unit letter from _hs_units[r15].
+        lea r11, [rip + _hs_units];
+        xor rax, rax;
+        mov_b rax, [r11 + r15];              // letter
+        // Swap: rbp <- letter, r15 <- tenth (from what we just placed
+        // in rbp above).
+        mov r10, rbp;                        // r10 = tenth
+        mov rbp, rax;                        // rbp = letter
+        mov r15, r10;                        // r15 = tenth
+
+        // ---- Phase B: emit integer -----------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        call render_dec_u64;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  hs_overflow;
+        add r12, rax;
+        sub r13, rax;
+
+        // ---- emit '.' ------------------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x2E;                       // '.'
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  hs_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // ---- emit tenth digit ----------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r15;
+        call render_dec_u64;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  hs_overflow;
+        add r12, rax;
+        sub r13, rax;
+
+        // ---- emit unit letter ----------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, rbp;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  hs_overflow;
+        add r12, 1;
+
+        // ---- Phase C: return total = cursor - anchor -----------------
+      hs_out:
+        mov rax, r12;
+        sub rax, rbx;
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      hs_overflow:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

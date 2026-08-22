@@ -1,0 +1,95 @@
+// src/hidden_filter.pdx -- ls.M2-003 (paideia-os/ls#6)
+//
+// HiddenFilter module: the `-a` toggle -- decides whether a
+// directory entry whose name starts with '.' is included in the
+// listing.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// One entry point:
+//
+//   hidden_filter_accept(name_ptr, show_hidden) -> 1 | 0
+//
+//     - name_ptr == 0 (defensive)            -> 0  (drop)
+//     - show_hidden != 0                     -> 1  (keep every entry)
+//     - show_hidden == 0 && name[0] == '.'   -> 0  (drop, dot-prefix)
+//     - show_hidden == 0 && name[0] != '.'   -> 1  (keep)
+//
+// Special-case handling of "." and ".." is implicit -- both have
+// name[0] == '.', so both are dropped when `-a` is off and kept when
+// `-a` is on. This is the POSIX ls convention preserved verbatim.
+//
+// M2 does NOT wire this into `Runner::runner_ls` yet -- Runner is
+// still STUB pending the R42 PdxFS-v1 directory-iterator substrate
+// (see src/runner.pdx §4.2 for the M2 evolution rationale). M3 wires
+// hidden_filter_accept into the readdir loop when the substrate
+// arrives; M2 delivers the primitive so M4 fixtures + the M3
+// integration land against a known-good filter.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`HiddenFilter`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. The only immediate
+//     compare in this module is against 0x2E ('.', 46 decimal).
+//   - Byte read: `xor rax, rax; mov_b rax, [name_ptr]` per #1248.
+//   - r11 unused in this leaf; r10 unused too. rax is the byte-load +
+//     return register.
+//   - LEAF function. No callee-save touched, no push/pop parity to
+//     preserve.
+
+module HiddenFilter = structure {
+
+  // ==========================================================================
+  // hidden_filter_accept(name_ptr, show_hidden) -> u64 (1 or 0)
+  //
+  // Signature: (u64, u64) -> u64 !{mem} @{}
+  //   RDI (input): name_ptr    -- NUL-terminated directory-entry name
+  //   RSI (input): show_hidden -- non-zero when `-a` was set (AS_BIT_A)
+  //   RAX (output): 1 = keep entry, 0 = drop entry
+  //
+  // Register plan (leaf):
+  //   rax = byte load / return value
+  //   rdi = name_ptr (untouched)
+  //   rsi = show_hidden (untouched)
+  //
+  // Ordering rationale: the show_hidden fast path precedes the byte
+  // load so a listing with `-a` set skips the memory access entirely
+  // -- meaningful when the M3 readdir loop invokes this once per
+  // entry across a large directory. When `-a` is unset the byte load
+  // costs one uop plus the compare, still no branch mispredict on the
+  // common (non-dot) case.
+  // ==========================================================================
+  pub let hidden_filter_accept : (u64, u64) -> u64 !{mem} @{} =
+    fn (name_ptr: u64) (show_hidden: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M2-003 (#6): the `-a` toggle. name_ptr == 0 refuses defensively (a null name from a broken readdir upstream must not fall through to a load). show_hidden != 0 short-circuits to keep before any load, so a `-a` listing has zero byte reads across a large directory. The byte read follows the #1248 mitigation (`xor rax, rax; mov_b rax, [rdi]`). '.' = 0x2E fits imm32 trivially. Leaf function; no callee-save touched. Labels prefixed hf_.",
+      block: {
+        // Defensive null-name check.
+        cmp rdi, 0;
+        je  hf_drop;
+
+        // `-a` fast path.
+        cmp rsi, 0;
+        jne hf_keep;
+
+        // Byte read: reject if name[0] == '.'.
+        xor rax, rax;
+        mov_b rax, [rdi];
+        cmp rax, 0x2E;                       // '.'
+        je  hf_drop;
+
+      hf_keep:
+        mov rax, 1;
+        ret;
+
+      hf_drop:
+        xor rax, rax;
+        ret
+      }
+    }
+}

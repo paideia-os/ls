@@ -114,13 +114,28 @@ module Ls = structure {
   // ==========================================================================
   // Tool-level stats -- eight u64 slots, cache-line aligned.
   //
-  // Slot map (M1):
+  // Slot map (M1 + M2 name allocations):
   //   0 LS_ST_INVOKES  argv_surface_parse entries
   //   1 LS_ST_OKS      argv_surface_parse OK returns
   //   2 LS_ST_RUNS     runner_ls entries
-  //   3 LS_ST_ENTRIES  entries printed (M2+; unused at M1 stub body)
+  //   3 LS_ST_ENTRIES  entries printed (M3+; unused until readdir lands)
   //   4 LS_ST_ERRORS   any error / reject path from any ls module
-  //   5..7 reserved    for M2+ (dir opens, cap denials, ...)
+  //   5 LS_ST_HIDDEN   entries filtered by HiddenFilter (`-a` off + dot)
+  //                    -- named at M2-003 (#6); bumped at M3 when Runner
+  //                    walks entries through hidden_filter_accept.
+  //   6 LS_ST_LONG     long-format lines rendered by LongFormat
+  //                    -- named at M2-001 (#4); bumped at M3 when
+  //                    Runner emits `-l` output through long_format_line.
+  //   7 LS_ST_COLOR    entries wrapped with ANSI SGR by ColorPicker
+  //                    -- named at M2-004 (#7); bumped at M3 when
+  //                    Runner emits colored output.
+  //
+  // The M2 primitives (HiddenFilter, HumanSize, OwnerCol, LongFormat,
+  // ColorPicker) are pure functions -- they do NOT bump these
+  // counters directly.  Bumps land at M3 when Runner composes the
+  // primitives with the readdir loop; keeping the primitive layer
+  // counter-free means a M4 fixture can call each primitive in
+  // isolation without leaking counter state into a test's neighbours.
   //
   // Cache-line alignment matches _shell_stats / _elevate_broker_stats
   // -- keeps a future SMP counter path a mechanical widening rather
@@ -133,6 +148,9 @@ module Ls = structure {
   pub let LS_ST_RUNS    : u64 = 2
   pub let LS_ST_ENTRIES : u64 = 3
   pub let LS_ST_ERRORS  : u64 = 4
+  pub let LS_ST_HIDDEN  : u64 = 5
+  pub let LS_ST_LONG    : u64 = 6
+  pub let LS_ST_COLOR   : u64 = 7
   pub let LS_ST_MAX     : u64 = 8
 
   // ==========================================================================

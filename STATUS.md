@@ -1,10 +1,11 @@
 # ls — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M1 (design + skeleton) — CLOSED. Ready for
-M2 (core implementation: `-l` long-format rendering, `-a` hidden-
-files toggle, `-h` human-readable size, coloring driven by
-declared schema/MIME).
+**Current milestone:** M2 (core implementation) — IN PROGRESS.
+Rendering primitives (`-l` long-format, `-a` hidden filter, `-h`
+human size, schema/MIME color) land as pure functions; Runner
+stays STUB until the R42 PdxFS-v1 directory-iterator substrate
+lands (see kernel-side gap below).
 
 ## Milestone rollup
 
@@ -13,6 +14,7 @@ declared schema/MIME).
 | M1-001 (#1)     | scaffold + caps.decl                                           | LANDED |
 | M1-002 (#2)     | argv surface via libpdx-argv                                   | LANDED |
 | M1-003 (#3)     | first runnable: entry-name print to KIND_TTY                   | LANDED |
+| M2-003 (#6)     | -a hidden-files toggle + -h human-readable size                | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -29,7 +31,23 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   substrates land).
 - `src/dispatch.pdx` — `Dispatch` module (`ls_dispatch` composition
   entry point that wires ArgvSurface into Runner).
+- `src/render.pdx` — `Render` module (shared M2 utility:
+  `render_dec_u64`, `render_byte_write`). M2-003.
+- `src/hidden_filter.pdx` — `HiddenFilter` module (the `-a`
+  dot-prefix filter). M2-003.
+- `src/human_size.pdx` — `HumanSize` module (the `-h`
+  base-2 K/M/G/T/P/E renderer). M2-003.
 - `caps.decl` — the four caps ls receives at exec (KIND_USER,
   KIND_TTY, KIND_PDXFS_FILE, KIND_IPC_ENDPOINT).
 - `tests/` — empty until `ls.M4-001` lands the fixture matrix.
 - `.plans/` — per-milestone implementation notes.
+
+## Kernel-side gap (M2 wave)
+
+The R42 PdxFS-v1 directory-iterator primitives (a userspace
+`sys_pdxfs_dir_readnext`-shaped syscall + a `sys_pdxfs_open` that
+returns a directory-capable `KIND_PDXFS_FILE`) do NOT exist in
+the paideia-os kernel at HEAD (2026-08-21). `Runner::runner_ls`
+therefore stays STUB across M2; the M2 rendering primitives are
+pure functions ready for M3 to compose with a real readdir loop
+once the substrate lands.
