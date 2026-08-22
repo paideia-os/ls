@@ -200,7 +200,7 @@ module HumanSize = structure {
         mov r10, 0x3FF;
         and rax, r10;
         mov r10, 10;
-        mul r10;                             // rdx:rax = residue * 10
+        imul rax, r10;                       // rax = residue * 10 (fits well under 64 bits; rdx not needed)
         shr rax, 10;
         // rax now holds tenth (0..9).  Stash in a temporary before we
         // load the letter into rbp (rax is caller-save; safe to
@@ -208,8 +208,9 @@ module HumanSize = structure {
         mov rbp, rax;                        // reuse rbp briefly
         // Load unit letter from _hs_units[r15].
         lea r11, [rip + _hs_units];
+        add r11, r15;                        // r11 = &_hs_units[unit]
         xor rax, rax;
-        mov_b rax, [r11 + r15];              // letter
+        mov_b rax, [r11];                    // letter
         // Swap: rbp <- letter, r15 <- tenth (from what we just placed
         // in rbp above).
         mov r10, rbp;                        // r10 = tenth
