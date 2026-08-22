@@ -1,0 +1,225 @@
+// src/exit_map.pdx -- ls.M4-003 (paideia-os/ls#13)
+//
+// ExitMap module: collapse the ls sub-band error codes (0xFFFFEBxx)
+// into the I4 exit-code vocabulary (0/2/3/4) documented at
+// design/architecture.md §6 and design/tooling/plan.md §4.2 in the
+// paideia-os repo.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// One entry point:
+//
+//   exit_map(ls_code) -> u64
+//
+//     Deterministic mapping from a Runner / Dispatch return code (one
+//     of the 0xFFFFEBxx family declared in Ls) to the I4 exit-code
+//     vocabulary the _start frame will hand to `sys_exit`:
+//
+//       0 = success
+//       2 = usage / path error (invoker fixable)
+//       3 = system / substrate error (library or IPC broker failure)
+//       4 = capability denied (I4 substrate refusal, includes both
+//           missing-cap and read-refused-by-cap)
+//
+// This module ships at M4-003 so the ls sub-band -> I4 mapping is a
+// single source of truth reachable from a test fixture and from the
+// eventual _start frame (paideia-os R14b bootstrap). Without this
+// module, the M2 _start would encode the mapping inline; with it, the
+// M4-003 fixture (tests/exit_matrix.pdx) exercises exit_map directly
+// and the R14b _start becomes a two-line wrapper (call ls_dispatch,
+// call exit_map, sys_exit).
+//
+// =============================================================================
+// EMPTY / MISSING / CAP-DENIED (ISSUE #13 LINE)
+// =============================================================================
+//
+// The M4-003 issue text says "empty=0, missing=2, cap-denied=4":
+//
+//   * `empty-dir`. sys_pdxfs_dir_readnext returns 0 (EOD) on the first
+//     iteration; Runner returns LS_OK -> exit 0.
+//   * `missing-dir`. Two paths reach ls at M3:
+//       (a) The ls-side gate: `path_ptr` non-null but points at an
+//           empty string -> LS_ERR_BAD_PATH (0xFFFFEB21) -> exit 2.
+//       (b) The shell-side gate: shell refused to narrow the cap
+//           because the dir does not exist -> ls never runs; the shell
+//           itself surfaces exit 2 to the invoker. Not this module.
+//   * `cap-denied`. sys_pdxfs_dir_readnext returns -EBADF (or any
+//     other non-1/0) because the cap slot was not populated by the
+//     shell's InitCap -> Runner returns LS_ERR_READDIR (0xFFFFEB22)
+//     -> exit 4.
+//
+// The three sentinels the fixture cross-checks are therefore
+// LS_OK (-> 0), LS_ERR_BAD_PATH (-> 2), LS_ERR_READDIR (-> 4). Every
+// other 0xFFFFEBxx code falls into one of {2, 3, 4} per the table
+// below.
+//
+// =============================================================================
+// MAPPING TABLE
+// =============================================================================
+//
+//   0xFFFFEB00  LS_OK                    -> 0
+//   0xFFFFEB10  AS_OK                    -> 0
+//   0xFFFFEB20  LS_RUN_STUB              -> 0
+//
+//   0xFFFFEB11  AS_ERR_BAD_ARGV          -> 2
+//   0xFFFFEB12  AS_ERR_PARSER_REJECT     -> 2
+//   0xFFFFEB13  AS_ERR_UNKNOWN_FLAG      -> 2
+//   0xFFFFEB14  AS_ERR_UNSUPPORTED_SHORT -> 2
+//   0xFFFFEB21  LS_ERR_BAD_PATH          -> 2
+//
+//   0xFFFFEB22  LS_ERR_READDIR           -> 4
+//   0xFFFFEB23  LS_ERR_TTY_WRITE         -> 4
+//
+//   0xFFFFEB24  LS_ERR_EMIT_BIND         -> 3
+//   0xFFFFEB25  LS_ERR_EMIT_SEND         -> 3
+//   0xFFFFEB26  LS_ERR_AUDIT             -> 3
+//
+//   anything else                        -> 3  (unknown -> system)
+//
+// The "unknown" fall-through routes to 3 rather than 4 so an invoker
+// facing an unclassified failure gets the "something upstream is
+// broken, not you" signal rather than the "you lack permission"
+// signal.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ExitMap`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every 0xFFFFEBxx sentinel is a large imm64 that does NOT fit in
+//     a sign-extended imm32 (paideia-as rule: `cmp reg, imm` requires
+//     imm <= 0x7FFFFFFF). Every compare therefore stages the sentinel
+//     into r10 first via `mov r10, imm64; cmp rdi, r10`. Same idiom
+//     Dispatch uses at src/dispatch.pdx for the AS_OK compare.
+//   - No byte reads (this module never touches memory outside its
+//     register file).
+//   - r10 is scratch for the sentinel staging; r11 unused. rdi is the
+//     input (untouched across compares); rax is the return.
+//   - LEAF function -- no callee-save touched, no push/pop parity.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called by: (future) `_start` frame at paideia-os R14b bootstrap;
+//            (present) tests/exit_matrix.pdx fixture verifier.
+// Reads:     nothing.
+// Writes:    nothing.
+
+module ExitMap = structure {
+
+  // ==========================================================================
+  // I4 exit-code vocabulary (design/tooling/plan.md §4.2).
+  // ==========================================================================
+  pub let EM_EXIT_OK      : u64 = 0
+  pub let EM_EXIT_USAGE   : u64 = 2
+  pub let EM_EXIT_SYSTEM  : u64 = 3
+  pub let EM_EXIT_CAP     : u64 = 4
+
+  // ==========================================================================
+  // exit_map(ls_code) -> u64
+  //
+  // Signature: (u64) -> u64 !{} @{}
+  //   RDI (input): ls_code -- one of the 0xFFFFEBxx sentinels from
+  //                           Ls's return-code band (design/
+  //                           architecture.md §6).
+  //   RAX (output): 0 | 2 | 3 | 4 per the mapping table (file header).
+  //
+  // Fall-through discipline: unknown codes route to 3 (system). No
+  // silent 0 return for an unclassified sentinel -- an unclassified
+  // failure MUST NOT look like success to a downstream shell script.
+  // ==========================================================================
+  pub let exit_map : (u64) -> u64 !{} @{} =
+    fn (ls_code: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.M4-003 (#13): pin the ls sub-band -> I4 exit-code mapping. LS_OK (0xFFFFEB00) / AS_OK (0xFFFFEB10) / LS_RUN_STUB (0xFFFFEB20) -> 0. AS_ERR_BAD_ARGV/PARSER_REJECT/UNKNOWN_FLAG/UNSUPPORTED_SHORT + LS_ERR_BAD_PATH -> 2 (usage error, invoker fixable; includes the ls-side missing-path gate). LS_ERR_READDIR + LS_ERR_TTY_WRITE -> 4 (substrate refusal; includes the -EBADF cap-denied case at readnext when the shell's InitCap did not populate the dir cap slot). LS_ERR_EMIT_BIND + LS_ERR_EMIT_SEND + LS_ERR_AUDIT -> 3 (library / IPC broker failure not attributable to the invoker). Unknown 0xFFFFEBxx -> 3 (safe default -- an unclassified failure MUST NOT look like success). Leaf pure function -- no callee-save, no push/pop, no memory. paideia-as conformance: every 0xFFFFEBxx sentinel is large imm64 (does not sign-extend from imm32), staged into r10 for the compare per the Dispatch idiom (paideia-os/ls src/dispatch.pdx `mov r10, 0xFFFFEB10; cmp rax, r10`). No test mnemonic; every zero-check would be `cmp reg, 0` but this function has none. r11 unused. Labels prefixed em_.",
+      block: {
+        // ---- 0xFFFFEB00 LS_OK -----------------------------------------
+        mov r10, 0xFFFFEB00;
+        cmp rdi, r10;
+        je  em_ok;
+
+        // ---- 0xFFFFEB10 AS_OK -----------------------------------------
+        mov r10, 0xFFFFEB10;
+        cmp rdi, r10;
+        je  em_ok;
+
+        // ---- 0xFFFFEB20 LS_RUN_STUB -----------------------------------
+        mov r10, 0xFFFFEB20;
+        cmp rdi, r10;
+        je  em_ok;
+
+        // ---- 0xFFFFEB11 AS_ERR_BAD_ARGV -------------------------------
+        mov r10, 0xFFFFEB11;
+        cmp rdi, r10;
+        je  em_usage;
+
+        // ---- 0xFFFFEB12 AS_ERR_PARSER_REJECT --------------------------
+        mov r10, 0xFFFFEB12;
+        cmp rdi, r10;
+        je  em_usage;
+
+        // ---- 0xFFFFEB13 AS_ERR_UNKNOWN_FLAG ---------------------------
+        mov r10, 0xFFFFEB13;
+        cmp rdi, r10;
+        je  em_usage;
+
+        // ---- 0xFFFFEB14 AS_ERR_UNSUPPORTED_SHORT ----------------------
+        mov r10, 0xFFFFEB14;
+        cmp rdi, r10;
+        je  em_usage;
+
+        // ---- 0xFFFFEB21 LS_ERR_BAD_PATH -------------------------------
+        mov r10, 0xFFFFEB21;
+        cmp rdi, r10;
+        je  em_usage;
+
+        // ---- 0xFFFFEB22 LS_ERR_READDIR (cap-denied via -EBADF) --------
+        mov r10, 0xFFFFEB22;
+        cmp rdi, r10;
+        je  em_cap;
+
+        // ---- 0xFFFFEB23 LS_ERR_TTY_WRITE ------------------------------
+        mov r10, 0xFFFFEB23;
+        cmp rdi, r10;
+        je  em_cap;
+
+        // ---- 0xFFFFEB24 LS_ERR_EMIT_BIND ------------------------------
+        mov r10, 0xFFFFEB24;
+        cmp rdi, r10;
+        je  em_system;
+
+        // ---- 0xFFFFEB25 LS_ERR_EMIT_SEND ------------------------------
+        mov r10, 0xFFFFEB25;
+        cmp rdi, r10;
+        je  em_system;
+
+        // ---- 0xFFFFEB26 LS_ERR_AUDIT ----------------------------------
+        mov r10, 0xFFFFEB26;
+        cmp rdi, r10;
+        je  em_system;
+
+        // ---- Unknown -> system ----------------------------------------
+        jmp em_system;
+
+      em_ok:
+        xor rax, rax;
+        ret;
+
+      em_usage:
+        mov rax, 2;
+        ret;
+
+      em_system:
+        mov rax, 3;
+        ret;
+
+      em_cap:
+        mov rax, 4;
+        ret
+      }
+    }
+}

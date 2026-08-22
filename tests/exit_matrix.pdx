@@ -1,0 +1,258 @@
+// tests/exit_matrix.pdx -- ls.M4-003 (paideia-os/ls#13)
+//
+// ExitMatrix module: the empty/missing/cap-denied exit-code matrix
+// verifier for ExitMap (src/exit_map.pdx). Walks every 0xFFFFEBxx
+// sentinel Ls declares and asserts the I4 exit code it maps to.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// FIXTURE module. Public entry points:
+//
+//   exit_matrix_case_count() -> u64
+//     Returns EM_CASE_COUNT (13).
+//
+//   exit_matrix_run(case_idx) -> u64
+//     Runs one case. Returns 0 on pass; EM_ERR_MISMATCH + case_idx on
+//     fail.
+//
+//   exit_matrix_verify_all() -> u64
+//     Fail-fast walk over every case.
+//
+// =============================================================================
+// MATRIX TABLE
+// =============================================================================
+//
+//   idx  ls_code                     expected_exit_code   plan-doc reference
+//   -----------------------------------------------------------------------
+//    0   0xFFFFEB00 LS_OK                    0            "empty=0"
+//    1   0xFFFFEB10 AS_OK                    0            argv passthrough
+//    2   0xFFFFEB20 LS_RUN_STUB              0            M1 legacy sentinel
+//
+//    3   0xFFFFEB11 AS_ERR_BAD_ARGV          2            usage error
+//    4   0xFFFFEB12 AS_ERR_PARSER_REJECT     2            usage error
+//    5   0xFFFFEB13 AS_ERR_UNKNOWN_FLAG      2            usage error
+//    6   0xFFFFEB14 AS_ERR_UNSUPPORTED_SHORT 2            usage error
+//    7   0xFFFFEB21 LS_ERR_BAD_PATH          2            "missing=2"
+//
+//    8   0xFFFFEB22 LS_ERR_READDIR           4            "cap-denied=4"
+//    9   0xFFFFEB23 LS_ERR_TTY_WRITE         4            cap-denied variant
+//
+//   10   0xFFFFEB24 LS_ERR_EMIT_BIND         3            system error
+//   11   0xFFFFEB25 LS_ERR_EMIT_SEND         3            system error
+//   12   0xFFFFEB26 LS_ERR_AUDIT             3            system error
+//
+// The three lines the M4-003 issue text pins ("empty=0", "missing=2",
+// "cap-denied=4") are cases 0, 7, and 8 respectively. The remaining
+// 10 cases cover every other sentinel in the ls sub-band so a future
+// re-mapping (e.g. splitting LS_ERR_READDIR into missing vs cap-
+// denied when Runner threads errno through) surfaces at M4 rather
+// than at M5.
+//
+// =============================================================================
+// TABLE LAYOUT
+// =============================================================================
+//
+// Each row is a 2-u64 lane pair (ls_code, expected_exit_code); 13
+// rows = 26 u64 = 208 bytes. Adjacent rows in the .rodata block are
+// contiguous so the case-index-to-lane math is `idx * 16`.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ExitMatrix`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediate
+//     in this module: 13 (EM_CASE_COUNT), 16 (row stride). The
+//     0xFFFFEBxx sentinels live in the .rodata table -- never
+//     compared as immediates.
+//   - No byte reads (all row data lives in u64 lanes).
+//   - r10 / r11 are scratch.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   exit_map               -- ExitMap (src/exit_map.pdx)
+
+module ExitMatrix = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let EM_OK               : u64 = 0
+  pub let EM_ERR_MISMATCH     : u64 = 0xFFFFEBD0    // + case_idx
+  pub let EM_ERR_BAD_CASE_IDX : u64 = 0xFFFFEBDF
+
+  pub let EM_CASE_COUNT       : u64 = 13
+
+  // ==========================================================================
+  // Matrix table: 13 rows, 2 u64 lanes each = 26 u64.
+  //
+  // Lane layout:
+  //   [0] ls_code (0xFFFFEBxx sentinel)
+  //   [1] expected_exit_code (0 | 2 | 3 | 4)
+  // ==========================================================================
+  pub let _em_cases : [u64; 26] = [
+      // 0: LS_OK                    -> 0 ("empty=0")
+      0xFFFFEB00, 0,
+      // 1: AS_OK                    -> 0
+      0xFFFFEB10, 0,
+      // 2: LS_RUN_STUB              -> 0
+      0xFFFFEB20, 0,
+      // 3: AS_ERR_BAD_ARGV          -> 2
+      0xFFFFEB11, 2,
+      // 4: AS_ERR_PARSER_REJECT     -> 2
+      0xFFFFEB12, 2,
+      // 5: AS_ERR_UNKNOWN_FLAG      -> 2
+      0xFFFFEB13, 2,
+      // 6: AS_ERR_UNSUPPORTED_SHORT -> 2
+      0xFFFFEB14, 2,
+      // 7: LS_ERR_BAD_PATH          -> 2 ("missing=2")
+      0xFFFFEB21, 2,
+      // 8: LS_ERR_READDIR           -> 4 ("cap-denied=4")
+      0xFFFFEB22, 4,
+      // 9: LS_ERR_TTY_WRITE         -> 4
+      0xFFFFEB23, 4,
+      // 10: LS_ERR_EMIT_BIND        -> 3
+      0xFFFFEB24, 3,
+      // 11: LS_ERR_EMIT_SEND        -> 3
+      0xFFFFEB25, 3,
+      // 12: LS_ERR_AUDIT            -> 3
+      0xFFFFEB26, 3
+  ]
+
+  // ==========================================================================
+  // exit_matrix_case_count() -> u64
+  //
+  // Leaf.
+  // ==========================================================================
+  pub let exit_matrix_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.M4-003 (#13): return EM_CASE_COUNT (13) for a harness iterating via exit_matrix_run. Leaf pure function. paideia-as: no test; no cmp. Labels prefixed emcc_.",
+      block: {
+        mov rax, 13;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // exit_matrix_run(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI: case_idx (0..12)
+  //   RAX: 0 on pass; EM_ERR_MISMATCH + case_idx on fail;
+  //        EM_ERR_BAD_CASE_IDX on out-of-range.
+  //
+  // Loads (ls_code, expected_exit_code) for case_idx, calls
+  // exit_map(ls_code), compares against expected.
+  //
+  // Register plan (non-leaf; three callee-save pushes for pipeline
+  // stability across the exit_map call):
+  //   rbx = case_idx (survives across the call for the error math)
+  //   r12 = row base (LEA target for ls_code + expected_exit lookup)
+  //   r13 = expected_exit_code (survives across the call)
+  //
+  // Alignment: 3 pushes + sub rsp,8 pad = 32 bytes; entry rsp % 16 ==
+  // 8; 8 + 32 = 40; 40 % 16 == 8. That's misaligned. Adopting: 3
+  // pushes + sub rsp,16 pad = 40; total 48; aligned.
+  // ==========================================================================
+  pub let exit_matrix_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-003 (#13): run one exit-matrix case. Bounds check case_idx < 13 -> EM_ERR_BAD_CASE_IDX. LEA _em_cases + case_idx * 16 recovers the row base. Load ls_code (rdi for the exit_map call) and expected_exit_code (r13). Call exit_map, compare rax to r13. Mismatch -> EM_ERR_MISMATCH + case_idx. Three callee-save pushes (rbx=case_idx, r12=row base, r13=expected) + sub rsp,16 pad = 40; entry rsp %16==8; 8+40=48; aligned at exit_map call site. Matched add rsp,16 + 3 pops before every ret. paideia-as conformance: no test mnemonic; largest cmp immediate 13 or 16 (stride); the 0xFFFFEBxx sentinels are mov rax, imm64 stores or ADD-relative arithmetic. Labels prefixed emr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 16;
+
+        mov rbx, rdi;
+
+        cmp rbx, 13;                             // EM_CASE_COUNT
+        jae emr_bad_idx;
+
+        // r12 = &_em_cases + case_idx * 16
+        lea r11, [rip + _em_cases];
+        mov r12, rbx;
+        shl r12, 4;
+        add r12, r11;
+
+        // ls_code -> rdi; expected -> r13.
+        mov rdi, [r12 + 0];
+        mov r13, [r12 + 8];
+
+        call exit_map;
+
+        cmp rax, r13;
+        jne emr_mismatch;
+
+        xor rax, rax;
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      emr_mismatch:
+        mov rax, 0xFFFFEBD0;                     // EM_ERR_MISMATCH
+        add rax, rbx;
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      emr_bad_idx:
+        mov rax, 0xFFFFEBDF;                     // EM_ERR_BAD_CASE_IDX
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // exit_matrix_verify_all() -> u64
+  //
+  // Walk case_idx 0..12; first non-zero return propagates.
+  // ==========================================================================
+  pub let exit_matrix_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-003 (#13): fail-fast walk over all 13 cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp %16==8; 8+24=32; aligned at exit_matrix_run call site. paideia-as: no test; cmp against 13 fits imm32. Labels prefixed emva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 13;
+
+      emva_loop:
+        cmp rbx, r12;
+        jae emva_ok;
+
+        mov rdi, rbx;
+        call exit_matrix_run;
+        cmp rax, 0;
+        jne emva_out;
+
+        add rbx, 1;
+        jmp emva_loop;
+
+      emva_ok:
+        xor rax, rax;
+      emva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

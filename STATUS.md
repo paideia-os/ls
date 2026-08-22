@@ -2,14 +2,14 @@
 
 **Wave:** R50 (Wave 2)
 **Current milestone:** M4 (tests + smoke matrix) — IN PROGRESS.
-M4-001 landed `tests/color_fixtures.pdx` with 10 palette-dispatch
-cases + 3 SGR byte-exact goldens. M4-002 landed
-`tests/owner_fixtures.pdx` with 7 multi-user quota-subtree row
-cases (rows 0, 1, 7, 42, 1000, 65534, 65535) covering every
-decimal-digit-count boundary through `OwnerCol::owner_col_render
-_from_row`, plus 2 wire-cap cases (KIND_USER round-trip + KIND_TTY
-refusal) through `owner_col_render_from_wire`. M4-003 and M4-004
-follow.
+M4-001 landed `tests/color_fixtures.pdx` (10 dispatch + 3 SGR
+goldens). M4-002 landed `tests/owner_fixtures.pdx` (7 row + 2
+wire-cap cases). M4-003 landed `src/exit_map.pdx` — the ls
+sub-band → I4 exit-code mapping (0/2/3/4) reachable from both
+the M4 fixture and the eventual R14b `_start` frame — plus
+`tests/exit_matrix.pdx` with 13 cases covering every 0xFFFFEBxx
+sentinel Ls declares; the "empty=0 / missing=2 / cap-denied=4"
+line from issue #13 is cases 0, 7, 8 respectively. M4-004 follows.
 
 ## Milestone rollup
 
@@ -27,6 +27,7 @@ follow.
 | M3-003 (#10)    | DirListRecord via libpdx-audit before first byte               | LANDED |
 | M4-001 (#11)    | coloring test against known-schema fixture corpus              | LANDED |
 | M4-002 (#12)    | owner-render correctness for multi-user quota subtree          | LANDED |
+| M4-003 (#13)    | exit-code matrix (empty=0, missing=2, cap-denied=4)            | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -83,6 +84,11 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   `ColorPicker`.
 - `tests/owner_fixtures.pdx` — `OwnerFixtures` module (M4-002):
   7 quota-subtree row cases + 2 wire-cap cases for `OwnerCol`.
+- `tests/exit_matrix.pdx` — `ExitMatrix` module (M4-003):
+  13 cases covering every 0xFFFFEBxx sentinel via `ExitMap`.
+- `src/exit_map.pdx` — `ExitMap` module (M4-003): pins the ls
+  sub-band → I4 exit-code mapping (0 / 2 / 3 / 4). Used by the
+  M4-003 fixture and by the eventual R14b `_start` frame.
 - `.plans/` — per-milestone implementation notes.
 
 ## Kernel-side substrate (M3 wave)
