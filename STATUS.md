@@ -3,11 +3,12 @@
 **Wave:** R50 (Wave 2)
 **Current milestone:** M4 (tests + smoke matrix) — IN PROGRESS.
 M4-001 landed `tests/color_fixtures.pdx` with 10 palette-dispatch
-cases covering every branch of the plan-doc §4.4 schema-first /
-kind-fallback table plus 3 byte-exact SGR goldens for the ANSI
-prefix / suffix emitters. Fixture entry-point contract
-(`<name>_case_count`, `<name>_run`, `<name>_verify_all`) is pinned
-for the remaining M4 modules to inherit. M4-002 through M4-004
+cases + 3 SGR byte-exact goldens. M4-002 landed
+`tests/owner_fixtures.pdx` with 7 multi-user quota-subtree row
+cases (rows 0, 1, 7, 42, 1000, 65534, 65535) covering every
+decimal-digit-count boundary through `OwnerCol::owner_col_render
+_from_row`, plus 2 wire-cap cases (KIND_USER round-trip + KIND_TTY
+refusal) through `owner_col_render_from_wire`. M4-003 and M4-004
 follow.
 
 ## Milestone rollup
@@ -25,6 +26,7 @@ follow.
 | M3-002 (#9)     | owner field emits as cap ref, not text uid (D2 literal)        | LANDED |
 | M3-003 (#10)    | DirListRecord via libpdx-audit before first byte               | LANDED |
 | M4-001 (#11)    | coloring test against known-schema fixture corpus              | LANDED |
+| M4-002 (#12)    | owner-render correctness for multi-user quota subtree          | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -79,6 +81,8 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
 - `tests/color_fixtures.pdx` — `ColorFixtures` module (M4-001):
   10 dispatch cases + 3 SGR byte-exact goldens for
   `ColorPicker`.
+- `tests/owner_fixtures.pdx` — `OwnerFixtures` module (M4-002):
+  7 quota-subtree row cases + 2 wire-cap cases for `OwnerCol`.
 - `.plans/` — per-milestone implementation notes.
 
 ## Kernel-side substrate (M3 wave)

@@ -1,0 +1,575 @@
+// tests/owner_fixtures.pdx -- ls.M4-002 (paideia-os/ls#12)
+//
+// OwnerFixtures module: multi-user quota-share subtree correctness for
+// OwnerCol (src/owner_col.pdx). Two sub-matrices:
+//
+//   (A) owner_col_render_from_row: 7 (user_row, expected_bytes) cases
+//       covering the row-id range a multi-user quota subtree exhibits
+//       (0, 1, 7, 42, 1000, 65534, 65535). Every case round-trips
+//       through render_dec_u64 and the "u:" prefix, so a per-user
+//       render regression surfaces at M4 rather than at M5.
+//
+//   (B) owner_col_render_from_wire: 2 golden wire caps.
+//       * KIND_USER (0x190) cap with target_ptr's low 16 bits = 42
+//         -> expected "u:42" (4 bytes).
+//       * KIND_TTY (0x197) cap -> expected OC_ERR_NOT_USER refusal.
+//
+// The wire-cap sub-matrix uses libpdx-cap's wire format (see
+// libpdx-cap/src/cap.pdx L307 cap_unpack):
+//   qword0 = slot(low 16) | kind(bits 16..31) | rights(bits 32..63)
+//   qword1 = target_ptr (verbatim; row is in low 16 bits by
+//            InitCap sidecar convention)
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// FIXTURE module, not production code. Public entry points:
+//
+//   owner_fixtures_case_count() -> u64
+//     Returns OF_CASE_COUNT (7 row + 2 wire = 9).
+//
+//   owner_fixtures_run(case_idx) -> u64
+//     Runs one case. Returns 0 on pass; OF_ERR_* + case_idx on fail.
+//
+//   owner_fixtures_verify_all() -> u64
+//     Fail-fast walk of every case.
+//
+// =============================================================================
+// ROW-CASE TABLE
+// =============================================================================
+//
+//   idx  user_row  expected text  expected len
+//   ----------------------------------------------
+//    0   0         "u:0"          3
+//    1   1         "u:1"          3
+//    2   7         "u:7"          3
+//    3   42        "u:42"         4
+//    4   1000      "u:1000"       6
+//    5   65534     "u:65534"      7
+//    6   65535     "u:65535"      7
+//
+// Each row case = 2 u64 lanes = 16 bytes; 7 cases = 112 bytes.
+//
+// Expected-text bytes are packed into a per-case u64-lane table (up
+// to 8 bytes per case). The byte-diff loop reads `expected_len`
+// bytes from the packed table -- any trailing bytes are zero-padded
+// but never inspected.
+//
+// =============================================================================
+// WIRE-CAP CASES
+// =============================================================================
+//
+//   idx  wire cap                                         expected outcome
+//   -------------------------------------------------------------------------
+//    7   KIND_USER row=42 wire (see _of_wire_cap_u42)     bytes "u:42" (len 4)
+//    8   KIND_TTY (0x197) wire                            OC_ERR_NOT_USER
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`OwnerFixtures`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates
+//     in this module: 7 (row-case cap), 9 (total case cap), 32 (row-
+//     scratch buffer capacity). The OF_ERR_* sentinels and the
+//     OC_ERR_NOT_USER sentinel (0xFFFFEB30) are `mov rax, imm64`
+//     stores or compare via r10.
+//   - Byte reads (byte-diff loop) use `xor rax; mov_b rax, [ptr]`.
+//   - r10 / r11 are scratch.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   owner_col_render_from_row     -- OwnerCol (src/owner_col.pdx)
+//   owner_col_render_from_wire    -- OwnerCol (src/owner_col.pdx)
+
+module OwnerFixtures = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let OF_OK                   : u64 = 0
+  pub let OF_ERR_LEN_MISMATCH     : u64 = 0xFFFFEB80    // + case_idx
+  pub let OF_ERR_BYTE_MISMATCH    : u64 = 0xFFFFEB90    // + case_idx
+  pub let OF_ERR_WIRE_LEN         : u64 = 0xFFFFEBA0    // + case_idx (7 or 8)
+  pub let OF_ERR_WIRE_BYTE        : u64 = 0xFFFFEBB0    // + case_idx
+  pub let OF_ERR_WIRE_NOT_REFUSED : u64 = 0xFFFFEBC0    // TTY cap accepted
+  pub let OF_ERR_BAD_CASE_IDX     : u64 = 0xFFFFEBCF
+
+  // ==========================================================================
+  // Case counts
+  // ==========================================================================
+  pub let OF_ROW_COUNT  : u64 = 7
+  pub let OF_WIRE_COUNT : u64 = 2
+  pub let OF_CASE_COUNT : u64 = 9
+
+  // ==========================================================================
+  // Row-case table (7 cases, 2 u64 lanes each = 14 u64).
+  //
+  // Lane layout:
+  //   [0] user_row
+  //   [1] expected_len (bytes of "u:<row>" text)
+  // ==========================================================================
+  pub let _of_row_cases : [u64; 14] = [
+      0,     3,
+      1,     3,
+      7,     3,
+      42,    4,
+      1000,  6,
+      65534, 7,
+      65535, 7
+  ]
+
+  // ==========================================================================
+  // Expected text bytes, packed as one u64 per case (LE, up to 8
+  // bytes; the loop reads only expected_len bytes so trailing zeros
+  // are ignored).
+  //
+  // Byte packings (LE first byte -> low byte):
+  //   case 0: "u:0"      = 0x30 0x3A 0x75            = 0x0000000000303A75
+  //   case 1: "u:1"      = 0x31 0x3A 0x75            = 0x0000000000313A75
+  //   case 2: "u:7"      = 0x37 0x3A 0x75            = 0x0000000000373A75
+  //   case 3: "u:42"     = 0x32 0x34 0x3A 0x75       = 0x000000003234:3A75 = 0x0000000032343A75
+  //     Wait: byte 0 is 'u', byte 1 is ':', byte 2 is '4', byte 3 is '2'.
+  //     LE packing: byte 0 at bit 0..7. So low bytes = 'u' 'r' 'a' '2'.
+  //     Text is "u:42" so byte0='u'(0x75), byte1=':'(0x3A), byte2='4'(0x34), byte3='2'(0x32)
+  //     LE qword = 0x00_00_00_00_32_34_3A_75 = 0x000000003234_3A75
+  //   case 4: "u:1000"   = 'u' ':' '1' '0' '0' '0'
+  //     LE bytes: 0x75 0x3A 0x31 0x30 0x30 0x30 0x00 0x00
+  //     qword = 0x0000_3030_3031_3A75 = 0x0000303030313A75
+  //   case 5: "u:65534"  = 'u' ':' '6' '5' '5' '3' '4'
+  //     LE bytes: 0x75 0x3A 0x36 0x35 0x35 0x33 0x34 0x00
+  //     qword = 0x0034_3335_3536_3A75 = 0x0034333535363A75
+  //   case 6: "u:65535"  = 'u' ':' '6' '5' '5' '3' '5'
+  //     LE bytes: 0x75 0x3A 0x36 0x35 0x35 0x33 0x35 0x00
+  //     qword = 0x0035_3335_3536_3A75 = 0x0035333535363A75
+  // ==========================================================================
+  pub let _of_row_expected : [u64; 7] = [
+      0x0000000000303A75,
+      0x0000000000313A75,
+      0x0000000000373A75,
+      0x0000000032343A75,
+      0x0000303030313A75,
+      0x0034333535363A75,
+      0x0035333535363A75
+  ]
+
+  // ==========================================================================
+  // Wire-cap fixtures (2 caps, 2 u64 lanes each = 4 u64 total).
+  //
+  // Cap 0 (_of_wire_cap_u42): KIND_USER (0x190), row 42.
+  //   qword0 = slot(0) | kind(0x190 << 16) | rights(0) = 0x00000000_01900000
+  //   qword1 = target_ptr = 0x000000000000002A (row 42 in low 16 bits)
+  //
+  // Cap 1 (_of_wire_cap_tty): KIND_TTY (0x197), row irrelevant.
+  //   qword0 = slot(0) | kind(0x197 << 16) | rights(0) = 0x00000000_01970000
+  //   qword1 = 0
+  // ==========================================================================
+  pub let _of_wire_cap_u42 : [u64; 2] = [
+      0x0000000001900000,
+      0x000000000000002A
+  ]
+
+  pub let _of_wire_cap_tty : [u64; 2] = [
+      0x0000000001970000,
+      0x0000000000000000
+  ]
+
+  // Expected text for the wire cap case (idx 7): "u:42" = 4 bytes.
+  // Packing identical to row case 3.
+  pub let _of_wire_u42_expected : [u64; 1] = [ 0x0000000032343A75 ]
+
+  // ==========================================================================
+  // .bss render scratch -- 32 bytes = 4 u64 lanes. Sized bigger than
+  // the widest expected (7 bytes for "u:65535") so a corrupt oversized
+  // render surfaces as a byte mismatch inside the fixed diff window
+  // rather than an overflow bomb.
+  // ==========================================================================
+  pub let mut _of_scratch : [u64; 4] = uninit @align(8)
+
+  // ==========================================================================
+  // owner_fixtures_case_count() -> u64
+  //
+  // Signature: () -> u64 !{} @{}
+  //   RAX: OF_CASE_COUNT (9).
+  //
+  // Leaf.
+  // ==========================================================================
+  pub let owner_fixtures_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.M4-002 (#12): return the total case count (7 row + 2 wire = 9) for a harness iterating via owner_fixtures_run. Leaf pure function. paideia-as conformance: no test mnemonic; no cmp. Labels prefixed ofcc_.",
+      block: {
+        mov rax, 9;                              // OF_CASE_COUNT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // owner_fixtures_run_row(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI: case_idx (0..6)
+  //   RAX: 0 on pass; OF_ERR_LEN_MISMATCH + case_idx or
+  //        OF_ERR_BYTE_MISMATCH + case_idx on fail.
+  //
+  // Loads user_row + expected_len from _of_row_cases[idx * 2],
+  // calls owner_col_render_from_row(&_of_scratch, 32, user_row),
+  // compares return len to expected, then byte-diffs _of_scratch[0..len]
+  // against _of_row_expected[case_idx] (little-endian byte order:
+  // byte i = (qword >> (i*8)) & 0xFF).
+  //
+  // Register plan (non-leaf; five callee-save pushes for the two-pass
+  // check across the nested call):
+  //   rbx = case_idx (survives across owner_col call)
+  //   r12 = expected_len (survives across call)
+  //   r13 = packed expected qword (survives)
+  //   r14 = scratch address
+  //   r15 = byte loop counter
+  //
+  // Alignment: 5 pushes = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48;
+  // aligned. No pad. Matched 5 pops.
+  // ==========================================================================
+  pub let owner_fixtures_run_row : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-002 (#12): run one row-render fixture case. Bounds-check case_idx < 7 -> OF_ERR_BAD_CASE_IDX. LEA _of_row_cases + case_idx * 16 recovers the two-lane base (user_row, expected_len). Call owner_col_render_from_row(&_of_scratch, 32, user_row). Compare return to expected_len -> OF_ERR_LEN_MISMATCH + case_idx on fail. Then byte-diff loop: load packed expected qword from _of_row_expected[case_idx] into r13, iterate r15 = 0..expected_len, load byte from _of_scratch[r15] (xor rax + mov_b), compute expected byte via (r13 >> (r15 * 8)) & 0xFF -- that's `mov rax, r13; mov rcx, r15; shl rcx, 3; shr rax, cl; and rax, 0xFF` (variable shift uses rcx per x86_64 encoding). First mismatch -> OF_ERR_BYTE_MISMATCH + case_idx. Five callee-save pushes; 5*8=40; entry rsp % 16 == 8; 8 + 40 = 48; aligned at owner_col_render_from_row call site. paideia-as conformance: no test mnemonic; largest cmp immediate is 7 (OF_ROW_COUNT) or 32 (scratch cap); the 0xFFFFEBxx sentinels are mov rax, imm64 stores. Labels prefixed ofrr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+
+        // Bounds check.
+        cmp rbx, 7;                              // OF_ROW_COUNT
+        jae ofrr_bad_idx;
+
+        // r11 = &_of_row_cases + case_idx * 16
+        lea r11, [rip + _of_row_cases];
+        mov r12, rbx;
+        shl r12, 4;                              // * 16
+        add r12, r11;
+
+        // Load user_row (rdx for the render call) + expected_len (r12).
+        mov rdx, [r12 + 0];                      // user_row
+        mov r12, [r12 + 8];                      // expected_len (repurpose r12)
+
+        // Load expected packed qword into r13.
+        lea r11, [rip + _of_row_expected];
+        mov r13, [r11 + rbx * 8];
+
+        // Scratch address in r14 (used both for the render call target
+        // and for the byte-diff loop base).
+        lea r14, [rip + _of_scratch];
+
+        // Call owner_col_render_from_row(&_of_scratch, 32, user_row).
+        mov rdi, r14;
+        mov rsi, 32;
+        // rdx already = user_row
+        call owner_col_render_from_row;
+
+        // Length check.
+        cmp rax, r12;
+        jne ofrr_len_fail;
+
+        // Byte-diff loop.
+        xor r15, r15;
+
+      ofrr_diff_loop:
+        cmp r15, r12;
+        jae ofrr_ok;
+
+        // Load actual byte from scratch.
+        mov r11, r14;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];
+        mov r10, rax;                            // r10 = actual byte
+
+        // Extract expected byte: (r13 >> (r15 * 8)) & 0xFF
+        mov rax, r13;
+        mov rcx, r15;
+        shl rcx, 3;                              // r15 * 8 -> bit shift
+        shr rax, cl;                             // variable shift by cl
+        and rax, 0xFF;
+
+        cmp rax, r10;
+        jne ofrr_byte_fail;
+
+        add r15, 1;
+        jmp ofrr_diff_loop;
+
+      ofrr_ok:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ofrr_len_fail:
+        mov rax, 0xFFFFEB80;                     // OF_ERR_LEN_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ofrr_byte_fail:
+        mov rax, 0xFFFFEB90;                     // OF_ERR_BYTE_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ofrr_bad_idx:
+        mov rax, 0xFFFFEBCF;                     // OF_ERR_BAD_CASE_IDX
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // owner_fixtures_run_wire(wire_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI: wire_idx  (0 or 1)
+  //     0 -> KIND_USER cap wire (row 42); expect "u:42" (4 bytes)
+  //     1 -> KIND_TTY cap wire; expect OC_ERR_NOT_USER refusal
+  //   RAX: 0 on pass; OF_ERR_WIRE_* on fail.
+  //
+  // Register plan (non-leaf; five callee-save pushes -- same shape
+  // as owner_fixtures_run_row):
+  //   rbx = wire_idx (case_idx = wire_idx + 7 for the error-return math)
+  //   r12 = expected_len (4 for wire 0; unused for wire 1)
+  //   r13 = expected packed qword (for wire 0)
+  //   r14 = scratch address
+  //   r15 = byte loop counter
+  //
+  // Alignment: 5 pushes = 40 bytes; aligned as run_row.
+  // ==========================================================================
+  pub let owner_fixtures_run_wire : (u64) -> u64 !{mem} @{} =
+    fn (wire_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-002 (#12): run one wire-cap fixture case. wire_idx == 0 -> KIND_USER cap (row 42); call owner_col_render_from_wire(&_of_scratch, 32, &_of_wire_cap_u42), check return len == 4 and byte-diff scratch against _of_wire_u42_expected. wire_idx == 1 -> KIND_TTY cap; call owner_col_render_from_wire(&_of_scratch, 32, &_of_wire_cap_tty), check return == OC_ERR_NOT_USER (0xFFFFEB30 -- staged via r10). Any accept of the TTY cap (return != OC_ERR_NOT_USER) -> OF_ERR_WIRE_NOT_REFUSED. case_idx for the error-return math is wire_idx + 7 (so mismatches propagate the harness case index, not the wire-only index). Five callee-save pushes; aligned as run_row (5*8=40; 8+40=48; %16==0). paideia-as conformance: no test mnemonic; OC_ERR_NOT_USER staged via r10; OF_ERR_WIRE_* sentinels are mov rax, imm64. Labels prefixed ofrw_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+
+        // Bounds check.
+        cmp rbx, 2;                              // OF_WIRE_COUNT
+        jae ofrw_bad_idx;
+
+        // Scratch address in r14.
+        lea r14, [rip + _of_scratch];
+
+        // Dispatch on wire_idx.
+        cmp rbx, 0;
+        jne ofrw_tty;
+
+      ofrw_user:
+        // KIND_USER cap: call owner_col_render_from_wire.
+        mov rdi, r14;
+        mov rsi, 32;
+        lea r11, [rip + _of_wire_cap_u42];
+        mov rdx, r11;
+        call owner_col_render_from_wire;
+
+        mov r12, 4;                              // expected len
+        cmp rax, r12;
+        jne ofrw_len_fail;
+
+        // Byte-diff loop against _of_wire_u42_expected.
+        lea r11, [rip + _of_wire_u42_expected];
+        mov r13, [r11];
+
+        xor r15, r15;
+
+      ofrw_user_loop:
+        cmp r15, r12;
+        jae ofrw_ok;
+
+        mov r11, r14;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];
+        mov r10, rax;
+
+        mov rax, r13;
+        mov rcx, r15;
+        shl rcx, 3;
+        shr rax, cl;
+        and rax, 0xFF;
+
+        cmp rax, r10;
+        jne ofrw_byte_fail;
+
+        add r15, 1;
+        jmp ofrw_user_loop;
+
+      ofrw_tty:
+        // KIND_TTY cap: call owner_col_render_from_wire; expect
+        // OC_ERR_NOT_USER (0xFFFFEB30).
+        mov rdi, r14;
+        mov rsi, 32;
+        lea r11, [rip + _of_wire_cap_tty];
+        mov rdx, r11;
+        call owner_col_render_from_wire;
+
+        mov r10, 0xFFFFEB30;                     // OC_ERR_NOT_USER
+        cmp rax, r10;
+        jne ofrw_not_refused;
+
+        // Passed: TTY cap correctly refused.
+        jmp ofrw_ok;
+
+      ofrw_ok:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ofrw_len_fail:
+        mov rax, 0xFFFFEBA0;                     // OF_ERR_WIRE_LEN
+        add rax, rbx;
+        add rax, 7;                              // shift to harness case idx
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ofrw_byte_fail:
+        mov rax, 0xFFFFEBB0;                     // OF_ERR_WIRE_BYTE
+        add rax, rbx;
+        add rax, 7;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ofrw_not_refused:
+        mov rax, 0xFFFFEBC0;                     // OF_ERR_WIRE_NOT_REFUSED
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ofrw_bad_idx:
+        mov rax, 0xFFFFEBCF;                     // OF_ERR_BAD_CASE_IDX
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // owner_fixtures_run(case_idx) -> u64
+  //
+  // 0..6 -> owner_fixtures_run_row(case_idx)
+  // 7..8 -> owner_fixtures_run_wire(case_idx - 7)
+  // ==========================================================================
+  pub let owner_fixtures_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-002 (#12): dispatch case 0..8 to the row or wire sub-verifier. 0..6 -> run_row; 7..8 -> run_wire(case_idx - 7). One callee-save push (rbx=case_idx); entry rsp %16==8; 1 push = 8; total 16; aligned. Bounds check case_idx >= 9 -> OF_ERR_BAD_CASE_IDX. paideia-as conformance: no test; cmp against 7/9 fits imm32. Labels prefixed ofr_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+
+        cmp rbx, 9;                              // OF_CASE_COUNT
+        jae ofr_bad_idx;
+
+        cmp rbx, 7;                              // OF_ROW_COUNT
+        jae ofr_wire;
+
+        call owner_fixtures_run_row;
+        pop rbx;
+        ret;
+
+      ofr_wire:
+        mov rdi, rbx;
+        sub rdi, 7;
+        call owner_fixtures_run_wire;
+        pop rbx;
+        ret;
+
+      ofr_bad_idx:
+        mov rax, 0xFFFFEBCF;                     // OF_ERR_BAD_CASE_IDX
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // owner_fixtures_verify_all() -> u64
+  //
+  // Walk case_idx 0..8; first non-zero return propagates.
+  // ==========================================================================
+  pub let owner_fixtures_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-002 (#12): fail-fast walk of all 9 cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp %16==8; 8+24=32; aligned. paideia-as: no test; cmp against 9 fits imm32. Labels prefixed ofva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 9;                              // OF_CASE_COUNT
+
+      ofva_loop:
+        cmp rbx, r12;
+        jae ofva_ok;
+
+        mov rdi, rbx;
+        call owner_fixtures_run;
+        cmp rax, 0;
+        jne ofva_out;
+
+        add rbx, 1;
+        jmp ofva_loop;
+
+      ofva_ok:
+        xor rax, rax;
+      ofva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
