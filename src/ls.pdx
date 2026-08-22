@@ -1,0 +1,228 @@
+// src/ls.pdx -- ls.M1-001 (paideia-os/ls#1)
+//
+// Ls module: top-level scaffold + KIND mirrors + return-code band +
+// tool-level stats.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The M1 substrate for the ls binary. Owns:
+//
+//   * KIND ordinal mirrors (LS_KIND_*) so the ls binary's modules do
+//     not need to link paideia-os's kernel .o graph to name the KINDs
+//     the tool holds. Redeclared here for the same reason
+//     libpdx-elevate mirrors ELV_* and the shell mirrors SH_KIND_* --
+//     the M4 smoke matrix catches any drift between the mirrored
+//     values here and the authoritative kernel values.
+//
+//   * The ls binary's error band (LS_* 0xFFFFEBxx). Disjoint from the
+//     libpdx-cap band (0xFFFFFFxx), the libpdx-elevate band
+//     (0xFFFFEAxx), the shell band (0xFFFFECxx), and the kernel errno
+//     band (-EFAULT = 0xFFFFFFFFFFFFFFF2 ...). The high two bytes of
+//     the return tell a downstream consumer which layer refused.
+//     Sub-bands: 0xFFFFEB1x = ArgvSurface, 0xFFFFEB2x = Runner.
+//
+//   * An eight-slot _ls_stats counter table with bounded increment +
+//     bounded read (ls_note, ls_stat). Same shape as
+//     Shell._shell_stats (paideia-os/shell src/shell.pdx) and
+//     ElevateBroker._elevate_broker_stats (paideia-os
+//     src/kernel/core/ipc/elevate_broker.pdx:70). Cache-line aligned
+//     so a future SMP variant of the counter path does not straddle a
+//     line.
+//
+//   * ls_reset() -- clears the counter table. Startup + teardown only.
+//
+// =============================================================================
+// WHAT M1-001 IS DELIBERATELY NOT
+// =============================================================================
+//
+// M1-001 does NOT ship the argv surface (ls.M1-002) or the runner
+// skeleton (ls.M1-003) or the _start entry frame (which is a paideia-os
+// R14b bootstrap concern -- ls's _start lands with ls.M2 alongside the
+// sys_pdxfs_open userspace wrapper). M1-001 ships the three modules
+// the composition Dispatch::ls_dispatch will call at M1-003.
+//
+// M1-001 does NOT allocate. Every buffer is caller-owned. Every counter
+// lives in .bss. Mirrors libpdx-argv M1 discipline -- the ls binary's
+// M1 has no reason to differ.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Ls`), no directory prefix
+//     (per feedback_paideia_os_loop_shape).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (LS_ST_MAX = 8 fits
+//     easily; the KIND ordinals and error codes are `mov rax, imm`
+//     emissions, not compares).
+//   - r11 is scratch (paideia-as conformance) and appears in every
+//     `lea r11, [rip + sym]` .bss reach.
+//   - No byte reads in this module; the `xor rax, rax; mov_b rax, [ptr]`
+//     pattern lands at M1-002 in ArgvSurface when it walks flag_names.
+//   - ls_reset and ls_note / ls_stat are leaf functions -- no push/pop
+//     parity to preserve.
+
+module Ls = structure {
+
+  // ==========================================================================
+  // KIND ordinal mirrors
+  //
+  // Mirror the authoritative values in paideia-os:
+  //   LS_KIND_IPC_ENDPOINT   src/kernel/core/cap/kind.pdx:72
+  //   LS_KIND_USER           src/kernel/core/cap/kind_user.pdx:122
+  //   LS_KIND_PDXFS_FILE     src/kernel/core/cap/kind_pdxfs_file.pdx:82
+  //   LS_KIND_TTY            placeholder ordinal 0x196 -- reserved for
+  //                          the KIND_TTY landing in a paideia-os round
+  //                          adjacent to R49 (kind_tty.pdx has not
+  //                          landed at HEAD 2026-08-21). ls's caps.decl
+  //                          names it symbolically; this constant is
+  //                          the numeric hook the M2 InitCap sidecar
+  //                          consumer will read. Same provisional
+  //                          treatment as shell.M1-001's SH_KIND_TTY.
+  // ==========================================================================
+  pub let LS_KIND_IPC_ENDPOINT : u64 = 5
+  pub let LS_KIND_USER         : u64 = 0x190
+  pub let LS_KIND_PDXFS_FILE   : u64 = 0x195
+  pub let LS_KIND_TTY          : u64 = 0x196    // provisional, pin at substrate PR
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEBxx (ls layer)
+  //
+  // High two bytes = 0xFFFFEB identify the ls layer to a downstream
+  // consumer. Full table in design/architecture.md §6.
+  // ==========================================================================
+
+  // General success sentinel -- unused at M1 body; reserved so
+  // consumers can spell `LS_OK` at their call sites now and get real
+  // semantics at M2 (when Runner returns real success rather than
+  // LS_RUN_STUB).
+  pub let LS_OK                    : u64 = 0xFFFFEB00
+
+  // ArgvSurface stubs and errors (0xFFFFEB1x)
+  pub let AS_OK                    : u64 = 0xFFFFEB10
+  pub let AS_ERR_BAD_ARGV          : u64 = 0xFFFFEB11
+  pub let AS_ERR_PARSER_REJECT     : u64 = 0xFFFFEB12
+  pub let AS_ERR_UNKNOWN_FLAG      : u64 = 0xFFFFEB13
+  pub let AS_ERR_UNSUPPORTED_SHORT : u64 = 0xFFFFEB14
+
+  // Runner stubs and errors (0xFFFFEB2x)
+  pub let LS_RUN_STUB              : u64 = 0xFFFFEB20   // M1: validated, no live iterate
+  pub let LS_ERR_BAD_PATH          : u64 = 0xFFFFEB21   // path ptr non-zero but empty
+
+  // ==========================================================================
+  // Tool-level stats -- eight u64 slots, cache-line aligned.
+  //
+  // Slot map (M1):
+  //   0 LS_ST_INVOKES  argv_surface_parse entries
+  //   1 LS_ST_OKS      argv_surface_parse OK returns
+  //   2 LS_ST_RUNS     runner_ls entries
+  //   3 LS_ST_ENTRIES  entries printed (M2+; unused at M1 stub body)
+  //   4 LS_ST_ERRORS   any error / reject path from any ls module
+  //   5..7 reserved    for M2+ (dir opens, cap denials, ...)
+  //
+  // Cache-line alignment matches _shell_stats / _elevate_broker_stats
+  // -- keeps a future SMP counter path a mechanical widening rather
+  // than a re-layout.
+  // ==========================================================================
+  pub let mut _ls_stats : [u64; 8] = uninit @align(64)
+
+  pub let LS_ST_INVOKES : u64 = 0
+  pub let LS_ST_OKS     : u64 = 1
+  pub let LS_ST_RUNS    : u64 = 2
+  pub let LS_ST_ENTRIES : u64 = 3
+  pub let LS_ST_ERRORS  : u64 = 4
+  pub let LS_ST_MAX     : u64 = 8
+
+  // ==========================================================================
+  // ls_reset() -> ()
+  //
+  // Clear the eight-word _ls_stats counter table. Called by _start
+  // (M2+) before the run loop, and by tests before each fixture. A
+  // live counter reset would race any concurrent ls_note, so this is
+  // startup + teardown only -- same discipline as shell_reset
+  // (paideia-os/shell src/shell.pdx) and elevate_broker_stats_reset
+  // (paideia-os src/kernel/core/ipc/elevate_broker.pdx:70).
+  //
+  // Register plan (leaf):
+  //   r10 = base pointer (loaded once via lea)
+  //   rcx = loop index (0..8)
+  //   rax = zero constant
+  // ==========================================================================
+  pub let ls_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M1-001 (#1): clear the eight-word tool stats table. Startup + teardown only; a live counter reset would race any concurrent ls_note (same discipline as shell_reset paideia-os/shell src/shell.pdx, and elevate_broker_stats_reset paideia-os src/kernel/core/ipc/elevate_broker.pdx:70). Loop: r10 base, rcx index 0..8, rax = 0. `cmp rcx, 8` uses imm <= 0x7FFFFFFF (paideia-as conformance). Leaf function -- no push/pop parity. Labels prefixed ls_rs_.",
+      block: {
+        lea r10, [rip + _ls_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      ls_rs_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  ls_rs_loop;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ls_note(which) -> ()
+  //
+  // Bounded increment of _ls_stats[which]. `which >= LS_ST_MAX` is a
+  // no-op (not an error) so a caller passing a slot from a newer
+  // library snapshot against an older binary snapshot cannot corrupt
+  // live counters. Same shape as shell_note (paideia-os/shell
+  // src/shell.pdx) and elevate_client_note (libpdx-elevate
+  // src/elevate_client.pdx).
+  //
+  // Register plan (leaf):
+  //   rdi = which (input; preserved through jae)
+  //   r10 = base pointer
+  //   rax = counter load / +1 accumulator
+  // ==========================================================================
+  pub let ls_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M1-001 (#1): bounded increment; out-of-range which is a no-op (not an error sentinel -- a slot that never got incremented reads as 0, which is also the correct 'never touched' value). Same shape as shell_note (paideia-os/shell src/shell.pdx). `cmp rdi, 8` uses imm <= 0x7FFFFFFF. Leaf function -- no push/pop parity. Labels prefixed ls_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae ls_nt_out;
+        lea r10, [rip + _ls_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      ls_nt_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ls_stat(which) -> u64
+  //
+  // Bounded read of _ls_stats[which]. `which >= LS_ST_MAX` returns 0
+  // (not an error sentinel -- see ls_note rationale). Same shape as
+  // shell_stat (paideia-os/shell src/shell.pdx).
+  //
+  // Register plan (leaf):
+  //   rdi = which
+  //   r10 = base pointer
+  //   rax = return value
+  // ==========================================================================
+  pub let ls_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M1-001 (#1): bounded read; out-of-range which returns 0 (0 is both the 'never touched' value and the 'out of range' value -- an explicit sentinel would force the caller to two loads for a distinction they never need). Same shape as shell_stat (paideia-os/shell src/shell.pdx). `cmp rdi, 8` uses imm <= 0x7FFFFFFF. Leaf function. Labels prefixed ls_st_.",
+      block: {
+        cmp rdi, 8;
+        jae ls_st_zero;
+        lea r10, [rip + _ls_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      ls_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+}

@@ -1,0 +1,43 @@
+# ls — caps.decl
+#
+# Wave: R50 (Wave 2)
+# Doc:  design/tooling/r49-r50-plan.md §4.4 and §5.4 in the paideia-os
+#       repo. This file is the invariant-I6 (capability handoff visible
+#       + refusable) manifest the shell validates at exec: ls receives
+#       exactly the caps below and no more.
+#
+# The four caps below are the minimum surface for the tool to (1)
+# identify who invoked it (KIND_USER — used at M3 to stamp the
+# DirListRecord audit tail and, at M2, to resolve the owner column for
+# --long), (2) read entries from a specific directory path only
+# (KIND_PDXFS_FILE narrowed to the argument path — no ambient authority
+# on the rest of the filesystem), (3) render text to the invoker's
+# terminal (KIND_TTY narrowed to write — no read, no tcsetattr), and
+# (4) participate in the semantic-pipe layer for the M3 PdxFsDirEntry[]
+# emission (KIND_IPC_ENDPOINT). The endpoint requirement is declared
+# at M1 so consumers can inspect the manifest early; the wire binding
+# lands with ls.M3-001 per r49-r50-plan.md §5.4.
+#
+# Cap narrowing note. Per r49-r50-plan.md §4.4 ("the tool's cap
+# request narrows to exactly the argument path (never ambient-
+# authority)"), the KIND_PDXFS_FILE(read, <path>) below is a template.
+# The shell's exec-time cap_manifest_verify (libpdx-cap M2-001) binds
+# the concrete argument path when it hands ls its narrowed cap; the
+# template here is the shape the shell has to satisfy.
+#
+# Missing caps in the received set → exit 4 (cap denied per I4 in
+# design/tooling/plan.md §4.2). Extra caps → the shell's cap_manifest_
+# verify refuses at the shell side; ls never sees them.
+requires:
+  - KIND_USER
+  - KIND_TTY(write)
+  - KIND_PDXFS_FILE(read, <arg-path>)
+  - KIND_IPC_ENDPOINT
+
+# Declared output schemas — the semantic-pipe record ls emits on
+# stdout. Declared at M1 so consumers can inspect the manifest; the
+# actual wire binding + emission lands at ls.M3-001 per r49-r50-plan.md
+# §5.4 (one PdxFsDirEntry per file, owner field a KIND_USER capability
+# reference rather than a text uid — D2 literal at the schema level).
+declares_output_schemas:
+  - PdxFsDirEntry@0.1
