@@ -1,0 +1,448 @@
+// src/long_format.pdx -- ls.M2-001 (paideia-os/ls#4)
+//
+// LongFormat module: the `-l` long-format layout. Renders one
+// directory-entry line as:
+//
+//   <kind> <mode:o> <owner> <size> <mtime> <name>\n
+//
+// where the columns are separated by single spaces.  The `-h` flag
+// selects HumanSize for the size column; without `-h` the size
+// renders as raw decimal via Render::render_dec_u64.  The owner
+// column is delegated to OwnerCol::owner_col_render_from_row --
+// the caller passes the KIND_USER row already decoded upstream
+// (via OwnerCol::owner_col_render_from_wire during the M3 readdir
+// pass, or by direct cap query during a M4 fixture).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// One entry point:
+//
+//   long_format_line(dst_ptr, dst_cap,
+//                    name_ptr,
+//                    kind_nibble,
+//                    mode_bits,
+//                    size_bytes,
+//                    mtime_ns,
+//                    owner_row,
+//                    human_size_flag)
+//     -> bytes_written | LF_ERR_OVERFLOW
+//
+// Nine arguments so the caller can hand every field it already has
+// from a decoded PdxFsDirEntry without a struct-typed detour.  Not a
+// wide "everything at once" API by choice -- each field is a leaf
+// value the caller pulls from a different source (name from the
+// entry blob; kind_nibble + mode_bits + size + mtime from the
+// KIND_PDXFS_FILE cap's row via pdxfs_file_row_mode / _len / _mtime;
+// owner_row from a KIND_USER decode).  Bundling them into a struct
+// would force every M4 fixture to build the struct just to render
+// one line.
+//
+// =============================================================================
+// COLUMN SEMANTICS
+// =============================================================================
+//
+//   kind      One character from a 4-bit nibble in mode_bits[15:12]
+//             (PdxFS-v1 file-type nibble; see paideia-os
+//             src/kernel/core/cap/kind_pdxfs_file.pdx SECTION 1).
+//             The caller passes the nibble ALREADY EXTRACTED as an
+//             independent parameter -- LongFormat does not re-mask
+//             mode_bits, which lets a caller with a fresh nibble
+//             (say, from a directory-only PdxFS cap that packs
+//             kind differently) still use this renderer.
+//             - 0x4 dir      -> 'd'
+//             - 0x8 file     -> '-'  (POSIX convention)
+//             - 0xA symlink  -> 'l'
+//             - 0xC special  -> 's'
+//             - other        -> '?'  (unknown; consumer diagnostic)
+//   mode      Three octal digits from mode_bits[8:0]. Rendered as
+//             three ASCII digits '0'..'7'. No POSIX 'rwxrwxrwx'
+//             glyphs at M2 -- that translation lands with M3 when
+//             the schema/MIME palette decides how permissions
+//             render in each output mode (text vs JSON schema).
+//   owner     Delegated to owner_col_render_from_row (M2-002).
+//             Emits `u:<row>`.
+//   size      Delegated to human_size_render (M2-003) when
+//             human_size_flag != 0, else render_dec_u64 (Render).
+//   mtime     Rendered as `ns:<decimal>` so a downstream schema-
+//             typed consumer can recover the raw i128 mtime
+//             unambiguously.  Real calendar rendering awaits
+//             pdx-time at R54 (plan doc §3.6).
+//   name      Copied verbatim from name_ptr up to the first NUL.
+//             No escaping at M2 (names are already caller-owned
+//             NUL-terminated bytes from the PdxFS-v1 entry blob;
+//             malicious-byte escaping is a M3 concern once the
+//             schema pipe declares its escaping rules).
+//   \n        Line terminator.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`LongFormat`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediate
+//     is 0x2E ('.', unused here) -- most immediates are ASCII bytes
+//     (<= 0x7F) or small shift counts (<= 6).  Sentinel returns
+//     (0xFFFFFFFFFFFFFFFF) stage into r11 for compare.
+//   - Byte reads (name copy loop) use `xor rax; mov_b rax, [ptr]`
+//     per #1248.
+//   - Byte writes via `mov_b [dst], reg` (through Render, or inline
+//     inside the name copy loop through render_byte_write).
+//   - r11 is scratch for LEA + sentinel + short-lived constants.
+//   - Non-leaf; many nested calls.  Callee-save discipline: 6
+//     pushes (rbx, r12, r13, r14, r15, rbp) + `sub rsp, 8` pad =
+//     56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at
+//     every nested-call site.
+//   - Stack args (SysV places args 7..9 at [rsp+8], [rsp+16],
+//     [rsp+24] AT ENTRY, before the prologue).  After the 56-byte
+//     prologue they live at [rsp+64], [rsp+72], [rsp+80] --
+//     accessed by explicit `mov reg, [rsp + N]` reloads at their
+//     consume site.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   render_dec_u64                -- Render (src/render.pdx)
+//   render_byte_write             -- Render (src/render.pdx)
+//   human_size_render             -- HumanSize (src/human_size.pdx)
+//   owner_col_render_from_row     -- OwnerCol (src/owner_col.pdx)
+
+module LongFormat = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let LF_OK              : u64 = 0
+  pub let LF_ERR_OVERFLOW    : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
+  // Kind-nibble letter table
+  //
+  // Indexed by kind_nibble (0..15). Slots that PdxFS-v1 does not
+  // assign a type to render as '?' so a corrupted mode field
+  // surfaces as a visible column value rather than a silent blank.
+  //
+  // ASCII:  '?' = 0x3F   'd' = 0x64   '-' = 0x2D
+  //         'l' = 0x6C   's' = 0x73
+  // ==========================================================================
+  pub let _lf_kind_letters : [u8; 16] = [
+      0x3F, 0x3F, 0x3F, 0x3F, 0x64, 0x3F, 0x3F, 0x3F,
+      0x2D, 0x3F, 0x6C, 0x3F, 0x73, 0x3F, 0x3F, 0x3F
+  ]
+
+  // ==========================================================================
+  // long_format_line(dst_ptr, dst_cap, name_ptr, kind_nibble,
+  //                  mode_bits, size_bytes, mtime_ns, owner_row,
+  //                  human_size_flag) -> bytes_written | LF_ERR_OVERFLOW
+  //
+  // Register allocation across the twelve-step emit sequence:
+  //   rbx = anchor  (dst_ptr; never changes; final total = cursor - anchor)
+  //   r12 = cursor  (advances after each emit)
+  //   r13 = cap remaining
+  //   r14 = mode_bits (spilled from r8 at prologue; consumed at step 3)
+  //   r15 = size_bytes (spilled from r9 at prologue; consumed at step 7)
+  //   rbp = name_ptr (spilled from rdx at prologue; consumed at step 11)
+  //
+  // Values loaded from stack at their consume site:
+  //   [rsp + 64] = mtime_ns
+  //   [rsp + 72] = owner_row
+  //   [rsp + 80] = human_size_flag
+  //
+  // kind_nibble is consumed at step 1 BEFORE any nested call so it
+  // stays in its entry register (rcx) and needs no spill.
+  //
+  // Overflow discipline: every nested call's return is compared
+  // against 0xFFFFFFFFFFFFFFFF staged in r11; any child overflow
+  // jumps to lf_overflow which returns LF_ERR_OVERFLOW without
+  // touching dst beyond what already succeeded.  Partial writes on
+  // overflow are acceptable here (unlike Render's atomic refusal)
+  // because a line-level rendering that overruns dst_cap is a
+  // caller-provided-too-small-buffer scenario the caller must
+  // discard the whole line -- the partial bytes carry a truncated
+  // schema no downstream consumer will read.
+  // ==========================================================================
+  pub let long_format_line
+    : (u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst_ptr: u64) (dst_cap: u64) (name_ptr: u64)
+       (kind_nibble: u64) (mode_bits: u64) (size_bytes: u64)
+       (mtime_ns: u64) (owner_row: u64) (human_size_flag: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M2-001 (#4): the `-l` long-format line renderer. Nine-argument entry avoids a struct-typed detour so every M4 fixture and every M3 readdir caller can hand pre-decoded fields directly. Twelve emit steps between callee-save pushes; each nested call checks the r11-staged 0xFFFFFFFFFFFFFFFF sentinel and short-circuits on overflow to lf_overflow. Column order (kind, mode, owner, size, mtime, name) adds one column (mode) beyond the plan doc §4.4 four-column base so a text-layer reader without the schema pipe still sees permission bits; the drop-swap point is the three-digit block starting at lf_emit_mode. Kind letter derived by table lookup at _lf_kind_letters[nibble & 0xF], with '?' fallback for unknown nibbles. Mode rendered as three raw octal digits from mode_bits[8:0]; the POSIX rwxrwxrwx glyph translation lands with the M3 schema-driven palette. Mtime rendered as `ns:<decimal>` because pdx-time doesn't ship until R54 (plan §3.6); the prefix keeps the column self-describing so a downstream typed consumer can recover the raw i128 value. Size dispatches to human_size_render (M2-003) or render_dec_u64 by the human_size_flag stack arg. Name copied byte-by-byte until NUL through inline mov_b loads (#1248 mitigation) forwarded to render_byte_write.  Callee-save + rsp discipline: 6 pushes (rbx, r12..r15, rbp) + sub rsp, 8 = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at every nested-call site. Stack args (mtime_ns, owner_row, human_size_flag) live at [rsp+64/72/80] post-prologue and load at their consume site so no seventh callee-save is needed. paideia-as conformance: no `test`; largest immediate 0x7F (ASCII); byte writes via mov_b [dst], reg through Render. Labels prefixed lf_.",
+      block: {
+        // ---- prologue ------------------------------------------------
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // anchor
+        mov r12, rdi;                        // cursor
+        mov r13, rsi;                        // cap remaining
+        mov r14, r8;                         // mode_bits
+        mov r15, r9;                         // size_bytes
+        mov rbp, rdx;                        // name_ptr
+
+        // ---- step 1: emit kind letter -------------------------------
+        // kind_nibble still in rcx (caller-save, not yet clobbered).
+        mov rax, rcx;
+        and rax, 0xF;
+        lea r11, [rip + _lf_kind_letters];
+        xor rdx, rdx;
+        mov_b rdx, [r11 + rax];              // kind letter into rdx
+
+        mov rdi, r12;
+        mov rsi, r13;
+        // rdx = kind letter (already loaded)
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // ---- step 2: emit ' ' ---------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x20;                       // ' '
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // ---- step 3: emit three octal digits from r14 --------------
+      lf_emit_mode:
+        // digit_hi = (mode >> 6) & 7
+        mov rax, r14;
+        shr rax, 6;
+        and rax, 7;
+        add rax, 0x30;
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, rax;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // digit_mid = (mode >> 3) & 7
+        mov rax, r14;
+        shr rax, 3;
+        and rax, 7;
+        add rax, 0x30;
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, rax;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // digit_lo = mode & 7
+        mov rax, r14;
+        and rax, 7;
+        add rax, 0x30;
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, rax;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // ---- step 4: emit ' ' ---------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x20;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // ---- step 5: emit owner via OwnerCol (owner_row @ [rsp+72]) -
+        mov rdx, [rsp + 72];                 // owner_row
+        mov rdi, r12;
+        mov rsi, r13;
+        call owner_col_render_from_row;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, rax;
+        sub r13, rax;
+
+        // ---- step 6: emit ' ' ---------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x20;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // ---- step 7: emit size (human vs raw dec) -------------------
+        mov rax, [rsp + 80];                 // human_size_flag
+        cmp rax, 0;
+        je  lf_size_raw;
+
+        // human path
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r15;                        // size_bytes
+        call human_size_render;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, rax;
+        sub r13, rax;
+        jmp lf_after_size;
+
+      lf_size_raw:
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r15;
+        call render_dec_u64;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, rax;
+        sub r13, rax;
+
+      lf_after_size:
+        // ---- step 8: emit ' ' ---------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x20;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // ---- step 9a: emit 'n' 's' ':' ------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x6E;                       // 'n'
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x73;                       // 's'
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x3A;                       // ':'
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // ---- step 9b: emit decimal(mtime_ns @ [rsp+64]) -------------
+        mov rdx, [rsp + 64];
+        mov rdi, r12;
+        mov rsi, r13;
+        call render_dec_u64;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, rax;
+        sub r13, rax;
+
+        // ---- step 10: emit ' ' --------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x20;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // ---- step 11: name copy loop --------------------------------
+        // Read bytes from rbp (name_ptr) until NUL; emit each.
+      lf_name_head:
+        xor rax, rax;
+        mov_b rax, [rbp];
+        cmp rax, 0;
+        je  lf_name_done;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, rax;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+        sub r13, 1;
+        add rbp, 1;
+        jmp lf_name_head;
+
+      lf_name_done:
+        // ---- step 12: emit '\n' -------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x0A;                       // '\n'
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  lf_overflow;
+        add r12, 1;
+
+        // ---- success: return cursor - anchor -----------------------
+        mov rax, r12;
+        sub rax, rbx;
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      lf_overflow:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
