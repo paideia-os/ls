@@ -1,8 +1,18 @@
 # ls — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M4 (tests + smoke matrix) — CLOSED.
-M4-001 landed `tests/color_fixtures.pdx` (10 dispatch + 3 SGR
+**Current milestone:** M5 (signed 1.0 release) — IN PROGRESS.
+M5-001 landed `manifest.pdxproj` (version bumped 0.4→1.0.0), `CHANGELOG.md`
+with the 1.0.0 entry freezing the argv surface + PdxFsDirEntry wire body +
+exit-code map + caps.decl at 1.0, `doc/ls.pdxdoc` (man-equivalent per I7
+for the `doc ls` back-end), and `design/release-1.0.md` pinning the
+`manifest.pdxsig` wire shape KV-record-by-record in the scaffold epoch
+(all-zero signature slots → SIG_UNSIGNED_SCAFFOLD verdict per
+`design/drivers/blob-policy.md` §1.7 in paideia-os; live re-sign at R32
+bumps `created_unix_secs` only). M5-002 (mirror push + `pkg install ls`
+end-to-end witness + `v1.0.0` tag) is next.
+
+M4 recap: M4-001 landed `tests/color_fixtures.pdx` (10 dispatch + 3 SGR
 goldens). M4-002 landed `tests/owner_fixtures.pdx` (7 row + 2
 wire-cap cases). M4-003 landed `src/exit_map.pdx` + `tests/
 exit_matrix.pdx` (13 cases, the "empty=0/missing=2/cap-denied=4"
@@ -12,8 +22,7 @@ schema-hash imprint stub (via `SemanticEmit::sem_emit_reset`) and
 the 144-byte wire body (via a new `SemanticEmit::sem_emit_wire
 _compose` — the compose-only sibling of `sem_emit_entry` added at
 M4-004 so the wire spec is testable without a live libpdx-
-semantic-pipe substrate). M5 (signed release + `.pdxdoc` + mirror
-push) is next.
+semantic-pipe substrate).
 
 ## Milestone rollup
 
@@ -33,6 +42,8 @@ push) is next.
 | M4-002 (#12)    | owner-render correctness for multi-user quota subtree          | LANDED |
 | M4-003 (#13)    | exit-code matrix (empty=0, missing=2, cap-denied=4)            | LANDED |
 | M4-004 (#14)    | --schema output validates against libpdx-semantic-pipe golden  | LANDED |
+| M5-001 (#15)    | dual-signed release + .pdxdoc                                  | LANDED |
+| M5-002 (#16)    | mirror push + verify `pkg install ls` works end-to-end         | OPEN   |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -97,6 +108,21 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
 - `src/exit_map.pdx` — `ExitMap` module (M4-003): pins the ls
   sub-band → I4 exit-code mapping (0 / 2 / 3 / 4). Used by the
   M4-003 fixture and by the eventual R14b `_start` frame.
+- `manifest.pdxproj` — paideia-as build manifest at version
+  `1.0.0` (M5-001): source list (15 files), test list (4
+  fixtures), version-pinned deps, and the `release:` block
+  naming `dist/manifest.pdxsig`, the CHANGELOG anchor, the
+  `.pdxdoc`, and the mirror target.
+- `CHANGELOG.md` — Keep-a-Changelog-style release log (M5-001).
+  The `[1.0.0]` entry freezes the 1.0 contract; `[0.1.0]..[0.4.0]`
+  roll up M1..M4 close.
+- `doc/ls.pdxdoc` — man-equivalent (M5-001) in the `.pdxdoc`
+  grammar the doc-repo's PdxdocParser (doc.M1-002) accepts.
+  Consumed by `doc ls` per `design/tooling/plan.md` I7 §2.
+- `design/release-1.0.md` — release-1.0 specification (M5-001):
+  §1 scaffold epoch, §2 `manifest.pdxsig` KV-record-by-record,
+  §3 release process, §4 byte-identity invariant with the mirror
+  copy, §5 what freezes at 1.0.
 - `.plans/` — per-milestone implementation notes.
 
 ## Kernel-side substrate (M3 wave)

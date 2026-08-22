@@ -1,0 +1,192 @@
+!# ls.pdxdoc -- man-equivalent for `doc ls` back-end.
+!# Grammar: design/tooling/plan.md I7 + doc repo's PdxdocParser
+!# (M1-002). Parsed line-oriented; `!doc` header exactly once;
+!# `!section` boundaries between top-level sections; `!posix-diff`
+!# and `!ref` and `!example`/`!end-example` are passthrough at M1
+!# of the `doc` reader, first-class from doc M2 onward.
+!doc ls
+!version 1.0.0
+
+Directory listing that emits typed `PdxFsDirEntry[]` records.
+
+Reads a directory's entries via the paideia PdxFS substrate and
+renders each entry as text to the terminal AND as a schema-typed
+record on the semantic pipe (stdout as `KIND_IPC_ENDPOINT`).
+Downstream consumers (`grep`, `find`, `pipeviz`) can filter or plot
+by field name rather than by column-slicing text.
+
+!section synopsis
+
+  ls [-l] [-a] [-h] [--json] [--schema] [--color=<v>] [<path>]
+
+`<path>` defaults to `.` when omitted. Positionals beyond `[0]` are
+ignored at 1.0 (multi-path listing lands at 1.1). Unknown flags
+return exit 2.
+
+!section flags
+
+  -l              Long format: kind mode owner size mtime name.
+  -a              Include dot-prefix (hidden) entries.
+  -h              Render sizes as base-2 K/M/G/T/P/E.
+  --json          Emit each row as one JSON object on stdout.
+  --schema        Print ls's declared output schemas + exit 0.
+  --color=<v>     `<v>` in {auto, always, never}. Colors are
+                  driven by the entry's declared schema/MIME, NOT
+                  by POSIX file-type bits. See POSIX-diff below.
+
+The nine standard flags (`--help`, `--version`, `--schema`,
+`--json`, `--color=`, `--dry-run`, `--verbose`, `--quiet`,
+`--no-cap:<name>`) are recognised by `libpdx-argv`'s StdVocab and
+land under the uniform I3 vocabulary at 1.0.
+
+!section capabilities
+
+ls receives exactly four capabilities at exec, per `caps.decl` at
+the repo root:
+
+  KIND_USER                              -- invoker identity for
+                                            the owner column and
+                                            the DirListRecord tail.
+  KIND_TTY(write)                        -- terminal write; no
+                                            read, no tcsetattr.
+  KIND_PDXFS_FILE(read, <arg-path>)      -- narrowed to the
+                                            argument path only;
+                                            no ambient authority.
+  KIND_IPC_ENDPOINT                      -- the semantic-pipe
+                                            stdout sink for the
+                                            PdxFsDirEntry stream.
+
+Missing caps -> exit 4 (cap denied). Extra caps refused at the
+shell's `cap_manifest_verify` before ls ever runs.
+
+!section semantic pipe -- PdxFsDirEntry@0.1
+
+Each accepted entry emits a 144-byte wire record on stdout:
+
+  bytes 0..127     128-byte kernel record (inode, kind, name_len,
+                    name[0..103]).
+  bytes 128..143   16-byte owner Cap wire: KIND_USER at offset
+                    128, user_row placeholder at offset 136 until
+                    `sys_pdxfs_stat_by_inode` ships (owner_row
+                    lookup lands at 1.1; the wire slot is
+                    reserved today so a 1.1 record is byte-
+                    compat with a 1.0 consumer).
+
+The 32-byte schema-hash prefix is added by `libpdx-semantic-pipe::
+Send::send_record`; the ls compose path itself produces bytes
+0..143 only. Golden for the compose byte range lives in
+`tests/schema_golden.pdx`.
+
+!section audit
+
+`DirListRecord` opened via `libpdx-audit` BEFORE the first
+`KIND_TTY` write; committed at the Runner epilogue. If the audit
+broker is unavailable, ls exits 3 (system error) without emitting
+any user-visible bytes. This is audit-first per invariant I5.
+
+!section exit codes
+
+The 0xFFFFEBxx internal band folds to the shared I4 vocabulary at
+`src/exit_map.pdx`:
+
+   0  success (including "directory was empty").
+   2  usage error (bad flag, malformed path, missing).
+   3  system error (audit broker down, IPC bind failure, other
+      unclassified upstream failure).
+   4  capability denied (missing cap, substrate refusal, cap
+      slot not populated).
+
+The three exit-code rows the M4-003 fixture pins as invariant:
+
+  empty=0        directory has zero entries; no error.
+  missing=2      path was ill-formed at the ls side, OR the
+                 shell refused to hand ls a cap.
+  cap-denied=4   substrate returned -EBADF or -EACCES on
+                 readnext.
+
+!section colorization
+
+`--color=` is driven by the entry's declared schema/MIME, not by
+POSIX file-type bits. This is a Paideia D2 literal -- the color
+picker consults the entry's schema handle first, then falls back
+to the MIME registered on the file's `.pdxfs` metadata, then
+finally to a `KIND_UNKNOWN` neutral color. The M4-001 fixture
+pins 10 dispatch cases + 3 SGR byte-exact goldens for the
+palette.
+
+!posix-diff
+
+POSIX `ls -F` and `ls --color` render decoration from the
+file-type bits in `st_mode` (regular / directory / symlink /
+socket / FIFO / block / char). Paideia has no such bits at the
+filesystem layer -- every entry carries a schema handle instead.
+`ls --color=` therefore looks the same shape as POSIX color but
+answers a different question: what is this entry *for*, not what
+kind of inode is it. A directory rendered blue in POSIX may be
+rendered red in Paideia if its schema is a repository root, and
+a `.pdxsig` file may be rendered green if its schema is a signed
+manifest -- the color follows the schema, not the mode bits.
+
+!posix-diff
+
+POSIX `ls -l` renders the owner column as a text uid resolved
+through `/etc/passwd`. Paideia has no `/etc/passwd` -- users are
+capabilities. `ls -l` renders the owner column as `u:<row>`
+where `<row>` is the row index in the founder-provisioned user
+table (per R48). Consumers who want the human-readable name
+pipe through `caps decode --owner-col` (a post-1.0 tool at
+`caps` M2+).
+
+!section examples
+
+!example
+$ ls
+argv_surface.pdx
+runner.pdx
+semantic_emit.pdx
+!end-example
+
+!example
+$ ls -l
+f rw- u:0    12103  2026-08-21T20:49  argv_surface.pdx
+f rw- u:0    22163  2026-08-22T08:14  runner.pdx
+f rw- u:0    27731  2026-08-22T08:31  semantic_emit.pdx
+!end-example
+
+!example
+$ ls -lh
+f rw- u:0    12K    2026-08-21T20:49  argv_surface.pdx
+f rw- u:0    21K    2026-08-22T08:14  runner.pdx
+f rw- u:0    27K    2026-08-22T08:31  semantic_emit.pdx
+!end-example
+
+!example
+$ ls --schema
+declares_output_schemas:
+  - PdxFsDirEntry@0.1
+!end-example
+
+!example
+$ ls | grep --schema PdxFsDirEntry --field name --pattern '.pdx$'
+argv_surface.pdx
+runner.pdx
+semantic_emit.pdx
+!end-example
+
+!section see-also
+
+!ref pkg           -- install ls: `pkg install ls`.
+!ref shell         -- pipeline consumer for the PdxFsDirEntry
+                      stream (`ls | grep --schema ...`).
+!ref caps          -- decode `u:<row>` -> user name.
+!ref libpdx-semantic-pipe
+                    -- schema/version-tolerance rules that
+                      govern how `PdxFsDirEntry@0.1` evolves.
+!ref libpdx-audit  -- the DirListRecord frame ls opens/commits.
+
+!section version
+
+1.0.0 -- R50 Wave-2 core-utility line. Byte-frozen: the argv
+surface, the exit-code map, and the 144-byte `PdxFsDirEntry@0.1`
+wire body do not change on the 1.x line. See `CHANGELOG.md` for
+the 0.1..1.0 progression and the 1.x additive-only rules.

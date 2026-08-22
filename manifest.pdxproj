@@ -1,0 +1,105 @@
+# ls -- paideia-as build manifest
+#
+# Wave: R50  Milestone: M5 (signed 1.0 release)
+# Doc:   design/tooling/r49-r50-plan.md §5.4 in the paideia-os repo,
+#        and design/release-1.0.md in this repo.
+#
+# Consumed by `paideia-as build`. Each line is a directive; blank lines
+# and lines starting with `#` are ignored. The M5 build produces the
+# byte-frozen 1.0 artefact: one output at build-out/ls (the elaborated
+# .pdx -> ELF-like Paideia binary) plus a caps-manifest copy at
+# build-out/ls.caps for the InitCap sidecar packaging step + the
+# dual-signed manifest.pdxsig staged under dist/ per design/release-1.0.md.
+#
+# paideia-as v0.33+ is the required toolchain floor (mov_b narrow-load
+# mnemonic + @align attribute on .bss slots per the #1248 mitigation).
+# Any bump of this floor is a compatibility break for the signed 1.0
+# artefact and requires a corresponding manifest.pdxsig re-sign under
+# a new PAIDEIA_AS_VER KV record.
+
+name        = ls
+version     = 1.0.0
+kind        = tool
+entry       = Dispatch::ls_dispatch
+output      = build-out/ls
+caps_decl   = caps.decl
+
+# --- Source list (order-insensitive; paideia-as resolves module deps
+# from `module <Basename> = structure { ... }` headers). -----------------
+#
+# Grouped by the milestone-issue that added each file:
+#   M1-001 lands: ls (KIND mirrors + error band + stats table).
+#   M1-002 lands: argv_surface (flag-bit recogniser over libpdx-argv).
+#   M1-003 lands: runner + dispatch (Runner stub + composition).
+#   M2-001 lands: long_format (-l line renderer).
+#   M2-002 lands: owner_col (owner column: u:<row>).
+#   M2-003 lands: render + hidden_filter + human_size (-a, -h utilities).
+#   M2-004 lands: color_picker (schema-first coloring + SGR emit).
+#   M3-001 lands: pdxfs_shim + tty_write + semantic_emit (128-byte record).
+#   M3-002 lands: (semantic_emit extended in place -- 144-byte record).
+#   M3-003 lands: audit_shim (DirListRecord begin/commit around Runner body).
+#   M4-003 lands: exit_map (0xFFFFEBxx -> I4 exit-code vocabulary).
+sources:
+  - src/ls.pdx                    # M1-001 KIND mirrors + error band + stats
+  - src/argv_surface.pdx          # M1-002 flag-bit recogniser
+  - src/runner.pdx                # M1-003 + M3-001 + M3-003 runner_ls body
+  - src/dispatch.pdx              # M1-003 ls_dispatch composition
+  - src/long_format.pdx           # M2-001 -l line renderer
+  - src/owner_col.pdx             # M2-002 owner column: u:<row>
+  - src/render.pdx                # M2-003 render_dec_u64 + render_byte_write
+  - src/hidden_filter.pdx         # M2-003 -a dot-prefix filter
+  - src/human_size.pdx            # M2-003 -h base-2 K/M/G/T/P/E renderer
+  - src/color_picker.pdx          # M2-004 schema-first coloring + SGR emit
+  - src/pdxfs_shim.pdx            # M3-001 sysno 71/72 trampolines
+  - src/tty_write.pdx             # M3-001 sysno 1 sys_write to fd=1
+  - src/semantic_emit.pdx         # M3-001 + M3-002 + M4-004 emit + wire_compose
+  - src/audit_shim.pdx            # M3-003 audit_ls_begin + audit_ls_commit
+  - src/exit_map.pdx              # M4-003 0xFFFFEBxx -> I4 exit-code map
+
+# --- Library dependencies -----------------------------------------------
+# ls consumes five libraries at 1.0. Every dep is version-pinned to a
+# 1.0-compatible major so a downstream `pkg install ls` resolves against
+# a byte-frozen library set. The version bumps at each library's own M5
+# and the manifest.pdxsig at design/release-1.0.md re-signs on each.
+deps:
+  - libpdx-argv @ ^1.0            # M1-002 argv surface + M4-001 typed flags
+  - libpdx-cap @ ^1.0             # M2-002 KIND_USER_ref decode for owner column
+  - libpdx-semantic-pipe @ ^1.0   # M3-001 PdxFsDirEntry@0.1 schema bind + emit
+  - libpdx-audit @ ^1.0           # M3-003 DirListRecord begin/commit
+  - libpdx-elevate @ ^1.0         # not consumed by ls; declared for cross-tool ABI parity
+
+# --- Test list (order-insensitive; every fixture lives at tests/). ------
+tests:
+  - tests/color_fixtures.pdx      # M4-001 10 dispatch + 3 SGR goldens
+  - tests/owner_fixtures.pdx      # M4-002 7 row + 2 wire-cap cases
+  - tests/exit_matrix.pdx         # M4-003 13-case exit-code map witness
+  - tests/schema_golden.pdx       # M4-004 hash-imprint + 144-byte wire body
+
+# --- Paideia-as compliance flags ---------------------------------------
+# These mirror the invariants every R49/R50 tool observes and every M1
+# file in this repo is written against. Documented here so a build under
+# a non-conforming paideia-as revision refuses fast.
+compliance:
+  - module-basename-pascal        # Module <BasenamePascalCase>, no dir prefix
+  - no-test-mnemonic              # zero-check via cmp reg, 0
+  - cmp-imm32-only                # cmp reg, imm <= 0x7FFFFFFF; else stage via r11
+  - r11-scratch                   # r11 is not preserved across calls
+  - byte-load-zero-then-mov_b     # xor rax, rax; mov_b rax, [ptr]
+  - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call
+
+# --- Release-1.0 signing block references ------------------------------
+# The dual-signed manifest.pdxsig for this build lives at
+# dist/manifest.pdxsig once `paideia-as release` composes it. Its wire
+# shape, KV body contents, and the scaffold-epoch discipline for the
+# two ML-DSA-65 signature slots are pinned in design/release-1.0.md.
+# In the scaffold epoch (pre-R32) both signature slots are bytewise
+# zero and the verifier returns SIG_UNSIGNED_SCAFFOLD (per
+# design/drivers/blob-policy.md §1.7 in the paideia-os repo); the
+# 1.0 tag freezes the shape, and a re-sign at R32 will bump the
+# manifest header's `created_unix_secs` field without a source-tree
+# change.
+release:
+  manifest_pdxsig = dist/manifest.pdxsig
+  changelog_entry = CHANGELOG.md#100
+  pdxdoc          = doc/ls.pdxdoc
+  mirror_target   = pkgs.paideia-os/ls/1.0.0/
