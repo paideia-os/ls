@@ -4,6 +4,34 @@ Every ls release ships as a dual-signed `manifest.pdxsig` per
 `design/release-1.0.md`; the CHANGELOG entry moves in lock-step with
 the version stamp in `manifest.pdxproj` and the git tag.
 
+## [Unreleased]
+
+Enhancement v1.x wave (`design/enhancement-plan.md`), 1.0.1
+honesty-patch items landing ahead of the 1.1.0 wiring milestone. No
+frozen 1.0 interface (argv surface, exit-code map, wire body shape,
+`caps.decl`) changes in this section.
+
+### Fixed
+
+- **ENH-010** (#27) -- `SemanticEmit::sem_emit_reset` now imprints the
+  real `PdxFsDirEntry@0.1` schema id via `libpdx-semantic-pipe::
+  Schema::spipe_schema_id_from_name`, replacing the M3-001 placeholder
+  (a fixed first-byte-0x01 stub with no relation to the schema name).
+  The new id is byte-identical to libpdx-semantic-pipe's own
+  `tests/wire_golden.pdx` `_wg_hash0` corpus entry, so an
+  independently-built adopter binding the same schema name now
+  interoperates with ls without coordination. Not cryptographic --
+  see `src/semantic_emit.pdx` §Schema Hash for the pre-BLAKE3 bridge
+  rationale. `tests/schema_golden.pdx`'s hash golden is updated to
+  match.
+- **ENH-004** (#18) -- `Dispatch::ls_dispatch` now folds its return
+  value through `ExitMap::exit_map` before returning. Previously
+  `exit_map` had no caller anywhere in the tool and `ls_dispatch`
+  (this repo's `entry`, since there is no `_start` frame) returned a
+  raw `0xFFFFEBxx` sentinel verbatim; a successful run exited
+  `0xFFFFEB00`, not `0`. Every documented exit code (0/2/3/4, README
+  and `doc/ls.pdxdoc`) is now what the tool actually returns.
+
 ## [1.0.0] -- 2026-08-22 <a id="100"></a>
 
 **M5 close.** First byte-frozen release. The 1.0 line is the R50

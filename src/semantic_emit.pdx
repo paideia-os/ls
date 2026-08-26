@@ -58,22 +58,26 @@
 // sees a valid prefix.
 //
 // =============================================================================
-// SCHEMA HASH (M3-001 STUB)
+// SCHEMA HASH (ls.ENH-010, paideia-os/ls#27)
 // =============================================================================
 //
 // libpdx-semantic-pipe::Binding requires a non-zero 32-byte hash
 // (SP_ERR_NULL_HASH refuses schema_id == 0 -- see binding.pdx §40).
-// The canonical hash is BLAKE3-truncated("PdxFsDirEntry@0.1") -- a
-// computation that lives in libpdx-schema-registry (R51+, not yet
-// present in the scratchpad checkout). For M3-001 the .bss slot
-// _se_pdxfsdirentry_hash carries a fixed 32-byte stub whose first
-// byte is 0x01 (all-other-bytes zero) so the bind gate passes and
-// the wire prefix is round-trippable by an M4 fixture that pins the
-// same stub. When libpdx-schema-registry.M1 lands, ls-side reset
-// code will overwrite this .bss slot with the real hash at process
-// start; consumers of the constant (send_record's prefix write)
-// never see the swap because the binding table cached the hash at
-// bind time.
+// _se_pdxfsdirentry_hash is imprinted by sem_emit_reset via
+// libpdx-semantic-pipe::Schema::spipe_schema_id_from_name("PdxFsDir
+// Entry@0.1", 17) -- the deterministic, pre-BLAKE3 fold that shipped
+// in libpdx-semantic-pipe's Enhancement v2.0 wave (ENH-001, #11).
+// This is NOT a cryptographic hash (no collision resistance
+// guarantee) but it IS the same value any other adopter of
+// libpdx-semantic-pipe computes for the same schema name -- byte-
+// identical to that library's own `_wg_hash0` golden in tests/wire_
+// golden.pdx -- so ls interoperates with an independently-built
+// consumer today rather than agreeing only with its own placeholder
+// (the M3-001 stub's actual defect: every stub-imprinting adopter
+// picked a different constant). The BLAKE3("PdxFsDirEntry@0.1")
+// upgrade lands as a body-only change inside spipe_schema_id_from_
+// name when libpdx-schema-registry / the paideia-as BLAKE3 intrinsic
+// ships; this call site does not change.
 //
 // =============================================================================
 // STDOUT ENDPOINT SLOT
@@ -103,6 +107,9 @@
 //     the .bss scratch) use `xor rax; mov_b rax, [ptr]` per #1248.
 //   - Byte writes via `mov_b [dst], reg` at every store.
 //   - r11 is scratch for LEA staging + short-lived intermediates.
+//   - sem_emit_reset: non-leaf (calls spipe_schema_id_from_name).
+//     One callee-save push (r12, alignment-only -- not read after the
+//     call) -> rsp % 16 == 0 at the nested call site.
 //   - sem_emit_bind_stdout: non-leaf (calls libpdx_semantic_pipe_bind).
 //     Two callee-save pushes (r12 = flag_bits sink unused here / kept
 //     for symmetry with the M3-002 extension that needs r13 for the
@@ -120,10 +127,12 @@
 // Called:
 //   libpdx_semantic_pipe_bind      -- libpdx-semantic-pipe::Binding
 //   send_record                    -- libpdx-semantic-pipe::Send
+//   spipe_schema_id_from_name      -- libpdx-semantic-pipe::Schema
+//                                     (ls.ENH-010, #27)
 //
 // Written / read:
-//   _se_pdxfsdirentry_hash         -- 32-byte schema hash stub (this
-//                                     module's .bss)
+//   _se_pdxfsdirentry_hash         -- 32-byte PdxFsDirEntry@0.1 schema
+//                                     id (this module's .bss)
 //   _se_wire_scratch               -- 128-byte record composition
 //                                     buffer at M3-001; extended to
 //                                     144 bytes at M3-002 (this
@@ -170,16 +179,29 @@ module SemanticEmit = structure {
   pub let SE_OFF_OWNER_TARGET : u64 = 136
 
   // ==========================================================================
+  // Schema name (.rodata)
+  // ==========================================================================
+  //
+  // _se_schema_name -- the literal schema name string passed to
+  // libpdx-semantic-pipe::Schema::spipe_schema_id_from_name at reset
+  // time (ls.ENH-010, paideia-os/ls#27). 17 bytes, no NUL terminator
+  // (spipe_schema_id_from_name takes an explicit length, not a
+  // C-string). This is also `_wg_name0` in libpdx-semantic-pipe's own
+  // tests/wire_golden.pdx corpus -- both repos must pass the same
+  // bytes to get the same id.
+  pub let _se_schema_name : [u8; 17] = "PdxFsDirEntry@0.1"
+
+  // ==========================================================================
   // .bss storage
   // ==========================================================================
   //
-  // _se_pdxfsdirentry_hash -- 32 bytes = 4 u64 lanes.  BLAKE3-truncated
-  // hash of the PdxFsDirEntry@0.1 schema.  M3-001 stub: first byte
-  // 0x01, remaining 31 bytes zero.  A .bss `uninit` starts zeroed at
-  // load, so we do NOT need a reset entry point that writes it -- the
-  // first-byte stub is imprinted by a static init helper below
+  // _se_pdxfsdirentry_hash -- 32 bytes = 4 u64 lanes. The
+  // pre-BLAKE3 schema id for "PdxFsDirEntry@0.1", computed by
+  // libpdx-semantic-pipe::Schema::spipe_schema_id_from_name (ls.
+  // ENH-010, paideia-os/ls#27). A .bss `uninit` starts zeroed at
+  // load; the real id is imprinted by a static init helper below
   // (sem_emit_reset), called once from Runner before its first bind
-  // call.  Aligned to 8 so the four qword lanes are naturally aligned.
+  // call. Aligned to 8 so the four qword lanes are naturally aligned.
   pub let mut _se_pdxfsdirentry_hash : [u64; 4] = uninit @align(8)
 
   // _se_wire_scratch -- 144 bytes (18 u64 lanes) at M3-002: 16 lanes
@@ -193,32 +215,46 @@ module SemanticEmit = structure {
   // ==========================================================================
   // sem_emit_reset() -> ()
   //
-  // Imprint the stub schema hash into _se_pdxfsdirentry_hash so
-  // Binding::libpdx_semantic_pipe_bind's SP_ERR_NULL_HASH gate
-  // (binding.pdx §40) passes.  Called once from Runner before the
-  // first bind attempt.  Safe to call more than once; second and
-  // subsequent calls are idempotent stores of the same bytes.
+  // Imprint the real PdxFsDirEntry@0.1 schema id into
+  // _se_pdxfsdirentry_hash so Binding::libpdx_semantic_pipe_bind's
+  // SP_ERR_NULL_HASH gate (binding.pdx §40) passes.  Called once from
+  // Runner before the first bind attempt.  Safe to call more than
+  // once; second and subsequent calls are idempotent (the fold is a
+  // pure function of the name bytes -- same input, same output).
   //
-  // Real hash (BLAKE3-truncated("PdxFsDirEntry@0.1")) arrives via
-  // libpdx-schema-registry.M1 (R51+); at that point sem_emit_reset
-  // fetches from the registry rather than imprinting a constant.
+  // ls.ENH-010 (paideia-os/ls#27): delegates to libpdx-semantic-
+  // pipe::Schema::spipe_schema_id_from_name(name_ptr, name_len,
+  // out_hash_ptr) over the literal `_se_schema_name` bytes, replacing
+  // the M3-001 stub (first byte 0x01, rest zero). This is the same
+  // pre-BLAKE3 fold every other adopter of libpdx-semantic-pipe.
+  // ENH-001 calls for "PdxFsDirEntry@0.1" -- byte-identical to
+  // libpdx-semantic-pipe's own `_wg_hash0` golden in tests/wire_
+  // golden.pdx, so an independently-built consumer that binds the
+  // same schema name agrees with ls's imprint without coordination.
+  // Not cryptographic; upgrades to a real BLAKE3(name) call in place
+  // when libpdx-schema-registry / the paideia-as BLAKE3 intrinsic
+  // ships, with no change to this call site's shape.
   //
-  // Register plan (leaf):
-  //   r11 = LEA scratch
-  //   rax = 0x01 seed / zero for the tail lanes
+  // Register plan (non-leaf, one callee-save push for alignment):
+  //   rdi = name_ptr (LEA _se_schema_name)
+  //   rsi = name_len (17, literal)
+  //   rdx = out_hash_ptr (LEA _se_pdxfsdirentry_hash)
+  //   rax = call return (SP_SCHEMA_OK == 0 always, for this fixed
+  //         well-formed input; not checked -- see justification)
   // ==========================================================================
   pub let sem_emit_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "ls.M3-001 (#8): imprint a stub PdxFsDirEntry@0.1 schema hash so libpdx-semantic-pipe::Binding's SP_ERR_NULL_HASH gate (binding.pdx §40) passes at bind time. Four qword lanes: lane 0 gets the byte 0x01 in position 0 with the remaining 7 bytes zero; lanes 1..3 stay zero. The first-byte-0x01 stub is a fixed marker any M4 fixture pins symmetrically so the wire prefix round-trips. Real BLAKE3(PdxFsDirEntry@0.1) lands with libpdx-schema-registry.M1 (R51+); at that point this function reads from the registry rather than imprinting a constant. Leaf; r11 scratch for the LEA; no cmp needed. No test mnemonic. Labels prefixed serst_.",
+      justification: "ls.ENH-010 (#27): imprint the real PdxFsDirEntry@0.1 schema id via libpdx-semantic-pipe::Schema::spipe_schema_id_from_name(name_ptr=&_se_schema_name, name_len=17, out_hash_ptr=&_se_pdxfsdirentry_hash), replacing the M3-001 stub-byte imprint. The three gates inside spipe_schema_id_from_name (null name_ptr, name_len == 0 or > 256, null out_hash_ptr) cannot fire for this fixed, well-formed, non-null call site, so the return value is not checked -- there is no error path for sem_emit_reset to report through its () -> () signature, and none of SP_SCHEMA_ERR_NULL_NAME/NAME_RANGE/NULL_HASH is reachable here. Single r12 push for SysV alignment across the nested call: entry rsp % 16 == 8; one push -> rsp % 16 == 0 for spipe_schema_id_from_name's SysV call site. Matched pop before ret. paideia-as conformance: no test mnemonic; no cmp reg, imm > 0x7FFFFFFF (rsi's 17 is the only immediate). r12 is pushed only for alignment parity and is not read after the call. Effects {mem} @{} match spipe_schema_id_from_name's own declared effects. Labels prefixed serst_ (none needed -- straight-line, no branch).",
       block: {
-        lea r11, [rip + _se_pdxfsdirentry_hash];
-        mov rax, 1;                              // low byte 0x01, rest zero
-        mov [r11 + 0], rax;
-        xor rax, rax;
-        mov [r11 + 8], rax;
-        mov [r11 + 16], rax;
-        mov [r11 + 24], rax;
+        push r12;                                // SysV alignment for the nested call
+
+        lea rdi, [rip + _se_schema_name];        // name_ptr
+        mov rsi, 17;                              // name_len
+        lea rdx, [rip + _se_pdxfsdirentry_hash]; // out_hash_ptr
+        call spipe_schema_id_from_name;
+
+        pop r12;
         ret
       }
     }

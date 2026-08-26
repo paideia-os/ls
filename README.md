@@ -105,7 +105,10 @@ follow the `libpdx-semantic-pipe` version-tolerance rules and are additive on th
 ## Exit codes
 
 `src/exit_map.pdx` folds the internal `0xFFFFEBxx` band into the I4 vocabulary.
-An unclassified code routes to 3, never to 0.
+An unclassified code routes to 3, never to 0. `Dispatch::ls_dispatch` — this
+repo ships no `_start` frame, so `ls_dispatch` is `manifest.pdxproj`'s
+`entry` — calls `exit_map` on its way out (`ls.ENH-004`, #18), so every
+caller of `ls_dispatch` sees 0/2/3/4, never a raw `0xFFFFEBxx` sentinel.
 
 | Code | Meaning | Internal sentinels |
 |------|---------|--------------------|

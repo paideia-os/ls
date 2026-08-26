@@ -1,7 +1,12 @@
-// src/dispatch.pdx -- ls.M1-003 (paideia-os/ls#3)
+// src/dispatch.pdx -- ls.M1-003 (paideia-os/ls#3) + ls.ENH-004 (#18)
 //
 // Dispatch module: composition of ArgvSurface::argv_surface_parse and
 // Runner::runner_ls into a single entry point ls_dispatch(argv, argc).
+// ls.ENH-004 (#18) folds the result through ExitMap::exit_map before
+// returning, since this repo ships no `_start` frame -- ls_dispatch,
+// named as `entry` in manifest.pdxproj, IS the entry boundary a
+// wrapper would otherwise fold at. Every caller therefore sees the
+// I4 vocabulary (0/2/3/4) rather than a raw 0xFFFFEBxx sentinel.
 //
 // =============================================================================
 // SCOPE
@@ -15,13 +20,16 @@
 // Flow of ls_dispatch(argv, argc):
 //
 //   1. Call ArgvSurface::argv_surface_parse(argv, argc). Any return
-//      != AS_OK (0xFFFFEB10) propagates verbatim -- the caller
-//      collapses the 0xFFFFEBxx code into an I4 exit code (0/2/3/4)
-//      per design/architecture.md §6.
+//      != AS_OK (0xFFFFEB10) skips straight to step 4 with that
+//      sentinel in rax.
 //   2. On AS_OK, load _as_path_ptr + _as_flag_bits from
 //      ArgvSurface's .bss.
-//   3. Call Runner::runner_ls(path_ptr, flag_bits). Return its rax
-//      verbatim (LS_RUN_STUB at M1; LS_OK at M2+).
+//   3. Call Runner::runner_ls(path_ptr, flag_bits). rax becomes its
+//      return (LS_RUN_STUB at M1; LS_OK / LS_ERR_* at M2+).
+//   4. ls.ENH-004 (#18): call ExitMap::exit_map(rax) and return ITS
+//      result. ls_dispatch's caller therefore always sees 0/2/3/4 --
+//      never a raw 0xFFFFEBxx sentinel -- per design/architecture.md
+//      §6.
 //
 // =============================================================================
 // PAIDEIA-AS CONFORMANCE
@@ -55,6 +63,7 @@
 // Called:
 //   argv_surface_parse   -- ArgvSurface (src/argv_surface.pdx)
 //   runner_ls            -- Runner (src/runner.pdx)
+//   exit_map              -- ExitMap (src/exit_map.pdx), ls.ENH-004 (#18)
 //
 // Read:
 //   _as_path_ptr         -- ArgvSurface (src/argv_surface.pdx .bss)
@@ -68,21 +77,24 @@ module Dispatch = structure {
   // Signature: ls_dispatch : (u64, u64) -> u64 !{mem} @{}
   //   RDI: argv  (u64* array of NUL-terminated arg pointers)
   //   RSI: argc  (count of entries in argv)
-  //   RAX: AS_ERR_* (0xFFFFEB1x) if argv parse failed; else
-  //        LS_RUN_STUB (M1) or LS_OK (M2+) from Runner.
+  //   RAX: the I4 exit-code vocabulary -- 0 (success), 2 (usage), 3
+  //        (system), or 4 (capability denied) -- per ExitMap::
+  //        exit_map. ls.ENH-004 (#18): no 0xFFFFEBxx sentinel ever
+  //        escapes ls_dispatch.
   //
   // Register plan:
   //   r10 = AS_OK stage (large-imm compare workaround)
   //   r11 = scratch (LEA base for .bss reads)
   //   r12 = pushed for alignment + SysV callee-save discipline
   //   rdi/rsi = pass-through to argv_surface_parse; then loaded from
-  //             .bss for runner_ls
-  //   rax = return propagation
+  //             .bss for runner_ls; then rdi reloaded with the
+  //             pre-fold code for exit_map
+  //   rax = pre-fold code in, folded I4 exit code out
   // ==========================================================================
   pub let ls_dispatch : (u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "ls.M1-003 (#3): the composition entry point _start will call at M2. Passes argv/argc verbatim to ArgvSurface::argv_surface_parse. On AS_OK (0xFFFFEB10) loads _as_path_ptr + _as_flag_bits from ArgvSurface's .bss and calls Runner::runner_ls, returning its rax. Any non-AS_OK argv-parse rejection propagates rax verbatim so the caller can collapse the 0xFFFFEBxx family into an I4 exit code (0/2/3/4). The AS_OK compare stages the 0xFFFFEB10 constant into r10 because it does not fit in a sign-extended imm32 (paideia-as `cmp reg, imm <= 0x7FFFFFFF` rule -- same staging idiom libpdx-elevate uses for its 0xFFFFFFFFFFFFFFFF sentinel at elevate_client_lookup_broker). Push/pop parity: single r12 push both aligns rsp % 16 to 0 for the two nested call sites (entry rsp % 16 == 8; one push takes it to 0) AND preserves r12 across the callees for callers that expect SysV callee-save preservation. Same idiom as doc's doc_dispatch_from_buf (paideia-os/doc src/argv_dispatch.pdx L339). Labels prefixed ls_dp_.",
+      justification: "ls.M1-003 (#3) + ls.ENH-004 (#18): the composition entry point named as `entry` in manifest.pdxproj. Passes argv/argc verbatim to ArgvSurface::argv_surface_parse. On AS_OK (0xFFFFEB10) loads _as_path_ptr + _as_flag_bits from ArgvSurface's .bss and calls Runner::runner_ls; any non-AS_OK argv-parse rejection instead falls straight to the shared epilogue with rax still holding the AS_ERR_* sentinel. Either way, the epilogue (ls_dp_done) moves rax into rdi and calls ExitMap::exit_map so ls_dispatch always returns the I4 vocabulary (0/2/3/4), never a raw 0xFFFFEBxx code -- this repo ships no `_start` frame, so ls_dispatch is the entry boundary the fold belongs at (design/enhancement-plan.md §7 point 3). The AS_OK compare stages the 0xFFFFEB10 constant into r10 because it does not fit in a sign-extended imm32 (paideia-as `cmp reg, imm <= 0x7FFFFFFF` rule -- same staging idiom libpdx-elevate uses for its 0xFFFFFFFFFFFFFFFF sentinel at elevate_client_lookup_broker). Push/pop parity: single r12 push aligns rsp % 16 to 0 for all three nested call sites (entry rsp % 16 == 8; one push takes it to 0; no additional call changes that alignment since r12 stays pushed until the shared epilogue) AND preserves r12 across every callee per SysV callee-save discipline. Same idiom as doc's doc_dispatch_from_buf (paideia-os/doc src/argv_dispatch.pdx L339). Labels prefixed ls_dp_.",
       block: {
         push r12;                            // alignment + callee-save
 
@@ -94,7 +106,7 @@ module Dispatch = structure {
         // extended imm32, so stage via r10.
         mov r10, 0xFFFFEB10;                 // AS_OK
         cmp rax, r10;
-        jne ls_dp_done;                      // propagate parse error
+        jne ls_dp_done;                      // fold the parse error too
 
         // AS_OK. Load _as_path_ptr + _as_flag_bits and call Runner.
         lea r11, [rip + _as_path_ptr];
@@ -103,9 +115,14 @@ module Dispatch = structure {
         mov rsi, [r11];
         call runner_ls;
         // rax = Runner's return code (LS_RUN_STUB at M1; LS_OK / LS_
-        // ERR_* at M2+). Fall through to epilogue with rax unchanged.
+        // ERR_* at M2+). Fall through to the shared fold below.
 
       ls_dp_done:
+        // ls.ENH-004 (#18): fold whatever 0xFFFFEBxx sentinel is in
+        // rax (from either the parse-error early-out or Runner)
+        // through ExitMap::exit_map before returning to our caller.
+        mov rdi, rax;                        // ls_code arg for exit_map
+        call exit_map;
         pop r12;
         ret
       }

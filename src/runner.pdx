@@ -70,7 +70,9 @@
 //       DirListRecord audit frame BEFORE any user-visible byte is
 //       emitted (D3 invariant). On refusal return LS_ERR_AUDIT
 //       without touching KIND_TTY or the semantic-pipe endpoint.
-//   (2) sem_emit_reset() -- imprint the schema hash stub.
+//   (2) sem_emit_reset() -- imprint the PdxFsDirEntry@0.1 schema id
+//       (ls.ENH-010, #27: real spipe_schema_id_from_name fold, not
+//       a stub).
 //   (3) sem_emit_bind_stdout() -- bind LS_STDOUT_ENDPOINT_SLOT to
 //       PdxFsDirEntry@0.1. On refusal return LS_ERR_EMIT_BIND.
 //   (4) Loop:

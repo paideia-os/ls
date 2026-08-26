@@ -24,8 +24,10 @@ sub-band sentinel on fail.
   (`src/exit_map.pdx`, added at M4-003). The three lines the issue
   text pins ("empty=0", "missing=2", "cap-denied=4") are cases 0,
   7, 8 respectively.
-- `schema_golden.pdx` — `ls.M4-004` (#14). Two goldens: the M3-001
-  schema-hash imprint stub (first byte 0x01, rest zero) via
+- `schema_golden.pdx` — `ls.M4-004` (#14), updated at `ls.ENH-010`
+  (#27). Two goldens: the real PdxFsDirEntry@0.1 schema id (pre-BLAKE3
+  fold via `libpdx-semantic-pipe::Schema::spipe_schema_id_from_name`,
+  byte-identical to that library's own golden) imprinted by
   `SemanticEmit::sem_emit_reset`, and the 144-byte wire-body
   composition via `SemanticEmit::sem_emit_wire_compose` (a compose-
   only sibling of `sem_emit_entry` added at M4-004 so the wire

@@ -64,7 +64,10 @@ sources:
 deps:
   - libpdx-argv @ ^1.0            # M1-002 argv surface + M4-001 typed flags
   - libpdx-cap @ ^1.0             # M2-002 KIND_USER_ref decode for owner column
-  - libpdx-semantic-pipe @ ^1.0   # M3-001 PdxFsDirEntry@0.1 schema bind + emit
+  - libpdx-semantic-pipe @ ^1.0   # M3-001 PdxFsDirEntry@0.1 schema bind + emit;
+                                  # ls.ENH-010 (#27) adds Schema::spipe_schema_
+                                  # id_from_name (library's Enhancement v2.0
+                                  # wave, additive/backward-compatible with 1.0.0)
   - libpdx-audit @ ^1.0           # M3-003 DirListRecord begin/commit
   - libpdx-elevate @ ^1.0         # not consumed by ls; declared for cross-tool ABI parity
 
