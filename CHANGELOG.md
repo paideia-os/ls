@@ -41,6 +41,11 @@ frozen 1.0 interface (argv surface, exit-code map, wire body shape,
   `--color=` are parsed but not wired into the read loop, `--json`/
   `--schema` have no consumer, and the `--schema` example is a
   proposed shape (`ls.ENH-006`), not shipped output.
+- **ENH-013** (#22) -- drops the phantom `libpdx-elevate @ ^1.0` entry
+  from `manifest.pdxproj`'s `deps:` block. No call site in this repo
+  ever consumed it; `libpdx-elevate` appears elsewhere only as a
+  naming-convention precedent cited in comments, not as a real
+  dependency.
 
 ## [1.0.0] -- 2026-08-22 <a id="100"></a>
 

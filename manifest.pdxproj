@@ -57,10 +57,14 @@ sources:
   - src/exit_map.pdx              # M4-003 0xFFFFEBxx -> I4 exit-code map
 
 # --- Library dependencies -----------------------------------------------
-# ls consumes five libraries at 1.0. Every dep is version-pinned to a
-# 1.0-compatible major so a downstream `pkg install ls` resolves against
-# a byte-frozen library set. The version bumps at each library's own M5
-# and the manifest.pdxsig at design/release-1.0.md re-signs on each.
+# ls consumes four libraries at 1.0.1+ (ls.ENH-013, #22: the phantom
+# libpdx-elevate entry -- never consumed by any call site in this repo
+# -- is dropped; libpdx-elevate is a naming-convention precedent cited
+# in several justification comments, not a real dependency). Every dep
+# is version-pinned to a 1.0-compatible major so a downstream `pkg
+# install ls` resolves against a byte-frozen library set. The version
+# bumps at each library's own M5 and the manifest.pdxsig at design/
+# release-1.0.md re-signs on each.
 deps:
   - libpdx-argv @ ^1.0            # M1-002 argv surface + M4-001 typed flags
   - libpdx-cap @ ^1.0             # M2-002 KIND_USER_ref decode for owner column
@@ -69,7 +73,6 @@ deps:
                                   # id_from_name (library's Enhancement v2.0
                                   # wave, additive/backward-compatible with 1.0.0)
   - libpdx-audit @ ^1.0           # M3-003 DirListRecord begin/commit
-  - libpdx-elevate @ ^1.0         # not consumed by ls; declared for cross-tool ABI parity
 
 # --- Test list (order-insensitive; every fixture lives at tests/). ------
 tests:
