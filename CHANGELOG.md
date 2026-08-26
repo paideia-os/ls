@@ -31,6 +31,16 @@ frozen 1.0 interface (argv surface, exit-code map, wire body shape,
   raw `0xFFFFEBxx` sentinel verbatim; a successful run exited
   `0xFFFFEB00`, not `0`. Every documented exit code (0/2/3/4, README
   and `doc/ls.pdxdoc`) is now what the tool actually returns.
+- **ENH-001** (#23) -- `doc/ls.pdxdoc`'s `-l`/`-l -h`/`--schema`
+  examples now match the actual renderers: `kind` is `-` (not `f`),
+  `mode` is three raw octal digits (not POSIX `rwx` glyphs), `mtime`
+  is `ns:<decimal>` (not ISO-8601), `-h` sizes carry a tenths digit
+  (`11.8K`, not `12K`), and the `-lh` clustered form is replaced with
+  `-l -h` (clustered short flags are rejected upstream). Also adds
+  the disclosure `README.md` already carried: at 1.0.0 `-l`/`-h`/
+  `--color=` are parsed but not wired into the read loop, `--json`/
+  `--schema` have no consumer, and the `--schema` example is a
+  proposed shape (`ls.ENH-006`), not shipped output.
 
 ## [1.0.0] -- 2026-08-22 <a id="100"></a>
 

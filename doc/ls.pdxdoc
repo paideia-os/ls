@@ -26,13 +26,33 @@ return exit 2.
 !section flags
 
   -l              Long format: kind mode owner size mtime name.
-  -a              Include dot-prefix (hidden) entries.
+                  [parsed; not yet wired into the read loop -- see
+                  note below]
+  -a              Include dot-prefix (hidden) entries. [live]
   -h              Render sizes as base-2 K/M/G/T/P/E.
+                  [parsed; consumed only by the unwired -l renderer]
   --json          Emit each row as one JSON object on stdout.
+                  [parsed; no consumer in this repo yet]
   --schema        Print ls's declared output schemas + exit 0.
+                  [parsed; no consumer in this repo yet]
   --color=<v>     `<v>` in {auto, always, never}. Colors are
                   driven by the entry's declared schema/MIME, NOT
                   by POSIX file-type bits. See POSIX-diff below.
+                  [parsed; renderer shipped, not yet wired]
+
+At 1.0 the read loop honours only `-a` directly. `-l`, `-h`, and
+`--color=` are recognised by the argv parser and their renderers
+(`LongFormat`, `HumanSize`, `ColorPicker`) are shipped and tested,
+but `Runner::runner_ls` does not call them yet, so passing these
+flags today produces output byte-identical to bare `ls`. `--json`
+and `--schema` set their flag bits with no consumer at all. This is
+deliberate: the argv surface, the exit-code map, and the 144-byte
+wire body are frozen at 1.0, so wiring a renderer into the read loop
+is an additive change on the 1.x line, not a re-sign. The `-l`/`-h`
+examples below show the shipped renderer's actual byte output for
+when it is wired in; the `--schema` example is a proposed output
+shape with no implementation behind it yet (tracked as `ls.ENH-006`).
+None of these examples are reproducible by running `ls` at 1.0.0.
 
 The nine standard flags (`--help`, `--version`, `--schema`,
 `--json`, `--color=`, `--dry-run`, `--verbose`, `--quiet`,
@@ -148,23 +168,45 @@ semantic_emit.pdx
 
 !example
 $ ls -l
-f rw- u:0    12103  2026-08-21T20:49  argv_surface.pdx
-f rw- u:0    22163  2026-08-22T08:14  runner.pdx
-f rw- u:0    27731  2026-08-22T08:31  semantic_emit.pdx
+- 644 u:0 12103 ns:1755808140000000000 argv_surface.pdx
+- 644 u:0 22163 ns:1755841640000000000 runner.pdx
+- 644 u:0 27731 ns:1755870660000000000 semantic_emit.pdx
 !end-example
 
+Columns are `kind mode owner size mtime name`, single-space
+separated with no column padding. `kind` is one letter from the
+PdxFS-v1 type nibble (`-` regular file, `d` dir, `l` symlink, `s`
+special, `?` unrecognised); `mode` is three raw octal digits (no
+POSIX `rwx` glyph translation until the M3 schema/MIME palette
+lands); `mtime` is `ns:<decimal>`, the raw nanosecond epoch value,
+since calendar rendering awaits pdx-time (R54) -- pipe it through
+a schema-aware consumer to get a calendar date.
+
+`-l` clusters with no other short flag at 1.0 (`parse_argv` rejects
+clustered short forms -- exit 2); pass each short flag separately.
+
 !example
-$ ls -lh
-f rw- u:0    12K    2026-08-21T20:49  argv_surface.pdx
-f rw- u:0    21K    2026-08-22T08:14  runner.pdx
-f rw- u:0    27K    2026-08-22T08:31  semantic_emit.pdx
+$ ls -l -h
+- 644 u:0 11.8K ns:1755808140000000000 argv_surface.pdx
+- 644 u:0 21.6K ns:1755841640000000000 runner.pdx
+- 644 u:0 27.0K ns:1755870660000000000 semantic_emit.pdx
 !end-example
+
+`-h` renders the size column as `N.dK`/`N.dM`/... (base-2, one
+decimal digit) via `HumanSize::human_size_render`; it never rounds
+to a whole unit, so 12103 bytes is `11.8K`, not `12K`.
 
 !example
 $ ls --schema
 declares_output_schemas:
   - PdxFsDirEntry@0.1
 !end-example
+
+`--schema` is PROPOSED, not shipped: `AS_BIT_SCHEMA` is parsed but
+has no consumer anywhere in this repo at 1.0.0, so the flag is
+silently ignored and `ls --schema` produces the same bare directory
+listing as plain `ls`. The example above is the target shape (`ls.
+ENH-006`).
 
 !example
 $ ls | grep --schema PdxFsDirEntry --field name --pattern '.pdx$'
