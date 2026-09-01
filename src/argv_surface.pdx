@@ -133,6 +133,13 @@ module ArgvSurface = structure {
   // does not expose today, plus the shell-side per-name cap narrowing
   // #29 depends on). Argv surface here so the flag parses cleanly.
   pub let AS_BIT_R_REC  : u64 = 0x200
+  // ls.ENH-018 (#36): column-control overrides for the multi-column
+  // fitted layout that ships when sys_ttywinsize lands. -1 forces the
+  // one-per-line 1.0 output; -C forces multi-column regardless of
+  // stdout kind. When AS_BIT_ONE + AS_BIT_C_MAJ are both set, -1 wins
+  // (POSIX ls precedent).
+  pub let AS_BIT_ONE    : u64 = 0x400
+  pub let AS_BIT_C_MAJ  : u64 = 0x800
   // ls.ENH-019 (#37): -F type-indicator suffix (dir '/', exec '*', symlink '@').
   pub let AS_BIT_F      : u64 = 0x1000
   // ls.ENH-020 (#38): --group-directories-first. Sort comparator adds
@@ -295,6 +302,10 @@ module ArgvSurface = structure {
         je  as_pa_set_r_rev;
         cmp rax, 0x52;                    // 'R' ls.ENH-017 (#35)
         je  as_pa_set_r_rec;
+        cmp rax, 0x31;                    // '1' ls.ENH-018 (#36)
+        je  as_pa_set_one;
+        cmp rax, 0x43;                    // 'C' ls.ENH-018 (#36)
+        je  as_pa_set_c_maj;
         cmp rax, 0x46;                    // 'F' ls.ENH-019 (#37)
         je  as_pa_set_f;
         jmp as_pa_unsupported_short;
@@ -352,6 +363,22 @@ module ArgvSurface = structure {
         lea r11, [rip + _as_flag_bits];
         mov rax, [r11];
         or  rax, 0x200;                   // AS_BIT_R_REC
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+      as_pa_set_one:
+        // ls.ENH-018 (#36): -1 forces one-per-line.
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x400;                   // AS_BIT_ONE
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+      as_pa_set_c_maj:
+        // ls.ENH-018 (#36): -C forces multi-column.
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x800;                   // AS_BIT_C_MAJ
         mov [r11], rax;
         jmp as_pa_walk_advance;
 
