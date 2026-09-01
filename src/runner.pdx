@@ -159,6 +159,14 @@ module Runner = structure {
 
   // ArgvSurface AS_BIT_A mask (mirrored -- see design/architecture.md §3.1)
   pub let RN_BIT_A_MASK           : u64 = 0x2
+  // ls.ENH-019 (#37): -F type-indicator suffix mask (AS_BIT_F).
+  pub let RN_BIT_F_MASK           : u64 = 0x1000
+  // ls.ENH-019 (#37): kind-nibble offset inside the 128-byte kernel
+  // PdxFsDirEntry record. See paideia-os
+  // src/kernel/core/cap/pdxfs_dir_iter.pdx §1 (inode@0, kind@8,
+  // name_len@16, name[104]@24). The kind qword's low 4 bits carry the
+  // PdxFS-v1 file-type nibble (0x4=dir, 0x8=file, 0xA=symlink, ...).
+  pub let RN_ENT_OFF_KIND         : u64 = 8
 
   // Kernel PdxFsDirEntry offsets (mirror paideia-os
   // src/kernel/core/cap/pdxfs_dir_iter.pdx §1).
@@ -335,6 +343,52 @@ module Runner = structure {
         jmp rn_ls_copy_head;
 
       rn_ls_copy_done:
+        // ---- ls.ENH-019 (#37): -F type-indicator suffix -----------
+        //
+        // When AS_BIT_F is set in flag_bits, inspect the entry's kind
+        // nibble at record offset 8 and append a single suffix byte
+        // before the '\n':
+        //   nibble 0x4 (dir)     -> '/'
+        //   nibble 0xA (symlink) -> '@'
+        //   nibble 0x8 (file)    -> no suffix at v1.1 (exec '*' awaits
+        //                           the kernel record growing a mode
+        //                           field via sys_pdxfs_stat_by_inode --
+        //                           tracked as follow-up, aligned with
+        //                           ENH-008 owner deferral).
+        //   other                -> no suffix.
+        //
+        // r10 = suffix byte, rax = kind qword scratch.
+        mov r10, r13;                            // r10 = flag_bits copy
+        mov r11, 0x1000;                         // RN_BIT_F_MASK
+        and r10, r11;
+        cmp r10, 0;
+        je  rn_ls_no_suffix;
+        // Load kind at offset 8.
+        lea r11, [rip + _rn_entry_buf];
+        mov rax, [r11 + 8];                      // RN_ENT_OFF_KIND
+        and rax, 0xF;                            // low 4 bits = nibble
+        cmp rax, 0x4;
+        je  rn_ls_suffix_dir;
+        cmp rax, 0xA;
+        je  rn_ls_suffix_sym;
+        jmp rn_ls_no_suffix;
+
+      rn_ls_suffix_dir:
+        mov r10, 0x2F;                           // '/'
+        jmp rn_ls_suffix_emit;
+
+      rn_ls_suffix_sym:
+        mov r10, 0x40;                           // '@'
+        jmp rn_ls_suffix_emit;
+
+      rn_ls_suffix_emit:
+        // dst[len] = suffix; len++
+        mov r11, r15;
+        add r11, r14;
+        mov_b [r11], r10;
+        add r14, 1;
+
+      rn_ls_no_suffix:
         // ---- Append '\n' -----------------------------------------
         mov r11, r15;
         add r11, r14;                            // &dst[len]

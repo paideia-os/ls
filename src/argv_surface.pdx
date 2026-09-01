@@ -122,6 +122,8 @@ module ArgvSurface = structure {
   pub let AS_BIT_JSON   : u64 = 0x8
   pub let AS_BIT_SCHEMA : u64 = 0x10
   pub let AS_BIT_COLOR  : u64 = 0x20
+  // ls.ENH-019 (#37): -F type-indicator suffix (dir '/', exec '*', symlink '@').
+  pub let AS_BIT_F      : u64 = 0x1000
 
   // ==========================================================================
   // Parse-result .bss slots -- populated by argv_surface_parse, read
@@ -255,13 +257,15 @@ module ArgvSurface = structure {
         cmp rcx, 0;
         jne as_pa_route_long;
 
-        // ---- short-flag dispatch: byte0 ∈ {l, a, h} ------------------
+        // ---- short-flag dispatch: byte0 ∈ {l, a, h, F} ---------------
         cmp rax, 0x6C;                    // 'l'
         je  as_pa_set_l;
         cmp rax, 0x61;                    // 'a'
         je  as_pa_set_a;
         cmp rax, 0x68;                    // 'h'
         je  as_pa_set_h;
+        cmp rax, 0x46;                    // 'F' ls.ENH-019 (#37)
+        je  as_pa_set_f;
         jmp as_pa_unsupported_short;
 
       as_pa_set_l:
@@ -282,6 +286,15 @@ module ArgvSurface = structure {
         lea r11, [rip + _as_flag_bits];
         mov rax, [r11];
         or  rax, 0x4;                     // AS_BIT_H
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+      as_pa_set_f:
+        // ls.ENH-019 (#37): -F type-indicator suffix. Runner appends
+        // '/' / '*' / '@' after each entry name when this bit is set.
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x1000;                  // AS_BIT_F
         mov [r11], rax;
         jmp as_pa_walk_advance;
 
