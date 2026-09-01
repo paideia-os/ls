@@ -152,6 +152,13 @@ module ArgvSurface = structure {
   pub let mut _as_flag_bits       : u64 = uninit @align(8)
   pub let mut _as_path_ptr        : u64 = uninit @align(8)
   pub let mut _as_color_value_ptr : u64 = uninit @align(8)
+  // ls.ENH-014 (#32): multi-path listing. _as_pos_count captures
+  // libpdx-argv's pos_count so Dispatch can iterate every positional
+  // rather than silently ignoring [1..]. Dispatch-side iteration is
+  // deferred (needs a per-positional cap slot from shell InitCap;
+  // today only LS_DIR_CAP_SLOT is populated). This .bss slot is the
+  // hook the multi-path loop will read.
+  pub let mut _as_pos_count       : u64 = uninit @align(8)
 
   // ==========================================================================
   // argv_surface_reset() -> ()
@@ -173,6 +180,7 @@ module ArgvSurface = structure {
         lea r11, [rip + _as_flag_bits];       mov [r11], rax;
         lea r11, [rip + _as_path_ptr];        mov [r11], rax;
         lea r11, [rip + _as_color_value_ptr]; mov [r11], rax;
+        lea r11, [rip + _as_pos_count];       mov [r11], rax;
         ret
       }
     }
@@ -466,9 +474,17 @@ module ArgvSurface = structure {
         jmp as_pa_walk_head;
 
         // ---- post-walk: capture pos_ptrs[0] if any ---------------------
+        // ls.ENH-014 (#32): also mirror pos_count into _as_pos_count so
+        // Dispatch can iterate every positional once the multi-slot cap
+        // handoff arrives from shell InitCap. Today only slot 2 is
+        // populated; iteration of pos_ptrs[1..] against slot 2 would
+        // produce N identical listings, so the loop stays 1-shot until
+        // the per-positional cap slots exist.
       as_pa_walk_done:
         lea r11, [rip + pos_count];
         mov rax, [r11];
+        lea r10, [rip + _as_pos_count];
+        mov [r10], rax;
         cmp rax, 0;
         je  as_pa_skip_path;
         lea r11, [rip + pos_ptrs];
