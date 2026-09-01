@@ -130,6 +130,10 @@ module ArgvSurface = structure {
   pub let AS_BIT_R_REV  : u64 = 0x100   // -r reverse sort
   // ls.ENH-019 (#37): -F type-indicator suffix (dir '/', exec '*', symlink '@').
   pub let AS_BIT_F      : u64 = 0x1000
+  // ls.ENH-020 (#38): --group-directories-first. Sort comparator adds
+  // a partition step keyed on kind_nibble == 0x4. Argv surface here;
+  // observable behaviour lands with ENH-016's Runner buffering.
+  pub let AS_BIT_GDF    : u64 = 0x2000
 
   // ==========================================================================
   // Parse-result .bss slots -- populated by argv_surface_parse, read
@@ -345,6 +349,8 @@ module ArgvSurface = structure {
         je  as_pa_try_color;
         cmp rax, 0x70;                    // 'p' -> pdx-schema
         je  as_pa_try_pdx_schema;
+        cmp rax, 0x67;                    // 'g' -> group-directories-first (ENH-020)
+        je  as_pa_try_gdf;
         jmp as_pa_unknown_flag;
 
         // "json\0"  bytes:  j=0x6A s=0x73 o=0x6F n=0x6E NUL
@@ -412,6 +418,46 @@ module ArgvSurface = structure {
         lea r11, [rip + _as_flag_bits];
         mov rax, [r11];
         or  rax, 0x10;                    // AS_BIT_SCHEMA
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+        // "group-directories-first\0" bytes:
+        //   g=0x67 r=0x72 o=0x6F u=0x75 p=0x70 -=0x2D d=0x64 i=0x69
+        //   r=0x72 e=0x65 c=0x63 t=0x74 o=0x6F r=0x72 i=0x69 e=0x65
+        //   s=0x73 -=0x2D f=0x66 i=0x69 r=0x72 s=0x73 t=0x74 NUL
+        //
+        // ls.ENH-020 (#38): sets AS_BIT_GDF; the sort comparator gains
+        // a directories-first partition step. Comparator-side landing
+        // is deferred with ENH-016; this arm keeps the flag recognised
+        // so `ls --group-directories-first` parses instead of failing
+        // AS_ERR_UNKNOWN_FLAG.
+      as_pa_try_gdf:
+        xor rax, rax; mov_b rax, [r10 + 1];  cmp rax, 0x72; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 2];  cmp rax, 0x6F; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 3];  cmp rax, 0x75; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 4];  cmp rax, 0x70; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 5];  cmp rax, 0x2D; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 6];  cmp rax, 0x64; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 7];  cmp rax, 0x69; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 8];  cmp rax, 0x72; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 9];  cmp rax, 0x65; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 10]; cmp rax, 0x63; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 11]; cmp rax, 0x74; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 12]; cmp rax, 0x6F; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 13]; cmp rax, 0x72; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 14]; cmp rax, 0x69; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 15]; cmp rax, 0x65; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 16]; cmp rax, 0x73; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 17]; cmp rax, 0x2D; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 18]; cmp rax, 0x66; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 19]; cmp rax, 0x69; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 20]; cmp rax, 0x72; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 21]; cmp rax, 0x73; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 22]; cmp rax, 0x74; jne as_pa_unknown_flag;
+        xor rax, rax; mov_b rax, [r10 + 23]; cmp rax, 0;    jne as_pa_unknown_flag;
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x2000;                  // AS_BIT_GDF
         mov [r11], rax;
         jmp as_pa_walk_advance;
 
