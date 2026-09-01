@@ -423,6 +423,23 @@ module LongFormat = structure {
         jmp lf_name_head;
 
       lf_name_done:
+        // ---- ls.ENH-022 (#40): symlink target rendering placeholder
+        //
+        // When #24 wires LongFormat into the read loop, the kind_nibble
+        // (already in the caller's kind_mode_flags[3:0]) that decodes
+        // to 0xA (symlink) will steer this point into emitting
+        // ` -> <target_bytes>` before step 12's '\n'. Requires:
+        //   (a) a caller-supplied target_ptr (extra_ptr layout gains a
+        //       [16..24) qword or an inline PdxfsShim readlink call
+        //       here);
+        //   (b) a PdxfsShim::pdxfs_readlink_by_slot trampoline the
+        //       kernel does not currently expose.
+        //
+        // Awaiting #24 + kernel readlink surface (file cross-repo
+        // follow-up when attempted). No behavioural change at this
+        // commit; the label sits here so the future emit block is a
+        // pure insert.
+
         // ---- step 12: emit '\n' -------------------------------------
         mov rdi, r12;
         mov rsi, r13;
