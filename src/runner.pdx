@@ -445,6 +445,18 @@ module Runner = structure {
         jmp rn_ls_epilogue;
 
       rn_ls_readdir_fail:
+        // ls.ENH-015 (#33): when the cap at LS_DIR_CAP_SLOT is a
+        // regular file rather than a directory, sys_pdxfs_dir_readnext
+        // returns -EBADF here (0xFFFFFFFFFFFFFFF7 -- kind mismatch on
+        // the dir-mode gate). The POSIX fall-through would compose one
+        // entry-shaped record from the file cap's row (via a
+        // pdxfs_file_stat_by_slot trampoline that does not yet exist in
+        // PdxfsShim) and emit a single line + one PdxFsDirEntry record.
+        // Blocked by #29 (path-resolve) for the argument-driven cap
+        // narrowing that must precede the file/dir discrimination;
+        // land the discrimination + single-entry emit as follow-up to
+        // #29. Today: continue to surface LS_ERR_READDIR so the current
+        // exit vocabulary stays honest.
         mov rdi, 4;
         call ls_note;
         mov rax, 0xFFFFEB22;                     // LS_ERR_READDIR
