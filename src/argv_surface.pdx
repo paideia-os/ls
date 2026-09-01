@@ -122,6 +122,12 @@ module ArgvSurface = structure {
   pub let AS_BIT_JSON   : u64 = 0x8
   pub let AS_BIT_SCHEMA : u64 = 0x10
   pub let AS_BIT_COLOR  : u64 = 0x20
+  // ls.ENH-016 (#34): sort options. Runner-side buffering + comparator
+  // land in a follow-up round; the argv surface recognises them now so
+  // an early adopter can pass the flags without hitting UNSUPPORTED_SHORT.
+  pub let AS_BIT_T      : u64 = 0x40    // -t sort by mtime
+  pub let AS_BIT_S      : u64 = 0x80    // -S sort by size
+  pub let AS_BIT_R_REV  : u64 = 0x100   // -r reverse sort
   // ls.ENH-019 (#37): -F type-indicator suffix (dir '/', exec '*', symlink '@').
   pub let AS_BIT_F      : u64 = 0x1000
 
@@ -264,6 +270,12 @@ module ArgvSurface = structure {
         je  as_pa_set_a;
         cmp rax, 0x68;                    // 'h'
         je  as_pa_set_h;
+        cmp rax, 0x74;                    // 't' ls.ENH-016 (#34)
+        je  as_pa_set_t;
+        cmp rax, 0x53;                    // 'S' ls.ENH-016 (#34)
+        je  as_pa_set_s;
+        cmp rax, 0x72;                    // 'r' ls.ENH-016 (#34)
+        je  as_pa_set_r_rev;
         cmp rax, 0x46;                    // 'F' ls.ENH-019 (#37)
         je  as_pa_set_f;
         jmp as_pa_unsupported_short;
@@ -286,6 +298,31 @@ module ArgvSurface = structure {
         lea r11, [rip + _as_flag_bits];
         mov rax, [r11];
         or  rax, 0x4;                     // AS_BIT_H
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+      as_pa_set_t:
+        // ls.ENH-016 (#34): -t sort by mtime. Runner buffering + sort
+        // deferred (issue stays open pending the buffering rework).
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x40;                    // AS_BIT_T
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+      as_pa_set_s:
+        // ls.ENH-016 (#34): -S sort by size.
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x80;                    // AS_BIT_S
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+      as_pa_set_r_rev:
+        // ls.ENH-016 (#34): -r reverse sort.
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x100;                   // AS_BIT_R_REV
         mov [r11], rax;
         jmp as_pa_walk_advance;
 
