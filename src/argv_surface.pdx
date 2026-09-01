@@ -128,6 +128,11 @@ module ArgvSurface = structure {
   pub let AS_BIT_T      : u64 = 0x40    // -t sort by mtime
   pub let AS_BIT_S      : u64 = 0x80    // -S sort by size
   pub let AS_BIT_R_REV  : u64 = 0x100   // -r reverse sort
+  // ls.ENH-017 (#35): -R recursive descent. Runner recursion controller
+  // deferred (needs a per-name pdxfs_dir_open_at trampoline the kernel
+  // does not expose today, plus the shell-side per-name cap narrowing
+  // #29 depends on). Argv surface here so the flag parses cleanly.
+  pub let AS_BIT_R_REC  : u64 = 0x200
   // ls.ENH-019 (#37): -F type-indicator suffix (dir '/', exec '*', symlink '@').
   pub let AS_BIT_F      : u64 = 0x1000
   // ls.ENH-020 (#38): --group-directories-first. Sort comparator adds
@@ -288,6 +293,8 @@ module ArgvSurface = structure {
         je  as_pa_set_s;
         cmp rax, 0x72;                    // 'r' ls.ENH-016 (#34)
         je  as_pa_set_r_rev;
+        cmp rax, 0x52;                    // 'R' ls.ENH-017 (#35)
+        je  as_pa_set_r_rec;
         cmp rax, 0x46;                    // 'F' ls.ENH-019 (#37)
         je  as_pa_set_f;
         jmp as_pa_unsupported_short;
@@ -335,6 +342,16 @@ module ArgvSurface = structure {
         lea r11, [rip + _as_flag_bits];
         mov rax, [r11];
         or  rax, 0x100;                   // AS_BIT_R_REV
+        mov [r11], rax;
+        jmp as_pa_walk_advance;
+
+      as_pa_set_r_rec:
+        // ls.ENH-017 (#35): -R recursive. Runner descent controller
+        // deferred (needs pdxfs_dir_open_at kernel-side + #29 path
+        // resolve). This arm keeps -R parseable.
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x200;                   // AS_BIT_R_REC
         mov [r11], rax;
         jmp as_pa_walk_advance;
 
