@@ -72,6 +72,16 @@ module TtyWrite = structure {
   pub let TW_SYSNO_WRITE     : u64 = 1
   pub let LS_TTY_STDOUT_FD   : u64 = 1
 
+  // ls.ENH-023 (#41): KIND_TTY ordinal used by the --color=auto
+  // discrimination. When the R49.M1 KIND_TTY write wire lands, a
+  // tty_stdout_kind() helper will return the sink's KIND ordinal
+  // (equal to TW_KIND_TTY when stdout is a terminal, another value
+  // when it is a pipe/file/semantic-pipe). Today no such helper
+  // exists because fd 1 does not resolve to a cap slot in the M3
+  // compat shim; --color=auto therefore falls back to --color=never
+  // until the KIND_TTY wire lands and #25 wires ColorPicker.
+  pub let TW_KIND_TTY        : u64 = 0x197
+
   // ==========================================================================
   // tty_write(buf_ptr, len) -> bytes_written | -errno
   //

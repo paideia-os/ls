@@ -160,6 +160,14 @@ module ArgvSurface = structure {
   //                        or 0 if --color was not seen. Interior into
   //                        caller-owned argv memory (libpdx-argv's
   //                        in-place NUL-termination on '=' semantics).
+  //                        ls.ENH-023 (#41): when AS_BIT_COLOR is unset,
+  //                        or is set and this ptr resolves to "auto\0",
+  //                        the coloring path becomes stdout-kind-driven
+  //                        (engage ColorPicker only if stdout is KIND_TTY
+  //                        0x197). The wire lands with #25; the argv
+  //                        surface already carries the value string
+  //                        verbatim so the discrimination is a Runner-
+  //                        side compare against the fixed literal.
   // ==========================================================================
   pub let mut _as_flag_bits       : u64 = uninit @align(8)
   pub let mut _as_path_ptr        : u64 = uninit @align(8)
