@@ -423,23 +423,120 @@ module LongFormat = structure {
         jmp lf_name_head;
 
       lf_name_done:
-        // ---- ls.ENH-022 (#40): symlink target rendering placeholder
+        // ---- ls.ENH-022 (#40) v1.1.0: symlink target rendering -----
         //
-        // When #24 wires LongFormat into the read loop, the kind_nibble
-        // (already in the caller's kind_mode_flags[3:0]) that decodes
-        // to 0xA (symlink) will steer this point into emitting
-        // ` -> <target_bytes>` before step 12's '\n'. Requires:
-        //   (a) a caller-supplied target_ptr (extra_ptr layout gains a
-        //       [16..24) qword or an inline PdxfsShim readlink call
-        //       here);
-        //   (b) a PdxfsShim::pdxfs_readlink_by_slot trampoline the
-        //       kernel does not currently expose.
+        // Wave 2 wires the LongFormat renderer into the read loop
+        // (ENH-002 / #24) which puts this insertion point on the live
+        // path. When the entry is a symlink (kind_nibble at
+        // kind_mode_flags[3:0] == 0xA), we append the fixed 25-byte
+        // placeholder ` -> <link:target-unknown>` before the LF
+        // terminator. The literal placeholder ships until a paideia-os
+        // kernel readlink primitive lands (see paideia-os follow-up
+        // filed at paideia-os#TBD -- sys_pdxfs_readlink_by_slot);
+        // consumers see a distinct, self-describing value rather than
+        // a fabricated target.
         //
-        // Awaiting #24 + kernel readlink surface (file cross-repo
-        // follow-up when attempted). No behavioural change at this
-        // commit; the label sits here so the future emit block is a
-        // pure insert.
+        // The kind_nibble is not preserved in a register at this point
+        // (rcx was consumed at step 1's kind-letter emit), so we
+        // re-read it from _lf_kind_letters[nibble] indirectly via the
+        // r13-preserved kind_mode_flags -- BUT r13 was reused for cap
+        // remaining. So we recover the nibble from the emitted kind
+        // letter at offset rbx (the anchor holds the kind letter we
+        // wrote at step 1). The kind letters table maps 0xA -> 'l'
+        // (0x6C); a byte read of *rbx == 0x6C identifies symlink
+        // without keeping the nibble live through steps 2..11.
+        //
+        // r11 = symlink glyph 'l' (0x6C); rax = loaded kind letter.
+        xor rax, rax;
+        mov_b rax, [rbx];                    // kind letter at anchor
+        cmp rax, 0x6C;                       // 'l' (symlink)
+        jne lf_no_symlink_tail;
 
+        // Emit ' -> <link:target-unknown>' -- 25 bytes.
+        // Bytes (ASCII):
+        //   0x20 0x2D 0x3E 0x20 0x3C 0x6C 0x69 0x6E 0x6B 0x3A
+        //     sp    -    >   sp    <    l    i    n    k    :
+        //   0x74 0x61 0x72 0x67 0x65 0x74 0x2D 0x75 0x6E 0x6B
+        //     t    a    r    g    e    t    -    u    n    k
+        //   0x6E 0x6F 0x77 0x6E 0x3E
+        //     n    o    w    n    >
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x20; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x2D; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x3E; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x20; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x3C; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6C; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x69; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6E; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6B; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x3A; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x74; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x61; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x72; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x67; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x65; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x74; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x2D; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x75; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6E; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6B; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6E; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6F; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x77; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6E; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x3E; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je lf_overflow;
+        add r12, 1; sub r13, 1;
+
+      lf_no_symlink_tail:
         // ---- step 12: emit '\n' -------------------------------------
         mov rdi, r12;
         mov rsi, r13;

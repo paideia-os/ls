@@ -1,10 +1,30 @@
 # ls — status
 
 **Wave:** R50 (Wave 2)
-**Version:** 1.0.1
-**Current milestone:** Enhancement v1.x wave -- 1.0.1 honesty patch
-LANDED (ENH-003 + ENH-011 + ENH-012 per `design/enhancement-plan.md`
-§5-§6). M5 (signed 1.0 release) closed at v1.0.0.
+**Version:** 1.1.0
+**Current milestone:** Enhancement v1.x wave -- 1.1.0 wiring wave
+LANDED (ENH-002 + ENH-005 + ENH-006 + ENH-007 + ENH-022 + ENH-023 per
+`design/enhancement-plan.md` §5-§6, bundled per the `libpdx-elevate`
+v1.1.2 pattern). 1.0.1 honesty patch remains LANDED
+(ENH-003 + ENH-011 + ENH-012). M5 (signed 1.0 release) closed at
+v1.0.0.
+
+The wiring wave activates six flags whose primitives shipped at M2 or
+whose recogniser landed at M1-002 but whose runner-side dispatch
+lagged: `-l` now composes a long-format line via `LongFormat`
+(ENH-002 #24), `--color` wraps entries with ANSI SGR via
+`ColorPicker` (ENH-005 #25), `--schema` short-circuits to a schema
+catalog emit via the new `SchemaDump` module (ENH-006 #19), `--json`
+swaps the KIND_TTY text branch to a JSON line via the new `JsonLine`
+module (ENH-007 #26), symlink entries in `-l` gain a
+` -> <link:target-unknown>` placeholder tail (ENH-022 #40 -- awaits
+a paideia-os readlink primitive), and `--color=auto` gains a stdout-
+KIND-driven discrimination that today falls through to color-off
+because fd 1 has no cap-slot binding on the M3 compat shim
+(ENH-023 #41). Every change is purely additive per the 1.0
+"Compatibility rules from 1.0 forward" §Additive-only rule; the
+frozen 1.0 interface (argv surface, 144-byte `PdxFsDirEntry@0.1`
+wire body, exit-code map, `caps.decl`) is unchanged.
 
 M5-001 landed `manifest.pdxproj` (version bumped 0.4→1.0.0),
 `CHANGELOG.md` with the 1.0.0 entry freezing the argv surface +
@@ -58,6 +78,12 @@ semantic-pipe substrate).
 | M4-004 (#14)    | --schema output validates against libpdx-semantic-pipe golden  | LANDED |
 | M5-001 (#15)    | dual-signed release + .pdxdoc                                  | LANDED |
 | M5-002 (#16)    | mirror push + verify `pkg install ls` works end-to-end         | LANDED |
+| ENH-002 (#24)   | wire LongFormat into read loop behind AS_BIT_L                 | WIRED  |
+| ENH-005 (#25)   | wire ColorPicker into read loop behind AS_BIT_COLOR            | WIRED  |
+| ENH-006 (#19)   | --schema prints declared output schemas and exits 0            | WIRED  |
+| ENH-007 (#26)   | --json emits one JSON object per row over the wire record      | WIRED  |
+| ENH-022 (#40)   | symlink target rendering in -l (placeholder pending readlink)  | WIRED  |
+| ENH-023 (#41)   | --color=auto discriminates on stdout KIND (probe today = off)  | WIRED  |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -123,12 +149,21 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   sub-band → I4 exit-code mapping (0 / 2 / 3 / 4). Used by the
   M4-003 fixture and by the eventual R14b `_start` frame.
 - `manifest.pdxproj` — paideia-as build manifest at version
-  `1.0.1` (M5-001 + 1.0.1 honesty patch): source list (15 files),
-  test list (6 fixtures; 1.0.1 adds `long_format_fixtures.pdx` and
-  `human_size_fixtures.pdx` per ENH-003), version-pinned deps, and
-  the `release:` block referring the signed `manifest.pdxsig` to
-  the mirror target (see 1.0.1 ENH-012 retraction), plus the
-  CHANGELOG anchor and the `.pdxdoc`.
+  `1.1.0` (M5-001 + 1.0.1 honesty patch + 1.1.0 wiring wave): source
+  list (17 files; 1.1.0 adds `src/schema_dump.pdx` and
+  `src/json_line.pdx`), test list (6 fixtures; 1.0.1 added
+  `long_format_fixtures.pdx` and `human_size_fixtures.pdx` per
+  ENH-003), version-pinned deps, and the `release:` block referring
+  the signed `manifest.pdxsig` to the 1.1.0 mirror target (see 1.0.1
+  ENH-012 retraction), plus the CHANGELOG anchor and the `.pdxdoc`.
+- `src/schema_dump.pdx` — `SchemaDump` module (v1.1.0 ENH-006):
+  emits the 125-byte schema catalog literal on KIND_TTY for
+  `ls --schema`; short-circuited by `Dispatch::ls_dispatch` before
+  Runner is called.
+- `src/json_line.pdx` — `JsonLine` module (v1.1.0 ENH-007): renders
+  one entry as `{"name":"...","kind":N,"inode":N}\n` for `ls --json`;
+  the KIND_TTY text branch swaps to this renderer per entry while the
+  144-byte `PdxFsDirEntry@0.1` wire record stays unchanged.
 - `CHANGELOG.md` — Keep-a-Changelog-style release log (M5-001).
   The `[1.0.0]` entry freezes the 1.0 contract; `[0.1.0]..[0.4.0]`
   roll up M1..M4 close.

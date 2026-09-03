@@ -9,9 +9,146 @@ and stored under `pkgs.paideia-os/ls/<version>/`.
 
 ## [Unreleased]
 
-Post-1.0.1 items on the Enhancement v1.x wave
+Post-1.1.0 items on the Enhancement v1.x wave
 (`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
 exit-code map, wire body shape, `caps.decl`) changes in this section.
+
+## [1.1.0] -- 2026-09-03 -- wiring wave (ENH-002 + ENH-005 + ENH-006 + ENH-007 + ENH-022 + ENH-023) <a id="110"></a>
+
+**1.1.0 (v1.x wiring wave).** Closes the six 1.1.0-wave items from
+`design/enhancement-plan.md` §5 (ENH-002/005/006/007 for the top-band
+"built + tested + disconnected" primitives, plus ENH-022 + ENH-023
+that had been sitting as pin-only markers behind #24 and #25). Every
+flag whose recognition landed at M1-002 but whose runner-side wiring
+lagged is now live on the read loop; every enhancement issue closed
+in this wave is purely additive per the "Compatibility rules from
+1.0 forward" §Additive-only rule (no frozen 1.0 interface changes:
+the argv surface stays the same, the 144-byte `PdxFsDirEntry@0.1`
+wire body is unchanged on every path including `--json`, the exit-
+code map is unchanged, and `caps.decl` is unchanged). Bundled release
+per the `libpdx-elevate` v1.1.2 pattern -- six related wire-in items
+ship as one minor.
+
+**Watch-out (from the 1.0.1 debugger note).** `paideia-as test` in
+Phase 2 of `tools/build.sh` is a parse+encode smoke, not a runtime
+verify. New fixtures added in this wave (none in-tree yet -- see
+Follow-ups) will vacuous-pass Phase 2; the real correctness gate is
+a shell-level byte-diff smoke against the compiled binary once the
+kernel wire lights up.
+
+### Added
+
+- **ENH-002** (#24) -- `Runner::runner_ls` now dispatches to
+  `LongFormat::long_format_line` when `AS_BIT_L` is set on
+  `_as_flag_bits`. The renderer packs `kind_nibble`, `mode_bits`
+  (placeholder 0 -- ENH-008 tracks the kernel-side per-entry mode
+  addition), and `human_size_flag` (from `AS_BIT_H`) into
+  `kind_mode_flags`, points `extra_ptr` at a pre-zeroed 16-byte
+  `_rn_lf_extra_scratch` (mtime_ns and owner_row both 0 -- same
+  kernel-blocked story), and composes into `_rn_line_buf` (grown
+  from 14 u64 to 32 u64 = 256 bytes to fit the max long-format line
+  including the ENH-022 symlink tail). The default (no `-l`) path
+  is byte-identical to 1.0.1. Bumps `LS_ST_LONG` (slot 6) per
+  rendered line so the tool's stats table records the wiring.
+- **ENH-005** (#25) -- `Runner::runner_ls` now wraps text-branch
+  content with ANSI SGR when `AS_BIT_COLOR` is set on
+  `_as_flag_bits`. `ColorPicker::color_pick` chooses a palette from
+  the entry's `kind_nibble`; `color_sgr_prefix` composes the SGR
+  set-color sequence into `_rn_sgr_prefix_scratch`, then `tty_write`
+  emits prefix + content + suffix as three separate writes.
+  `AS_BIT_JSON` disables color regardless (structured output must
+  not carry ANSI escapes). Palette 0 (no-color-known) short-circuits
+  to the plain emit path so an entry the palette dispatch cannot
+  classify emits verbatim. Bumps `LS_ST_COLOR` (slot 7) per wrapped
+  line.
+- **ENH-006** (#19) -- `Dispatch::ls_dispatch` now short-circuits to
+  `SchemaDump::schema_dump_emit` when `AS_BIT_SCHEMA` is set on
+  `_as_flag_bits`, BEFORE calling `Runner::runner_ls`. The catalog
+  is a 125-byte `.rodata` literal with one line per declared schema:
+  `PdxFsDirEntry@0.1 -- directory entry emitted per accepted row\n`
+  and `PdxLsSummaryRecord@0.1 -- run summary emitted after last
+  entry\n`. `--schema` opens no `DirListRecord` audit frame (no
+  directory read) and emits no semantic-pipe record -- it is a
+  stateless read-of-manifest. Success routes through `ExitMap` to
+  exit 0; a `tty_write` failure surfaces `LS_ERR_TTY_WRITE` and
+  routes to exit 4. Retires the `--schema is inert` line from
+  `design/enhancement-plan.md` §4.5.
+- **ENH-007** (#26) -- `Runner::runner_ls` now emits one JSON object
+  per accepted entry when `AS_BIT_JSON` is set, replacing the
+  KIND_TTY text branch with `JsonLine::json_line_render`. Format:
+  `{"name":"<name>","kind":<nibble_dec>,"inode":<inode_dec>}\n`.
+  The 144-byte `PdxFsDirEntry@0.1` semantic-pipe record is emitted
+  UNCHANGED on every path including `--json`; the JSON emit only
+  swaps the text-format branch on the same fd -- simplest mental
+  model, matches every other Unix tool with a `--json` mode. Name
+  escaping deferred: PdxFS-v1's `sys_pdxfs_open` mint contract
+  rejects `"`, `\\`, and control bytes at kernel-cap-narrow time,
+  so unescaped bytes are safe on the v1.x line; a future PdxFS
+  variant relaxing that constraint gets escape support as a
+  one-branch copy-loop extension in `JsonLine`.
+- **ENH-022** (#40) -- `LongFormat::long_format_line` now appends
+  ` -> <link:target-unknown>` (25 bytes) after the name column when
+  the kind letter at the anchor byte reads `l` (symlink; kind
+  nibble 0xA). The literal placeholder ships until a paideia-os
+  kernel readlink primitive lands -- see the follow-up
+  `paideia-os#TBD: sys_pdxfs_readlink_by_slot for symlink targets`
+  in the Deferred (upstream fix) section. Consumers see a distinct,
+  self-describing value rather than a fabricated target; the ` -> `
+  separator is the POSIX ls precedent so a downstream tool
+  splitting on it recovers the expected shape.
+- **ENH-023** (#41) -- `ArgvSurface::argv_surface_parse` now
+  recognises `--color=auto` as a discriminator value: when the
+  captured `_as_color_value_ptr` matches the literal `"auto\0"`,
+  `AS_BIT_COLOR_AUTO` (0x4000) is set on `_as_flag_bits` alongside
+  `AS_BIT_COLOR` (0x20). `Runner::runner_ls` reads this bit to
+  decide whether to probe stdout's KIND before enabling color:
+  today fd 1 has no cap-slot binding (M3 compat shim; see
+  `tty_write.pdx` §TW_KIND_TTY note), so the probe falls through to
+  "not a TTY" and color is disabled on `--color=auto`. Values other
+  than `"auto"` (e.g. `--color=always`) leave the AUTO bit clear;
+  Runner treats them as the "on" path.
+
+### Changed
+
+- **`src/runner.pdx`** -- `_rn_line_buf` grown from 14 u64 (112 B)
+  to 32 u64 (256 B) so LongFormat's max line (with the ENH-022
+  symlink tail) and JsonLine's max line (fixed 30 + name 104 +
+  digits 22 = 156 B) fit without a per-renderer buffer split. The
+  default path uses well under 105 B; the growth is a strict
+  superset. Adds `_rn_lf_extra_scratch` (16 B) for the LongFormat
+  `extra_ptr` and `_rn_sgr_prefix_scratch` + `_rn_sgr_suffix_scratch`
+  (8 B each) for the ColorPicker SGR emit.
+- **`manifest.pdxproj`** -- version bumped to `1.1.0`; adds
+  `src/schema_dump.pdx` and `src/json_line.pdx` to the `sources:`
+  block; `release:` block re-points to
+  `pkgs.paideia-os/ls/1.1.0/`.
+- **`STATUS.md`** -- Version bumped to 1.1.0; the milestone rollup
+  table now marks ENH-002/005/006/007/022/023 as WIRED (previously
+  DESIGNED behind pin markers) and pins the wiring wave close.
+
+### Deferred (upstream fix)
+
+- `src/long_format.pdx:lf_no_symlink_tail` uses the fixed placeholder
+  `<link:target-unknown>` for the symlink target column until the
+  paideia-os kernel exposes a `sys_pdxfs_readlink_by_slot` primitive
+  the tool can call inline at this point. Filed as
+  `paideia-os#TBD: sys_pdxfs_readlink_by_slot for symlink targets`;
+  the LongFormat body will replace the placeholder with an inline
+  `pdxfs_readlink_by_slot` call + name-copy tail as a one-block
+  edit when the kernel wire lands.
+- `src/runner.pdx:rn_ls_emit_wire` treats every `--color=auto` as
+  the "not a TTY" outcome because fd 1 has no cap-slot binding
+  today (M3 compat shim; see `tty_write.pdx` §TW_KIND_TTY note).
+  When the R49.M1 KIND_TTY write wire lands, a `tty_stdout_kind()`
+  helper in `TtyWrite` replaces the always-off gate with a real
+  KIND compare against `TW_KIND_TTY` (0x197).
+- `LongFormat` continues to render `mode_bits=0`, `size=0`, and
+  `mtime=0` per entry because the 128-byte kernel
+  `sys_pdxfs_dir_readnext` record carries only inode + kind +
+  name_len + name at v1.x. `ENH-008` (#28) tracks the per-entry
+  owner discovery via `sys_pdxfs_stat_by_inode`; the same kernel
+  primitive will supply mode/size/mtime for the `-l` columns on the
+  same round.
 
 ## [1.0.1] -- 2026-09-03 -- honesty patch (ENH-003 + ENH-011 + ENH-012) <a id="101"></a>
 

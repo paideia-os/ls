@@ -149,6 +149,11 @@
 //   sem_emit_entry         -- SemanticEmit (src/semantic_emit.pdx)
 //   audit_ls_begin         -- AuditShim (src/audit_shim.pdx) -- M3-003
 //   audit_ls_commit        -- AuditShim (src/audit_shim.pdx) -- M3-003
+//   long_format_line       -- LongFormat (src/long_format.pdx) -- v1.1.0 ENH-002
+//   json_line_render       -- JsonLine (src/json_line.pdx) -- v1.1.0 ENH-007
+//   color_pick             -- ColorPicker (src/color_picker.pdx) -- v1.1.0 ENH-005
+//   color_sgr_prefix       -- ColorPicker (src/color_picker.pdx) -- v1.1.0 ENH-005
+//   color_sgr_suffix       -- ColorPicker (src/color_picker.pdx) -- v1.1.0 ENH-005
 
 module Runner = structure {
 
@@ -159,6 +164,24 @@ module Runner = structure {
 
   // ArgvSurface AS_BIT_A mask (mirrored -- see design/architecture.md §3.1)
   pub let RN_BIT_A_MASK           : u64 = 0x2
+  // ls.ENH-002 (#24) v1.1.0: -l long-format mask (AS_BIT_L). Runner
+  // routes accepted entries through LongFormat::long_format_line when
+  // set; otherwise the default name+suffix+LF path stays.
+  pub let RN_BIT_L_MASK           : u64 = 0x1
+  // ls.ENH-002 (#24) v1.1.0: -h human size mask (AS_BIT_H). Forwarded
+  // into long_format_line's kind_mode_flags[13] (human_size_flag).
+  pub let RN_BIT_H_MASK           : u64 = 0x4
+  // ls.ENH-007 (#26) v1.1.0: --json mask (AS_BIT_JSON). Runner
+  // replaces the KIND_TTY text branch with JsonLine emission when set.
+  pub let RN_BIT_JSON_MASK        : u64 = 0x8
+  // ls.ENH-005 (#25) v1.1.0: --color mask (AS_BIT_COLOR). Runner
+  // wraps text-branch content with ANSI SGR prefix/suffix when set
+  // AND the color-auto probe (if AS_BIT_COLOR_AUTO also set) resolves
+  // to KIND_TTY. --json disables color regardless.
+  pub let RN_BIT_COLOR_MASK       : u64 = 0x20
+  // ls.ENH-023 (#41) v1.1.0: --color=auto mask (AS_BIT_COLOR_AUTO).
+  // Runner probes stdout KIND when set alongside AS_BIT_COLOR.
+  pub let RN_BIT_COLOR_AUTO_MASK  : u64 = 0x4000
   // ls.ENH-019 (#37): -F type-indicator suffix mask (AS_BIT_F).
   pub let RN_BIT_F_MASK           : u64 = 0x1000
   // ls.ENH-019 (#37): kind-nibble offset inside the 128-byte kernel
@@ -167,6 +190,9 @@ module Runner = structure {
   // name_len@16, name[104]@24). The kind qword's low 4 bits carry the
   // PdxFS-v1 file-type nibble (0x4=dir, 0x8=file, 0xA=symlink, ...).
   pub let RN_ENT_OFF_KIND         : u64 = 8
+  // ls.ENH-007 (#26) v1.1.0: inode field offset (record byte 0). Read
+  // into json_line_render as the "inode" numeric.
+  pub let RN_ENT_OFF_INODE        : u64 = 0
 
   // Kernel PdxFsDirEntry offsets (mirror paideia-os
   // src/kernel/core/cap/pdxfs_dir_iter.pdx §1).
@@ -196,11 +222,31 @@ module Runner = structure {
   // _rn_entry_buf -- 128-byte scratch that sys_pdxfs_dir_readnext
   // writes into (one entry at a time). 16 u64 lanes.
   //
-  // _rn_line_buf -- name + '\n' composition buffer for the tty_write
-  // call. Sized RN_ENT_NAME_MAX + 1 = 105 bytes = 14 u64 lanes rounded
-  // up.
-  pub let mut _rn_entry_buf : [u64; 16] = uninit @align(8)
-  pub let mut _rn_line_buf  : [u64; 14] = uninit @align(8)
+  // _rn_line_buf -- text composition buffer for the tty_write call.
+  // v1.1.0 (ENH-002/#24 + ENH-007/#26): grown from 14 u64 to 32 u64
+  // (256 bytes) so LongFormat's max line (kind + mode + owner + size
+  // + mtime + name + optional " -> <link:target-unknown>" + LF ~
+  // 200 bytes) and JsonLine's max line (30-byte fixed + name 104 +
+  // digits 22 = 156 bytes) fit without a per-renderer buffer split.
+  // The default name+suffix+LF path uses well under 105 bytes; the
+  // growth is a strict superset.
+  //
+  // _rn_lf_extra_scratch -- 16-byte scratch for long_format_line's
+  // extra_ptr (mtime_ns at [0..8), owner_row at [8..16)). Both fields
+  // are placeholder 0 at v1.1.0 -- see ENH-008 (owner) and the plan
+  // doc §7 for the kernel readnext-record growth (mtime, mode_bits,
+  // size). 2 u64 lanes.
+  //
+  // _rn_sgr_prefix_scratch -- 8-byte scratch for a color SGR prefix
+  // emit ("ESC [ N N m" max 6 bytes; 1 u64 lane leaves headroom).
+  //
+  // _rn_sgr_suffix_scratch -- 8-byte scratch for the fixed 4-byte
+  // color SGR suffix ("ESC [ 0 m").
+  pub let mut _rn_entry_buf          : [u64; 16] = uninit @align(8)
+  pub let mut _rn_line_buf           : [u64; 32] = uninit @align(8)
+  pub let mut _rn_lf_extra_scratch   : [u64; 2]  = uninit @align(8)
+  pub let mut _rn_sgr_prefix_scratch : [u64; 1]  = uninit @align(8)
+  pub let mut _rn_sgr_suffix_scratch : [u64; 1]  = uninit @align(8)
 
   // ==========================================================================
   // runner_ls(path_ptr, flag_bits) -> u64
@@ -304,6 +350,28 @@ module Runner = structure {
         cmp rax, 0;
         je  rn_ls_hidden;                        // filtered out
 
+        // ---- v1.1.0: Renderer dispatch ------------------------------
+        //
+        // Priority: AS_BIT_JSON > AS_BIT_L > default. JSON wins over
+        // -l per the "--json is a full wire replacement" rule the user
+        // constraint pinned this session (JSON swaps the text branch;
+        // any text-formatting flags are ignored when JSON is on so a
+        // downstream JSON consumer never sees mixed shapes). Default
+        // path (bare `ls`) falls through unchanged.
+        //
+        // r10 = flag_bits & mask; r11 = mask constant staged.
+        mov r10, r13;
+        mov r11, 0x8;                            // AS_BIT_JSON
+        and r10, r11;
+        cmp r10, 0;
+        jne rn_ls_render_json;
+
+        mov r10, r13;
+        mov r11, 0x1;                            // AS_BIT_L
+        and r10, r11;
+        cmp r10, 0;
+        jne rn_ls_render_long;
+
         // ---- Compose _rn_line_buf: copy name bytes + '\n' -----------
         //
         // Bound the name copy at min(name_len, RN_ENT_NAME_MAX) so a
@@ -394,20 +462,256 @@ module Runner = structure {
         add r11, r14;                            // &dst[len]
         mov rax, 0x0A;                           // '\n'
         mov_b [r11], rax;
+        add r14, 1;                              // r14 = bytes including LF
 
-        // ---- tty_write(&_rn_line_buf, len + 1) ------------------------
-        mov rdi, r15;
-        mov rsi, r14;
-        add rsi, 1;                              // len + 1 (name + '\n')
+        // Fall through to the shared emit (v1.1.0: shared with
+        // rn_ls_render_long + rn_ls_render_json).
+        jmp rn_ls_emit_wire;
+
+        // ==========================================================
+        // v1.1.0 ENH-002 (#24): -l long-format render path.
+        //
+        // Calls LongFormat::long_format_line with the entry's fields
+        // packed into kind_mode_flags:
+        //   [3:0]  = kind_nibble (from _rn_entry_buf[8] low 4 bits)
+        //   [12:4] = mode_bits   = 0 (kernel readnext record has no
+        //                          mode column at v1.x -- ENH-008 and
+        //                          the paideia-os follow-up track the
+        //                          fix)
+        //   [13]   = human_size_flag (from AS_BIT_H)
+        // Size and mtime are similarly 0 placeholders (kernel-blocked
+        // per plan doc §7); extra_ptr points at _rn_lf_extra_scratch
+        // pre-zeroed each iteration so the two 0 fields are stable.
+        //
+        // dst = _rn_line_buf (256 bytes); returns bytes composed in
+        // rax (or LF_ERR_OVERFLOW). name_ptr is in rbp; name is
+        // implicitly NUL-terminated by the readnext record (name_len
+        // bytes followed by zero fill inside the 104-byte name field).
+        // ==========================================================
+      rn_ls_render_long:
+        // Compute kind_mode_flags into a scratch register (r10).
+        //   nibble = _rn_entry_buf[8] & 0xF
+        //   human  = (flag_bits & AS_BIT_H) ? 0x2000 : 0
+        //   kmf    = nibble | human
+        lea r11, [rip + _rn_entry_buf];
+        mov rax, [r11 + 8];                      // RN_ENT_OFF_KIND qword
+        and rax, 0xF;                            // low 4 bits
+        mov r10, rax;                            // r10 = kmf accumulator
+
+        mov rax, r13;                            // flag_bits copy
+        mov r11, 0x4;                            // AS_BIT_H
+        and rax, r11;
+        cmp rax, 0;
+        je  rn_ls_lf_no_h;
+        mov r11, 0x2000;                         // bit 13
+        or  r10, r11;
+
+      rn_ls_lf_no_h:
+        // Zero _rn_lf_extra_scratch (mtime_ns @0, owner_row @8).
+        lea r11, [rip + _rn_lf_extra_scratch];
+        xor rax, rax;
+        mov [r11], rax;
+        mov [r11 + 8], rax;
+
+        // Marshal args:
+        //   rdi = dst_ptr    = _rn_line_buf
+        //   rsi = dst_cap    = 256
+        //   rdx = name_ptr   = rbp
+        //   rcx = kind_mode_flags = r10
+        //   r8  = size_bytes = 0 (placeholder)
+        //   r9  = extra_ptr  = _rn_lf_extra_scratch
+        lea r11, [rip + _rn_line_buf];
+        mov rdi, r11;
+        mov r15, r11;                            // remember dst for emit
+        mov rsi, 256;
+        mov rdx, rbp;
+        mov rcx, r10;
+        xor r8, r8;                              // size placeholder
+        lea r11, [rip + _rn_lf_extra_scratch];
+        mov r9, r11;
+        call long_format_line;
+
+        // Refuse on overflow (long_format returns 0xFFFFFFFFFFFFFFFF).
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  rn_ls_tty_fail;                      // reuse existing fail path
+
+        // Bump LS_ST_LONG counter (slot 6) so the tool's stats record
+        // how many -l lines were rendered.
+        mov r14, rax;                            // save bytes-written
+        mov rdi, 6;                              // RN_STAT_LONG
+        call ls_note;
+
+        jmp rn_ls_emit_wire;
+
+        // ==========================================================
+        // v1.1.0 ENH-007 (#26): --json render path.
+        //
+        // Calls JsonLine::json_line_render with the six fields packed
+        // by the 6-register cap:
+        //   rdi = dst_ptr    = _rn_line_buf
+        //   rsi = dst_cap    = 256
+        //   rdx = name_ptr   = rbp
+        //   rcx = name_len   = r14
+        //   r8  = kind_nibble (from _rn_entry_buf[8] low 4 bits)
+        //   r9  = inode      = _rn_entry_buf[0]
+        // ==========================================================
+      rn_ls_render_json:
+        lea r11, [rip + _rn_line_buf];
+        mov rdi, r11;
+        mov r15, r11;
+        mov rsi, 256;
+        mov rdx, rbp;
+        mov rcx, r14;                            // name_len
+
+        lea r11, [rip + _rn_entry_buf];
+        mov rax, [r11 + 8];                      // kind qword
+        and rax, 0xF;
+        mov r8, rax;
+        lea r11, [rip + _rn_entry_buf];
+        mov rax, [r11];                          // inode qword
+        mov r9, rax;
+
+        call json_line_render;
+
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  rn_ls_tty_fail;
+
+        mov r14, rax;                            // bytes composed
+        // Fall through to shared emit -- JSON path deliberately
+        // SKIPS color wrap regardless of AS_BIT_COLOR (structured
+        // output must not carry ANSI escapes).
+        jmp rn_ls_emit_wire_no_color;
+
+        // ==========================================================
+        // v1.1.0 ENH-005 (#25) + ENH-023 (#41): shared emit path.
+        //
+        // On entry:
+        //   r15 = buf_ptr  (bytes to write)
+        //   r14 = bytes    (total bytes in buf)
+        //
+        // Color decision:
+        //   * If AS_BIT_JSON set -> jump was already routed to
+        //     rn_ls_emit_wire_no_color (structured branch).
+        //   * If AS_BIT_COLOR unset -> no color.
+        //   * If AS_BIT_COLOR set and AS_BIT_COLOR_AUTO unset -> color.
+        //   * If AS_BIT_COLOR set and AS_BIT_COLOR_AUTO set -> probe
+        //     stdout KIND; today fd 1 has no cap-slot binding (M3
+        //     compat shim; see tty_write.pdx §TW_KIND_TTY note), so
+        //     the probe reduces to "not a TTY" -> no color.
+        //
+        // When color is on:
+        //   1. color_pick(kind_nibble, mode=0, schema=0) -> palette
+        //   2. color_sgr_prefix into _rn_sgr_prefix_scratch (<= 6 B)
+        //   3. tty_write prefix
+        //   4. tty_write content
+        //   5. color_sgr_suffix into _rn_sgr_suffix_scratch (4 B)
+        //   6. tty_write suffix
+        // Each tty_write's negative-errno collapses via the shared
+        // rn_ls_tty_fail label.
+        //
+        // sem_emit_entry (semantic-pipe emission) is UNCHANGED across
+        // every render path -- the wire record is always the 144-byte
+        // PdxFsDirEntry@0.1 (SemanticEmit's contract).
+        // ==========================================================
+      rn_ls_emit_wire:
+        // Gate: AS_BIT_COLOR set?
+        mov r10, r13;
+        mov r11, 0x20;                           // AS_BIT_COLOR
+        and r10, r11;
+        cmp r10, 0;
+        je  rn_ls_emit_wire_no_color;
+
+        // AS_BIT_COLOR_AUTO set? If so, probe -> today: no color.
+        mov r10, r13;
+        mov r11, 0x4000;                         // AS_BIT_COLOR_AUTO
+        and r10, r11;
+        cmp r10, 0;
+        jne rn_ls_emit_wire_no_color;            // auto -> off today
+
+        // ---- Color ON path: pick palette + wrap ---------------
+        //
+        // rdi = kind_nibble (from _rn_entry_buf[8] low 4)
+        // rsi = mode_bits    = 0 placeholder
+        // rdx = schema_id    = 0 (schema-registry lookup awaits ENH-010
+        //                         at libpdx-schema-registry.M1)
+        lea r11, [rip + _rn_entry_buf];
+        mov rax, [r11 + 8];
+        and rax, 0xF;
+        mov rdi, rax;
+        xor rsi, rsi;
+        xor rdx, rdx;
+        call color_pick;
+
+        // rax = palette_id. If palette == 0 (CP_PAL_NONE), skip color
+        // wrap and emit content directly. r10 holds palette across
+        // the prefix/content/suffix trio.
+        mov r10, rax;
+        cmp r10, 0;
+        je  rn_ls_emit_wire_no_color;
+
+        // Compose SGR prefix into _rn_sgr_prefix_scratch (max 6 B).
+        lea r11, [rip + _rn_sgr_prefix_scratch];
+        mov rdi, r11;
+        mov rsi, 8;                              // scratch cap
+        mov rdx, r10;                            // palette_id
+        call color_sgr_prefix;
+
+        // rax = prefix bytes; overflow (0xFFFFFFFFFFFFFFFF) -> tty_fail.
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  rn_ls_tty_fail;
+
+        // tty_write(&_rn_sgr_prefix_scratch, rax).
+        lea r11, [rip + _rn_sgr_prefix_scratch];
+        mov rdi, r11;
+        mov rsi, rax;
         call tty_write;
-
-        // sys_write returns bytes_written on success; negative-errno on
-        // failure. Detect failure with cmp rax, 0; jl (signed) -- if
-        // rax has bit 63 set, it is a negative-errno.
         cmp rax, 0;
         jl  rn_ls_tty_fail;
 
-        // ---- sem_emit_entry(&_rn_entry_buf) --------------------------
+        // tty_write(buf, bytes).
+        mov rdi, r15;
+        mov rsi, r14;
+        call tty_write;
+        cmp rax, 0;
+        jl  rn_ls_tty_fail;
+
+        // Compose SGR suffix into _rn_sgr_suffix_scratch (4 B).
+        lea r11, [rip + _rn_sgr_suffix_scratch];
+        mov rdi, r11;
+        mov rsi, 8;                              // scratch cap
+        call color_sgr_suffix;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  rn_ls_tty_fail;
+
+        // tty_write(&_rn_sgr_suffix_scratch, rax).
+        lea r11, [rip + _rn_sgr_suffix_scratch];
+        mov rdi, r11;
+        mov rsi, rax;
+        call tty_write;
+        cmp rax, 0;
+        jl  rn_ls_tty_fail;
+
+        // Bump LS_ST_COLOR (slot 7) so the tool's stats record how
+        // many entries were emitted with ANSI SGR.
+        mov rdi, 7;                              // RN_STAT_COLOR
+        call ls_note;
+
+        jmp rn_ls_after_wire;
+
+      rn_ls_emit_wire_no_color:
+        // ---- Plain content emit (no color wrap) ----
+        mov rdi, r15;
+        mov rsi, r14;
+        call tty_write;
+        cmp rax, 0;
+        jl  rn_ls_tty_fail;
+
+      rn_ls_after_wire:
+        // ---- sem_emit_entry(&_rn_entry_buf) -- unchanged ------------
         lea r11, [rip + _rn_entry_buf];
         mov rdi, r11;
         call sem_emit_entry;

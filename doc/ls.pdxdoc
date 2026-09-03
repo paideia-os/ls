@@ -26,33 +26,38 @@ return exit 2.
 !section flags
 
   -l              Long format: kind mode owner size mtime name.
-                  [parsed; not yet wired into the read loop -- see
-                  note below]
+                  [live at 1.1.0 -- see note below on the mode/size/
+                  mtime placeholder columns until the kernel readnext
+                  record grows the missing fields]
   -a              Include dot-prefix (hidden) entries. [live]
   -h              Render sizes as base-2 K/M/G/T/P/E.
-                  [parsed; consumed only by the unwired -l renderer]
+                  [live at 1.1.0 via -l's size column]
   --json          Emit each row as one JSON object on stdout.
-                  [parsed; no consumer in this repo yet]
+                  [live at 1.1.0; the 144-byte PdxFsDirEntry@0.1 wire
+                  record is emitted UNCHANGED on this path -- --json
+                  only swaps the KIND_TTY text branch]
   --schema        Print ls's declared output schemas + exit 0.
-                  [parsed; no consumer in this repo yet]
+                  [live at 1.1.0; no directory read, no audit frame]
   --color=<v>     `<v>` in {auto, always, never}. Colors are
                   driven by the entry's declared schema/MIME, NOT
                   by POSIX file-type bits. See POSIX-diff below.
-                  [parsed; renderer shipped, not yet wired]
+                  [live at 1.1.0; --color=auto falls through to
+                  color-off today because fd 1 has no cap-slot
+                  binding on the M3 compat shim -- the probe lands
+                  when the R49.M1 KIND_TTY write wire ships]
 
-At 1.0 the read loop honours only `-a` directly. `-l`, `-h`, and
-`--color=` are recognised by the argv parser and their renderers
-(`LongFormat`, `HumanSize`, `ColorPicker`) are shipped and tested,
-but `Runner::runner_ls` does not call them yet, so passing these
-flags today produces output byte-identical to bare `ls`. `--json`
-and `--schema` set their flag bits with no consumer at all. This is
-deliberate: the argv surface, the exit-code map, and the 144-byte
-wire body are frozen at 1.0, so wiring a renderer into the read loop
-is an additive change on the 1.x line, not a re-sign. The `-l`/`-h`
-examples below show the shipped renderer's actual byte output for
-when it is wired in; the `--schema` example is a proposed output
-shape with no implementation behind it yet (tracked as `ls.ENH-006`).
-None of these examples are reproducible by running `ls` at 1.0.0.
+At 1.1.0 the read loop honours `-a`, `-l`, `-h`, `--json`, and
+`--color=` directly (per the wiring-wave items ENH-002/005/007 in
+`design/enhancement-plan.md`), and `--schema` short-circuits before
+the read loop (ENH-006). Every rendered `-l` line uses placeholder
+`0` for `mode_bits`, `size`, and `mtime` because the 128-byte
+kernel `sys_pdxfs_dir_readnext` record carries only inode + kind +
+name_len + name; the placeholder columns concretise when the
+paideia-os kernel exposes `sys_pdxfs_stat_by_inode` per the
+follow-up filed for `ENH-008`. Symlink `-l` lines carry a fixed
+` -> <link:target-unknown>` tail (ENH-022) until a kernel readlink
+primitive ships. The `--schema` catalog is verbatim from
+`src/schema_dump.pdx`'s `_sd_catalog_bytes` literal.
 
 The nine standard flags (`--help`, `--version`, `--schema`,
 `--json`, `--color=`, `--dry-run`, `--verbose`, `--quiet`,

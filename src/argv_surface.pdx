@@ -146,6 +146,23 @@ module ArgvSurface = structure {
   // a partition step keyed on kind_nibble == 0x4. Argv surface here;
   // observable behaviour lands with ENH-016's Runner buffering.
   pub let AS_BIT_GDF    : u64 = 0x2000
+  // ls.ENH-023 (#41) v1.1.0: --color=auto value discriminator.
+  // Set alongside AS_BIT_COLOR whenever the parsed --color= value
+  // matches the exact literal "auto" (5 bytes, NUL-terminated).
+  // Runner reads this bit to decide the palette gate:
+  //   AS_BIT_COLOR unset               -> no color
+  //   AS_BIT_COLOR set, AUTO unset     -> color always on
+  //   AS_BIT_COLOR set, AUTO set       -> probe stdout KIND; on iff
+  //                                        stdout resolves to KIND_TTY
+  //                                        (TW_KIND_TTY 0x197). Today
+  //                                        fd 1 has no cap-slot binding
+  //                                        (M3 compat shim), so the
+  //                                        probe falls through to OFF.
+  // A value that is not "auto" (e.g. --color=always, --color=never)
+  // leaves this bit clear, so Runner treats it as the "on" path today;
+  // when the v1.x wave lands proper "never" recognition, a mirror
+  // AS_BIT_COLOR_NEVER slot takes bit 0x8000.
+  pub let AS_BIT_COLOR_AUTO : u64 = 0x4000
 
   // ==========================================================================
   // Parse-result .bss slots -- populated by argv_surface_parse, read
@@ -460,6 +477,31 @@ module ArgvSurface = structure {
         mov rax, [r11 + r12 * 8];
         lea r11, [rip + _as_color_value_ptr];
         mov [r11], rax;
+
+        // ls.ENH-023 (#41) v1.1.0: if the captured value points at
+        // the literal "auto\0" (5 bytes), set AS_BIT_COLOR_AUTO on
+        // _as_flag_bits so Runner can gate coloring on the stdout
+        // KIND probe. A null value (--color with no argument) OR any
+        // other value (always/never/etc.) leaves the AUTO bit clear.
+        // Byte discipline: xor rax, rax; mov_b (paideia-as #1248).
+        // Uses r10 = value_ptr (transient scratch, restored after);
+        // rax = per-byte load. Any mismatch falls through to
+        // as_pa_walk_advance without touching AS_BIT_COLOR_AUTO.
+        mov r10, rax;                        // r10 = value_ptr
+        cmp r10, 0;
+        je  as_pa_color_no_auto;             // null value -> no AUTO
+        xor rax, rax; mov_b rax, [r10];     cmp rax, 0x61; jne as_pa_color_no_auto;  // 'a'
+        xor rax, rax; mov_b rax, [r10 + 1]; cmp rax, 0x75; jne as_pa_color_no_auto;  // 'u'
+        xor rax, rax; mov_b rax, [r10 + 2]; cmp rax, 0x74; jne as_pa_color_no_auto;  // 't'
+        xor rax, rax; mov_b rax, [r10 + 3]; cmp rax, 0x6F; jne as_pa_color_no_auto;  // 'o'
+        xor rax, rax; mov_b rax, [r10 + 4]; cmp rax, 0;    jne as_pa_color_no_auto;  // NUL
+        // Value == "auto\0" -> set AS_BIT_COLOR_AUTO.
+        lea r11, [rip + _as_flag_bits];
+        mov rax, [r11];
+        or  rax, 0x4000;                     // AS_BIT_COLOR_AUTO
+        mov [r11], rax;
+
+      as_pa_color_no_auto:
         jmp as_pa_walk_advance;
 
         // "pdx-schema\0" bytes: p=0x70 d=0x64 x=0x78 -=0x2D s=0x73

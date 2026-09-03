@@ -69,8 +69,10 @@
 //   _lff_expected_lens     [u64; 3]  -- byte count long_format_line
 //                                       must return per case
 //   _lff_offsets           [u64; 3]  -- byte offset into _lff_golden_all
-//   _lff_golden_all        [u8; 140] -- all three expected lines packed
-//                                       contiguously: 56 + 42 + 42 = 140
+//   _lff_golden_all        [u8; 165] -- all three expected lines packed
+//                                       contiguously: 56 + 42 + 67 = 165
+//                                       (v1.1.0 ENH-022 grew case 2 by
+//                                        25 bytes for the symlink tail)
 //
 // The single packed goldens array + per-case offset+len table lets
 // one comparator loop cover every case without a per-case symbol
@@ -185,11 +187,17 @@ module LongFormatFixtures = structure {
 
   // ==========================================================================
   // Expected byte counts long_format_line must return per case.
+  //
+  // v1.1.0 ENH-022 (#40): case 2 grows from 42 -> 67 bytes to include
+  // the fixed symlink-target placeholder tail ` -> <link:target-
+  // unknown>` (25 bytes) LongFormat appends when the kind letter is
+  // 'l'. Cases 0 and 1 are unchanged (kind letters '-' and 'd' skip
+  // the symlink tail).
   // ==========================================================================
   pub let _lff_expected_lens : [u64; 3] = [
       56,         // case 0
       42,         // case 1
-      42          // case 2
+      67          // case 2  (was 42 pre-v1.1.0)
   ]
 
   // ==========================================================================
@@ -197,21 +205,22 @@ module LongFormatFixtures = structure {
   //
   //   case 0 -> [0..56)     56 bytes
   //   case 1 -> [56..98)    42 bytes
-  //   case 2 -> [98..140)   42 bytes
+  //   case 2 -> [98..165)   67 bytes  (v1.1.0 ENH-022 growth)
   // ==========================================================================
   pub let _lff_offsets : [u64; 3] = [ 0, 56, 98 ]
 
   // ==========================================================================
-  // Packed goldens (140 bytes total). Each case pins the byte-for-
-  // byte output of long_format_line for the paired input row.
+  // Packed goldens (165 bytes total; grew from 140 in v1.1.0 ENH-022
+  // for the case-2 symlink tail). Each case pins the byte-for-byte
+  // output of long_format_line for the paired input row.
   //
   // Case 0 (56 bytes): "- 644 u:0 12103 ns:1755808140000000000 argv_surface.pdx\n"
   // Case 1 (42 bytes): "d 755 u:0 4096 ns:1755850440000000000 src\n"
-  // Case 2 (42 bytes): "l 777 u:42 21 ns:1755808141000000000 link\n"
+  // Case 2 (67 bytes): "l 777 u:42 21 ns:1755808141000000000 link -> <link:target-unknown>\n"
   //
   // Human-readable copies live under tests/goldens/.
   // ==========================================================================
-  pub let _lff_golden_all : [u8; 140] = [
+  pub let _lff_golden_all : [u8; 165] = [
       // ---- case 0: "- 644 u:0 12103 ns:1755808140000000000 argv_surface.pdx\n" (56 bytes)
       0x2D, 0x20, 0x36, 0x34, 0x34, 0x20, 0x75, 0x3A,   // "- 644 u:"
       0x30, 0x20, 0x31, 0x32, 0x31, 0x30, 0x33, 0x20,   // "0 12103 "
@@ -229,13 +238,16 @@ module LongFormatFixtures = structure {
       0x30, 0x30, 0x30, 0x30, 0x30, 0x20, 0x73, 0x72,   // "00000 sr"
       0x63, 0x0A,                                       // "c\n"
 
-      // ---- case 2: "l 777 u:42 21 ns:1755808141000000000 link\n" (42 bytes)
+      // ---- case 2: "l 777 u:42 21 ns:1755808141000000000 link -> <link:target-unknown>\n" (67 bytes, v1.1.0 ENH-022)
       0x6C, 0x20, 0x37, 0x37, 0x37, 0x20, 0x75, 0x3A,   // "l 777 u:"
       0x34, 0x32, 0x20, 0x32, 0x31, 0x20, 0x6E, 0x73,   // "42 21 ns"
       0x3A, 0x31, 0x37, 0x35, 0x35, 0x38, 0x30, 0x38,   // ":1755808"
       0x31, 0x34, 0x31, 0x30, 0x30, 0x30, 0x30, 0x30,   // "14100000"
       0x30, 0x30, 0x30, 0x30, 0x20, 0x6C, 0x69, 0x6E,   // "0000 lin"
-      0x6B, 0x0A                                        // "k\n"
+      0x6B, 0x20, 0x2D, 0x3E, 0x20, 0x3C, 0x6C, 0x69,   // "k -> <li"
+      0x6E, 0x6B, 0x3A, 0x74, 0x61, 0x72, 0x67, 0x65,   // "nk:targe"
+      0x74, 0x2D, 0x75, 0x6E, 0x6B, 0x6E, 0x6F, 0x77,   // "t-unknow"
+      0x6E, 0x3E, 0x0A                                  // "n>\n"
   ]
 
   // ==========================================================================

@@ -1,0 +1,361 @@
+// src/json_line.pdx -- ls.ENH-007 (paideia-os/ls#26) v1.1.0
+//
+// JsonLine module: render one directory entry as a JSON object on a
+// single line, terminated by LF. Selected by Runner when the invoker
+// passes --json (AS_BIT_JSON on _as_flag_bits). Runner still emits the
+// PdxFsDirEntry@0.1 semantic-pipe record verbatim; --json only swaps
+// the text branch on KIND_TTY(write) from "name + optional -F suffix +
+// LF" to "one JSON object + LF" -- the wire record shape is unchanged.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// One entry point:
+//
+//   json_line_render(dst_ptr, dst_cap, name_ptr, name_len,
+//                    kind_nibble, inode)
+//     -> bytes_written | JL_ERR_OVERFLOW
+//
+// Line format (canonical bytes; the M4 fixture-golden lane will pin
+// each byte):
+//
+//   {"name":"<name>","kind":<nibble_dec>,"inode":<inode_dec>}\n
+//
+// where:
+//   - <name> is the raw name_ptr bytes, name_len bytes. NO ESCAPING at
+//     v1.1.0 -- directory entry names on PdxFS-v1 are constrained to
+//     the byte set the kernel accepts on sys_pdxfs_open (per paideia-os
+//     src/kernel/core/cap/kind_pdxfs_file.pdx §mint contract), which
+//     excludes '"', '\\', and control bytes. If a future kernel PdxFS
+//     variant relaxes that constraint, escape support lands here as a
+//     one-branch extension in the copy loop.
+//   - <nibble_dec> is the kind nibble at record offset 8 (low 4 bits),
+//     rendered as a small decimal (0..15).
+//   - <inode_dec> is the inode qword at record offset 0, rendered as
+//     decimal via Render::render_dec_u64.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`JsonLine`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediate
+//     is 104 (RN_ENT_NAME_MAX bound); ASCII bytes fit trivially.
+//     JL_ERR_OVERFLOW sentinel (0xFFFFFFFFFFFFFFFF) stages into r11.
+//   - Byte reads (name copy loop) use `xor rax; mov_b rax, [ptr]`.
+//   - Byte writes go through Render::render_byte_write.
+//   - r11 is scratch for LEA + sentinel staging.
+//   - Non-leaf (calls render_byte_write + render_dec_u64 many times).
+//     6 callee-save pushes (rbx = anchor, r12 = cursor, r13 = cap
+//     remaining, r14 = name_ptr survives copy loop, r15 = name_len
+//     bound, rbp = kind_nibble + inode composite spill) = 48 bytes;
+//     entry rsp % 16 == 8; 8 + 48 = 56; 56 % 16 == 8 (NOT aligned).
+//     One extra `sub rsp, 8` pad -> 64; aligned. Matched restore.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   render_byte_write        -- Render (src/render.pdx)
+//   render_dec_u64           -- Render (src/render.pdx)
+
+module JsonLine = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let JL_OK              : u64 = 0
+  pub let JL_ERR_OVERFLOW    : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // Bound on the name-copy loop (mirrors Runner::RN_ENT_NAME_MAX). Any
+  // caller passing name_len > this is a broken upstream; JsonLine
+  // clamps rather than overflow the dst buffer.
+  pub let JL_NAME_MAX        : u64 = 104
+
+  // ==========================================================================
+  // json_line_render(dst_ptr, dst_cap, name_ptr, name_len,
+  //                  kind_nibble, inode) -> bytes | JL_ERR_OVERFLOW
+  //
+  // Signature: (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI = dst_ptr  (caller-owned buffer)
+  //   RSI = dst_cap  (max bytes buffer can accept)
+  //   RDX = name_ptr (NUL-terminated name; length authoritative from
+  //                   name_len, NOT strlen -- kernel record carries
+  //                   the length explicitly)
+  //   RCX = name_len (bytes to copy from name_ptr; clamped at
+  //                   JL_NAME_MAX defensively)
+  //   R8  = kind_nibble (0..15, low 4 bits of the record's kind qword
+  //                      at offset 8)
+  //   R9  = inode (record qword at offset 0)
+  //   RAX = bytes written on success | JL_ERR_OVERFLOW on refusal
+  //
+  // Emit sequence (13 steps; each rejects on overflow via the r11
+  // 0xFFFFFFFFFFFFFFFF sentinel compare):
+  //
+  //   step  literal / value             bytes
+  //   -----------------------------------------
+  //    1    {                          1
+  //    2    "name":"                   8
+  //    3    <name bytes>               name_len (<= 104)
+  //    4    ","kind":                  9
+  //    5    <kind_nibble decimal>      1..2
+  //    6    ,"inode":                  9
+  //    7    <inode decimal>            1..20
+  //    8    }                          1
+  //    9    \n                         1
+  //
+  // Fixed overhead = 30 bytes; name (<= 104) + digits (<= 22) = 156
+  // upper bound. Caller sizes dst_cap accordingly (Runner picks 256).
+  //
+  // Register plan (non-leaf, 6 pushes + pad):
+  //   rbx = anchor       (original dst_ptr; final total = cursor - anchor)
+  //   r12 = cursor       (advances per emit; passed as rdi to the child)
+  //   r13 = cap remaining
+  //   r14 = name_ptr copy (survives across the copy loop)
+  //   r15 = name_len clamp bound (index limit)
+  //   rbp = spill for kind_nibble + inode: kind_nibble low 4 bits,
+  //         inode bits [63:4] -- both packed since inode < 2^60 in
+  //         practice on PdxFS-v1 (kernel row_id is u32 today) and
+  //         paideia-as's 6-arg limit means we cannot keep r8/r9 alive
+  //         through the copy loop without a spill.
+  // ==========================================================================
+  pub let json_line_render
+    : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst_ptr: u64) (dst_cap: u64) (name_ptr: u64)
+       (name_len: u64) (kind_nibble: u64) (inode: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-007 (#26) v1.1.0: emit one directory entry as a JSON line for --json on KIND_TTY(write). Format: {\"name\":\"<name>\",\"kind\":<nibble>,\"inode\":<inode>}\\n. Runner still emits the 144-byte PdxFsDirEntry@0.1 semantic-pipe record unchanged; --json swaps only the text-fd branch. Six-register cap (P0276) reached exactly: dst_ptr, dst_cap, name_ptr, name_len, kind_nibble, inode. Fixed overhead 30 bytes + name (<= JL_NAME_MAX=104) + digits (<= 22) = 156 byte upper bound; caller sizes dst_cap for the worst case (Runner picks 256). Name copy loop uses the #1248 mitigation (xor rax, rax; mov_b rax, [src]; call render_byte_write). Name escaping deferred: PdxFS-v1's sys_pdxfs_open mint contract rejects '\"'/'\\\\' and control bytes at kernel-cap-narrow time, so unescaped bytes are safe on the v1.x line; a future PdxFS variant relaxing that constraint gets escape support as a one-branch copy-loop extension. Kind emitted as small decimal (0..15, one or two bytes via render_dec_u64). Inode emitted as decimal via render_dec_u64. Every nested call's overflow return (0xFFFFFFFFFFFFFFFF) stages into r11 for the compare and short-circuits to jl_overflow. Because paideia-as's 6-reg cap leaves no room for kind_nibble + inode to survive the name copy loop through r8/r9 (both caller-save; render_byte_write clobbers), we spill them: rbp packs them qword-wise (nibble at [0:4], inode at [4:64]) since inode < 2^60 on PdxFS-v1 (kernel row_id is u32 today). Six callee-save pushes + sub rsp,8 pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at every nested-call site. paideia-as conformance: r11 scratch for LEA + sentinel; no test mnemonic; largest cmp imm 104 (JL_NAME_MAX). Labels prefixed jl_.",
+      block: {
+        // ---- prologue: 6 pushes + 8-byte pad -----------------------
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // anchor
+        mov r12, rdi;                        // cursor
+        mov r13, rsi;                        // cap remaining
+        mov r14, rdx;                        // name_ptr
+
+        // Clamp name_len at JL_NAME_MAX.
+        mov r15, rcx;
+        mov r11, 104;                        // JL_NAME_MAX
+        cmp r15, r11;
+        jbe jl_len_ok;
+        mov r15, r11;                        // clamp
+
+      jl_len_ok:
+        // Spill kind_nibble + inode into rbp. Pack: [0:4] = nibble;
+        // [4:64] = inode. Nibble mask 0xF applied to r8; inode shifted
+        // left 4 into rbp.
+        mov rax, r8;
+        and rax, 0xF;                        // nibble in low 4
+        mov rbp, r9;
+        shl rbp, 4;                          // inode << 4
+        or  rbp, rax;                        // packed spill
+
+        // ---- step 1: '{' -----------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x7B;                       // '{'
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  jl_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // ---- step 2: "name":" ------------------------------------
+        // Bytes: 0x22 0x6E 0x61 0x6D 0x65 0x22 0x3A 0x22
+        //         "    n    a    m    e    "    :    "
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x22; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6E; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x61; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6D; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x65; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x22; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x3A; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x22; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+
+        // ---- step 3: copy name bytes (0..r15) --------------------
+        xor r10, r10;                        // idx = 0
+
+      jl_name_head:
+        cmp r10, r15;
+        jae jl_name_done;
+
+        // rax = byte at name_ptr[r10]
+        mov r11, r14;
+        add r11, r10;
+        xor rax, rax;                        // #1248 mitigation
+        mov_b rax, [r11];
+
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, rax;
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  jl_overflow;
+        add r12, 1;
+        sub r13, 1;
+        add r10, 1;
+        jmp jl_name_head;
+
+      jl_name_done:
+        // ---- step 4: ","kind": ------------------------------------
+        // Bytes: 0x22 0x2C 0x22 0x6B 0x69 0x6E 0x64 0x22 0x3A
+        //         "    ,    "    k    i    n    d    "    :
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x22; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x2C; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x22; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6B; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x69; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6E; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x64; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x22; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x3A; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+
+        // ---- step 5: decimal(kind_nibble) ------------------------
+        mov rax, rbp;
+        and rax, 0xF;                        // unpack nibble
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, rax;
+        call render_dec_u64;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  jl_overflow;
+        add r12, rax;
+        sub r13, rax;
+
+        // ---- step 6: ,"inode": -----------------------------------
+        // Bytes: 0x2C 0x22 0x69 0x6E 0x6F 0x64 0x65 0x22 0x3A
+        //         ,    "    i    n    o    d    e    "    :
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x2C; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x22; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x69; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6E; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6F; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x64; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x65; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x22; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x3A; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+
+        // ---- step 7: decimal(inode) ------------------------------
+        mov rax, rbp;
+        shr rax, 4;                          // unpack inode
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, rax;
+        call render_dec_u64;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  jl_overflow;
+        add r12, rax;
+        sub r13, rax;
+
+        // ---- step 8: '}' -----------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x7D;                       // '}'
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  jl_overflow;
+        add r12, 1;
+        sub r13, 1;
+
+        // ---- step 9: '\n' ----------------------------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x0A;                       // '\n'
+        call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  jl_overflow;
+        add r12, 1;
+
+        // ---- success -----------------------------------------------
+        mov rax, r12;
+        sub rax, rbx;
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      jl_overflow:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

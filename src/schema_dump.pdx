@@ -1,0 +1,148 @@
+// src/schema_dump.pdx -- ls.ENH-006 (paideia-os/ls#19) v1.1.0
+//
+// SchemaDump module: emit the ls tool's declared output-schema catalog
+// on KIND_TTY(write) when the invoker passes --schema (AS_BIT_SCHEMA).
+// This is the discovery surface a caller uses to learn what typed
+// records the tool produces on its semantic-pipe stdout endpoint
+// without invoking a full listing pass -- the "semantically-queryable
+// terminal" thesis the plan doc §D2 pins.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// One entry point:
+//
+//   schema_dump_emit() -> u64
+//
+//     Writes the schema catalog verbatim to KIND_TTY(write) (fd 1 via
+//     the M3 compat shim) via TtyWrite::tty_write. Returns SD_OK (0)
+//     on success; SD_ERR_TTY (0xFFFFEB23 -- LS_ERR_TTY_WRITE mirror,
+//     so ExitMap folds it to exit 4) on any refusal from the write
+//     path. Called by Dispatch::ls_dispatch BEFORE Runner::runner_ls
+//     when AS_BIT_SCHEMA is set on _as_flag_bits; the schema-print
+//     short-circuit does NOT open a DirListRecord audit frame (no
+//     directory read is performed) and does NOT emit any semantic-
+//     pipe record -- it is a stateless read-of-manifest by the tool.
+//
+// =============================================================================
+// CATALOG SHAPE
+// =============================================================================
+//
+// One line per declared schema, each formatted:
+//
+//   <name>@<version> -- <purpose>\n
+//
+// The v1.1.0 catalog carries the two schemas ls declares on its
+// semantic-pipe stdout (see caps.decl declares_output_schemas + the
+// literal name strings in src/semantic_emit.pdx):
+//
+//   PdxFsDirEntry@0.1 -- directory entry emitted per accepted row\n
+//   PdxLsSummaryRecord@0.1 -- run summary emitted after last entry\n
+//
+// The name strings are the byte-exact values libpdx-semantic-pipe's
+// spipe_schema_id_from_name computes hashes over -- so a consumer that
+// captures this output can BLAKE3-hash them and index a schema
+// registry directly (once the registry ships at libpdx-schema-
+// registry.M1 per ENH-010's plan-doc entry).
+//
+// Bytes are packed into a single .rodata u8 array so the emit is a
+// single tty_write call -- one syscall, one audit-noise event, no
+// interleaving with concurrent stdout writers.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`SchemaDump`), no dir prefix.
+//   - No `test` mnemonic; the one compare (rax vs 0) uses cmp.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only imm here is
+//     the catalog byte count, which fits trivially).
+//   - No byte reads (the string is passed by pointer + length; the
+//     tty_write trampoline handles the kernel-side byte read).
+//   - r11 is scratch (paideia-as reserved) for LEA to the .rodata
+//     literal.
+//   - Non-leaf (calls tty_write). One callee-save push (r12, unused
+//     but pushed for SysV alignment + parity) -> entry rsp % 16 == 8;
+//     +8 = 16; aligned at the nested call site.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   tty_write             -- TtyWrite (src/tty_write.pdx)
+//
+// Read (via lea):
+//   _sd_catalog_bytes     -- local .rodata: packed schema-catalog text
+
+module SchemaDump = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let SD_OK          : u64 = 0
+  pub let SD_ERR_TTY     : u64 = 0xFFFFEB23    // LS_ERR_TTY_WRITE mirror
+
+  // ==========================================================================
+  // Catalog bytes (.rodata).
+  //
+  // Two lines, LF-terminated. Character count pinned in
+  // _sd_catalog_len so a future addition of a third schema is a
+  // one-line change (append bytes, bump the len).
+  //
+  //   "PdxFsDirEntry@0.1 -- directory entry emitted per accepted row\n"
+  //     = 62 bytes
+  //   "PdxLsSummaryRecord@0.1 -- run summary emitted after last entry\n"
+  //     = 63 bytes
+  //   TOTAL = 125 bytes
+  // ==========================================================================
+  pub let _sd_catalog_bytes : [u8; 125] =
+      "PdxFsDirEntry@0.1 -- directory entry emitted per accepted row\nPdxLsSummaryRecord@0.1 -- run summary emitted after last entry\n"
+
+  pub let _sd_catalog_len : u64 = 125
+
+  // ==========================================================================
+  // schema_dump_emit() -> u64
+  //
+  // Signature: () -> u64 !{mem, sysreg} @{}
+  //   RAX (output): SD_OK (0) on success; SD_ERR_TTY on refusal.
+  //
+  // Body: single tty_write of the packed catalog bytes. sys_write's
+  // negative-errno u64 (bit 63 set) collapses to SD_ERR_TTY so the
+  // ExitMap fold routes to exit 4 (cap-denied / substrate).
+  //
+  // Register plan (non-leaf; one push for alignment):
+  //   r12 = alignment pad (SysV callee-save; unused body-side)
+  //   rdi = buf_ptr (LEA _sd_catalog_bytes)
+  //   rsi = len (125)
+  //   rax = return
+  // ==========================================================================
+  pub let schema_dump_emit : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "ls.ENH-006 (#19) v1.1.0: emit the ls schema catalog on KIND_TTY(write) so `ls --schema` discovers the two typed records ls produces on its semantic-pipe stdout without invoking a listing pass. Two lines packed as a 125-byte .rodata literal, LF-terminated, one tty_write call so a concurrent stdout writer cannot interleave. Called by Dispatch::ls_dispatch BEFORE Runner::runner_ls when AS_BIT_SCHEMA is set on _as_flag_bits; no DirListRecord audit frame opens (no directory read) and no semantic-pipe record emits (this is stateless read-of-manifest, not a listing). Return: SD_OK (0) on success -> Dispatch folds to LS_OK via ExitMap -> exit 0. Negative-errno u64 from sys_write (bit 63 set) -> SD_ERR_TTY (0xFFFFEB23 mirror of LS_ERR_TTY_WRITE) -> ExitMap folds to exit 4. Single r12 push for SysV alignment across the nested tty_write call: entry rsp % 16 == 8; +8 -> 0; matched pop before every ret. paideia-as conformance: no test mnemonic; imm 125 fits imm32; SD_ERR_TTY stages via mov rax, imm64 (return, not compare); no byte read (the packed literal is handed to tty_write by pointer). Labels prefixed sde_.",
+      block: {
+        push r12;
+
+        lea r11, [rip + _sd_catalog_bytes];
+        mov rdi, r11;                          // buf_ptr
+        mov rsi, 125;                          // len (=_sd_catalog_len)
+        call tty_write;
+
+        // sys_write returns bytes on success, negative-errno on
+        // failure. Signed-less-than detects the negative-errno case.
+        cmp rax, 0;
+        jl  sde_tty_fail;
+
+        xor rax, rax;                          // SD_OK
+        pop r12;
+        ret;
+
+      sde_tty_fail:
+        mov rax, 0xFFFFEB23;                   // SD_ERR_TTY
+        pop r12;
+        ret
+      }
+    }
+}

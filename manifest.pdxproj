@@ -20,7 +20,7 @@
 # a new PAIDEIA_AS_VER KV record.
 
 name        = ls
-version     = 1.0.1
+version     = 1.1.0
 kind        = tool
 entry       = Dispatch::ls_dispatch
 output      = build-out/ls
@@ -57,6 +57,8 @@ sources:
   - src/semantic_emit.pdx         # M3-001 + M3-002 + M4-004 emit + wire_compose
   - src/audit_shim.pdx            # M3-003 audit_ls_begin + audit_ls_commit
   - src/exit_map.pdx              # M4-003 0xFFFFEBxx -> I4 exit-code map
+  - src/schema_dump.pdx           # v1.1.0 ENH-006 (#19) --schema catalog emit
+  - src/json_line.pdx             # v1.1.0 ENH-007 (#26) --json line renderer
 
 # --- Library dependencies -----------------------------------------------
 # ls consumes four libraries at 1.0.1+ (ls.ENH-013, #22: the phantom
@@ -108,7 +110,7 @@ compliance:
 # 1.0 tag freezes those, and a re-sign at R32 rewrites the mirror
 # copy only (source tree unchanged).
 release:
-  manifest_pdxsig = pkgs.paideia-os/ls/1.0.1/manifest.pdxsig
-  changelog_entry = CHANGELOG.md#101
+  manifest_pdxsig = pkgs.paideia-os/ls/1.1.0/manifest.pdxsig
+  changelog_entry = CHANGELOG.md#110
   pdxdoc          = doc/ls.pdxdoc
-  mirror_target   = pkgs.paideia-os/ls/1.0.1/
+  mirror_target   = pkgs.paideia-os/ls/1.1.0/

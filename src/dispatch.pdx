@@ -57,6 +57,18 @@
 //     paideia-os/doc src/argv_dispatch.pdx L339).
 //
 // =============================================================================
+// v1.1.0 (ls.ENH-006 / #19): --schema short-circuit
+// =============================================================================
+//
+// After argv_surface_parse returns AS_OK, Dispatch inspects
+// _as_flag_bits & AS_BIT_SCHEMA (0x10). When set, it calls
+// SchemaDump::schema_dump_emit BEFORE Runner and returns LS_OK
+// verbatim (folded to exit 0 by exit_map). --schema is a stateless
+// read-of-manifest -- no directory read, no audit frame, no
+// semantic-pipe emission -- so the runner_ls call is skipped
+// entirely on this path.
+//
+// =============================================================================
 // CROSS-MODULE SYMBOLS
 // =============================================================================
 //
@@ -64,6 +76,7 @@
 //   argv_surface_parse   -- ArgvSurface (src/argv_surface.pdx)
 //   runner_ls            -- Runner (src/runner.pdx)
 //   exit_map              -- ExitMap (src/exit_map.pdx), ls.ENH-004 (#18)
+//   schema_dump_emit     -- SchemaDump (src/schema_dump.pdx), v1.1.0 ENH-006
 //
 // Read:
 //   _as_path_ptr         -- ArgvSurface (src/argv_surface.pdx .bss)
@@ -108,11 +121,37 @@ module Dispatch = structure {
         cmp rax, r10;
         jne ls_dp_done;                      // fold the parse error too
 
-        // AS_OK. Load _as_path_ptr + _as_flag_bits and call Runner.
+        // AS_OK. Load _as_flag_bits early so we can gate --schema
+        // before dispatching Runner (v1.1.0 ENH-006 / #19).
+        lea r11, [rip + _as_flag_bits];
+        mov rsi, [r11];                      // rsi = flag_bits
+
+        // ls.ENH-006 (#19) v1.1.0: --schema short-circuit. AS_BIT_
+        // SCHEMA (0x10) -> emit catalog on KIND_TTY and return LS_OK
+        // without invoking Runner. r10 scratch for the mask; rsi
+        // preserved (still holds flag_bits for the runner path).
+        mov r10, rsi;
+        and r10, 0x10;                       // AS_BIT_SCHEMA
+        cmp r10, 0;
+        je  ls_dp_run_runner;                // no --schema -> runner path
+
+        // --schema present: emit catalog + fold.
+        call schema_dump_emit;
+        // schema_dump_emit returns SD_OK (0) on success -> map through
+        // exit_map (which routes 0xFFFFEB00-band unknowns to system,
+        // but SD_OK is 0 which is NOT in the ls sub-band; the fold
+        // treats it as unknown -> exit 3). Route the success case to
+        // LS_OK explicitly so ExitMap folds it to 0.
+        cmp rax, 0;
+        jne ls_dp_done;                      // failure: propagate as-is
+        mov rax, 0xFFFFEB00;                 // LS_OK -> exit 0
+        jmp ls_dp_done;
+
+      ls_dp_run_runner:
+        // Standard runner path: load path_ptr + call runner_ls.
         lea r11, [rip + _as_path_ptr];
         mov rdi, [r11];
-        lea r11, [rip + _as_flag_bits];
-        mov rsi, [r11];
+        // rsi already holds flag_bits from the load above.
         call runner_ls;
         // rax = Runner's return code (LS_RUN_STUB at M1; LS_OK / LS_
         // ERR_* at M2+). Fall through to the shared fold below.
