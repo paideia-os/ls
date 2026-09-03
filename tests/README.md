@@ -44,6 +44,21 @@ sub-band sentinel on fail.
   spanning the fast path (0, 999) and the slow path (1024→`1.0K`,
   1536→`1.5K`, 1048576→`1.0M`, 1099511627776→`1.0T`). Pins both the
   base-2 unit dispatch and the tenth-digit derivation.
+- `json_line_fixtures.pdx` — v1.1.1 post-1.1.0 debugger finding 3.
+  Byte-exact goldens for `JsonLine::json_line_render`; 7 cases
+  pinning the v1.1.1 RFC 8259 escape overhaul: plain name
+  (passthrough), the three shortcut escapes most likely to fire
+  in the wild (`"` → `\"`, `\` → `\\`, `0x0A` → `\n`), the six-byte
+  `\u00XX` fallback for `0x01`, the 104-byte max-input clamp, and
+  the overflow-sentinel path with an undersized `dst_cap`. Retires
+  the pre-1.1.1 "no fixture" line for the JSON-lines renderer.
+- `schema_dump_fixtures.pdx` — v1.1.1 post-1.1.0 debugger finding 3.
+  One byte-diff of `SchemaDump::_sd_catalog_bytes` against a local
+  52-byte golden copy. This is the tripwire the `caps.decl`
+  invariant note points at (v1.1.1 finding 2): the `SchemaDump`
+  catalog literal, the `SemanticEmit` schema-name literals, and
+  `caps.decl :: declares_output_schemas` must stay lock-step; any
+  drift here fails the diff.
 - `goldens/` — human-readable copies of each fixture case's
   expected byte sequence. Not read at build/test time (paideia-as
   fixture modules have no filesystem cap); the `.rodata` tables in

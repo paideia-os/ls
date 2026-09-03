@@ -20,7 +20,7 @@
 # a new PAIDEIA_AS_VER KV record.
 
 name        = ls
-version     = 1.1.0
+version     = 1.1.1
 kind        = tool
 entry       = Dispatch::ls_dispatch
 output      = build-out/ls
@@ -86,6 +86,8 @@ tests:
   - tests/schema_golden.pdx         # M4-004 hash-imprint + 144-byte wire body
   - tests/long_format_fixtures.pdx  # 1.0.1 ENH-003 3 long_format_line cases
   - tests/human_size_fixtures.pdx   # 1.0.1 ENH-003 6 human_size_render cases
+  - tests/json_line_fixtures.pdx    # 1.1.1 finding 3: 7 json_line_render cases
+  - tests/schema_dump_fixtures.pdx  # 1.1.1 finding 3: 1 catalog byte-diff
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49/R50 tool observes and every M1
@@ -110,7 +112,7 @@ compliance:
 # 1.0 tag freezes those, and a re-sign at R32 rewrites the mirror
 # copy only (source tree unchanged).
 release:
-  manifest_pdxsig = pkgs.paideia-os/ls/1.1.0/manifest.pdxsig
-  changelog_entry = CHANGELOG.md#110
+  manifest_pdxsig = pkgs.paideia-os/ls/1.1.1/manifest.pdxsig
+  changelog_entry = CHANGELOG.md#111
   pdxdoc          = doc/ls.pdxdoc
-  mirror_target   = pkgs.paideia-os/ls/1.1.0/
+  mirror_target   = pkgs.paideia-os/ls/1.1.1/

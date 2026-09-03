@@ -1,0 +1,279 @@
+// tests/schema_dump_fixtures.pdx -- v1.1.1 debugger finding 3 (post-1.1.0)
+//
+// SchemaDumpFixtures module: byte-exact golden for
+// SchemaDump::_sd_catalog_bytes (src/schema_dump.pdx). Pins the v1.1.1
+// single-entry catalog after debugger finding 2 retracted the phantom
+// PdxLsSummaryRecord@0.1 line. Any future edit that adds, drops, or
+// renames a schema in the catalog either updates this golden in the
+// same commit or trips this fixture -- the deliberate tripwire the
+// caps.decl invariant note points at.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// FIXTURE module. One case pinning the entire catalog byte-for-byte.
+// Unlike the color / long-format / json-line fixtures, there is no
+// dynamic renderer under test -- SchemaDump::schema_dump_emit only
+// hands the .rodata literal to tty_write. The fixture therefore
+// diffs the .rodata bytes directly against a local golden copy.
+//
+//   idx  what is pinned                    bytes
+//   ---------------------------------------------
+//    0   _sd_catalog_bytes (v1.1.1 shape)  52
+//
+// Human-readable copy at tests/goldens/schema_dump_catalog.txt.
+//
+// =============================================================================
+// TABLE LAYOUT
+// =============================================================================
+//
+//   _sdf_catalog_golden  [u8; 52]  -- expected bytes, byte-identical
+//                                     to SchemaDump::_sd_catalog_bytes
+//   _sdf_catalog_len     u64       -- 52 (must equal
+//                                     SchemaDump::_sd_catalog_len)
+//
+// =============================================================================
+// PUBLIC ENTRY POINTS
+// =============================================================================
+//
+//   schema_dump_fixtures_case_count() -> u64      -- SDF_CASE_COUNT (1)
+//   schema_dump_fixtures_run(case_idx) -> u64     -- 0 pass; err on fail
+//   schema_dump_fixtures_verify_all() -> u64      -- fail-fast walk
+//
+// The verifier signatures match the M4 fixture convention documented
+// in tests/README.md so a future harness iterates every module
+// through a uniform `<name>_verify_all` call.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`SchemaDumpFixtures`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediate
+//     is 52 (catalog length).
+//   - Byte reads (diff loop) use `xor rax, rax; mov_b rax, [ptr]` per
+//     #1248, staged through r11 so the addressing mode is [reg] only
+//     (no [reg + reg] byte reads per U1606).
+//   - r10 / r11 are scratch.
+//   - Labels prefixed sdf_.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Read (via lea):
+//   _sd_catalog_bytes    -- SchemaDump (src/schema_dump.pdx)
+//   _sd_catalog_len      -- SchemaDump (src/schema_dump.pdx)
+
+module SchemaDumpFixtures = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let SDF_OK               : u64 = 0
+  pub let SDF_ERR_LEN_MISMATCH : u64 = 0xFFFFEBA0
+  pub let SDF_ERR_BYTE_MISMATCH: u64 = 0xFFFFEBA1    // + byte_idx (low bits)
+  pub let SDF_ERR_BAD_CASE_IDX : u64 = 0xFFFFEBAF
+
+  pub let SDF_CASE_COUNT       : u64 = 1
+  pub let SDF_CATALOG_LEN      : u64 = 52
+
+  // ==========================================================================
+  // Golden catalog bytes (52 bytes).
+  //
+  //   "PdxFsDirEntry@0.1 -- one record per directory entry\n"
+  //
+  // ASCII: 'P'=0x50 'd'=0x64 'x'=0x78 'F'=0x46 's'=0x73 'D'=0x44
+  //        'i'=0x69 'r'=0x72 'E'=0x45 'n'=0x6E 't'=0x74 'y'=0x79
+  //        '@'=0x40 '0'=0x30 '.'=0x2E '1'=0x31 SPC=0x20 '-'=0x2D
+  //        'o'=0x6F 'e'=0x65 'c'=0x63 'p'=0x70 LF=0x0A
+  // ==========================================================================
+  pub let _sdf_catalog_golden : [u8; 52] = [
+      0x50, 0x64, 0x78, 0x46, 0x73, 0x44, 0x69, 0x72,   // "PdxFsDir"
+      0x45, 0x6E, 0x74, 0x72, 0x79, 0x40, 0x30, 0x2E,   // "Entry@0."
+      0x31, 0x20, 0x2D, 0x2D, 0x20, 0x6F, 0x6E, 0x65,   // "1 -- one"
+      0x20, 0x72, 0x65, 0x63, 0x6F, 0x72, 0x64, 0x20,   // " record "
+      0x70, 0x65, 0x72, 0x20, 0x64, 0x69, 0x72, 0x65,   // "per dire"
+      0x63, 0x74, 0x6F, 0x72, 0x79, 0x20, 0x65, 0x6E,   // "ctory en"
+      0x74, 0x72, 0x79, 0x0A                            // "try\n"
+  ]
+
+  // ==========================================================================
+  // schema_dump_fixtures_case_count() -> u64
+  //
+  // Leaf.
+  // ==========================================================================
+  pub let schema_dump_fixtures_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "v1.1.1 finding 3: return SDF_CASE_COUNT (1) for a harness iterating via schema_dump_fixtures_run. Leaf pure function. paideia-as conformance: no test mnemonic; no cmp. Labels prefixed sdfcc_.",
+      block: {
+        mov rax, 1;                              // SDF_CASE_COUNT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // schema_dump_fixtures_run(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI: case_idx (0 only)
+  //   RAX: 0 on pass; SDF_ERR_LEN_MISMATCH on length drift;
+  //        SDF_ERR_BYTE_MISMATCH + byte_idx on byte drift;
+  //        SDF_ERR_BAD_CASE_IDX on out-of-range.
+  //
+  // Sequence:
+  //   (1) Bounds check case_idx < 1.
+  //   (2) Compare _sd_catalog_len against 52; mismatch ->
+  //       SDF_ERR_LEN_MISMATCH.
+  //   (3) Byte-diff _sd_catalog_bytes[0..52] vs _sdf_catalog_golden
+  //       [0..52]; first mismatch -> SDF_ERR_BYTE_MISMATCH + byte_idx.
+  //
+  // Register plan (leaf: no external calls -- pure .rodata diff):
+  //   rbx = case_idx (survives; used only for the bounds check today)
+  //   r12 = actual base (LEA _sd_catalog_bytes)
+  //   r13 = golden base (LEA _sdf_catalog_golden)
+  //   r14 = length cap (52)
+  //   r15 = byte loop counter
+  //
+  // Alignment: 5 pushes = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48;
+  // 48 % 16 == 0. Aligned even though no call is made -- kept for
+  // parity with the other fixture modules and future-proofing if a
+  // check ever calls schema_dump_emit for a live-substrate round-trip.
+  // ==========================================================================
+  pub let schema_dump_fixtures_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "v1.1.1 finding 3: byte-exact diff of _sd_catalog_bytes against _sdf_catalog_golden (52 bytes). Bounds-check case_idx < 1 -> SDF_ERR_BAD_CASE_IDX. Load _sd_catalog_len; if != 52 -> SDF_ERR_LEN_MISMATCH. Byte-diff loop iterates r15 = 0..52: stage r11 = r12 + r15, xor rax + mov_b rax gives actual byte; stage r11 = r13 + r15, xor rax + mov_b rax gives expected; cmp -> SDF_ERR_BYTE_MISMATCH + byte_idx on first drift (byte_idx aids diagnosis of a single-byte edit). Byte reads use [reg]-only addressing (no [reg+reg] mov_b per U1606). Five callee-save pushes (rbx=case_idx, r12=actual base, r13=golden base, r14=length cap, r15=byte counter) = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48; aligned. Leaf today, but the push/pop parity keeps a live-substrate round-trip cheap to add later. paideia-as: no test mnemonic; largest cmp immediate 52. SDF_ERR_* sentinels via mov rax, imm64 + add. Labels prefixed sdfr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+
+        // Bounds check.
+        cmp rbx, 1;                              // SDF_CASE_COUNT
+        jae sdfr_bad_idx;
+
+        // Load _sd_catalog_len and compare against 52.
+        lea r11, [rip + _sd_catalog_len];
+        mov rax, [r11];
+        cmp rax, 52;                             // SDF_CATALOG_LEN
+        jne sdfr_len_fail;
+
+        // Set up loop bases.
+        lea r12, [rip + _sd_catalog_bytes];
+        lea r13, [rip + _sdf_catalog_golden];
+        mov r14, 52;                             // length cap
+        xor r15, r15;
+
+      sdfr_diff_loop:
+        cmp r15, r14;
+        jae sdfr_ok;
+
+        // Load actual byte.
+        mov r11, r12;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];
+        mov r10, rax;                            // r10 = actual byte
+
+        // Load expected byte.
+        mov r11, r13;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];                        // rax = expected byte
+
+        cmp rax, r10;
+        jne sdfr_byte_fail;
+
+        add r15, 1;
+        jmp sdfr_diff_loop;
+
+      sdfr_ok:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sdfr_len_fail:
+        mov rax, 0xFFFFEBA0;                     // SDF_ERR_LEN_MISMATCH
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sdfr_byte_fail:
+        mov rax, 0xFFFFEBA1;                     // SDF_ERR_BYTE_MISMATCH
+        add rax, r15;                            // + byte_idx
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sdfr_bad_idx:
+        mov rax, 0xFFFFEBAF;                     // SDF_ERR_BAD_CASE_IDX
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // schema_dump_fixtures_verify_all() -> u64
+  //
+  // Walk case_idx 0..0; first non-zero return propagates.
+  //
+  // Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24;
+  // entry rsp %16==8; 8+24=32; aligned at schema_dump_fixtures_run
+  // call site.
+  // ==========================================================================
+  pub let schema_dump_fixtures_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "v1.1.1 finding 3: fail-fast walk of the single schema_dump catalog case. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp %16==8; 8+24=32; aligned at schema_dump_fixtures_run call site. Matched add rsp,8 + 2 pops. paideia-as: no test; cmp against 1 fits imm32. Labels prefixed sdfva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 1;                              // SDF_CASE_COUNT
+
+      sdfva_loop:
+        cmp rbx, r12;
+        jae sdfva_ok;
+
+        mov rdi, rbx;
+        call schema_dump_fixtures_run;
+        cmp rax, 0;
+        jne sdfva_out;
+
+        add rbx, 1;
+        jmp sdfva_loop;
+
+      sdfva_ok:
+        xor rax, rax;
+      sdfva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

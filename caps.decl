@@ -39,5 +39,19 @@ requires:
 # actual wire binding + emission lands at ls.M3-001 per r49-r50-plan.md
 # §5.4 (one PdxFsDirEntry per file, owner field a KIND_USER capability
 # reference rather than a text uid — D2 literal at the schema level).
+#
+# INVARIANT (v1.1.1 debugger finding 2). This list is the AUTHORITATIVE
+# source for every declared output schema. Two mirrors must stay in
+# lock-step with it, or a `ls --schema` consumer preloads a decoder
+# for a schema id no record ever arrives against:
+#   1. src/schema_dump.pdx :: _sd_catalog_bytes -- one catalog line
+#      per schema name here, LF-terminated. `_sd_catalog_len` is the
+#      byte total.
+#   2. src/semantic_emit.pdx :: _se_schema_name (and any future
+#      per-schema name literal) -- one literal per schema this file
+#      declares. spipe_schema_id_from_name hashes over the bytes.
+# Adding, removing, or renaming a schema is a three-file edit landing
+# in one commit. tests/schema_dump_fixtures.pdx pins the catalog bytes
+# byte-for-byte; a mismatch there is the tripwire.
 declares_output_schemas:
   - PdxFsDirEntry@0.1

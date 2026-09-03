@@ -9,9 +9,104 @@ and stored under `pkgs.paideia-os/ls/<version>/`.
 
 ## [Unreleased]
 
-Post-1.1.0 items on the Enhancement v1.x wave
+Post-1.1.1 items on the Enhancement v1.x wave
 (`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
 exit-code map, wire body shape, `caps.decl`) changes in this section.
+
+## [1.1.1] -- 2026-09-03 -- JSON escape + schema catalog correctness (post-1.1.0 debugger findings) <a id="111"></a>
+
+**1.1.1 (post-1.1.0 debugger patch).** Closes the three findings the
+v1.1.0 debugger pass surfaced (HIGH + MEDIUM + LOW). No frozen 1.0
+interface changes -- the argv surface, 144-byte `PdxFsDirEntry@0.1`
+wire body, exit-code map, and `caps.decl` requires-set are unchanged.
+`caps.decl :: declares_output_schemas` shrinks from two entries to
+one (`PdxLsSummaryRecord@0.1` is retracted, matching what the tool
+actually emits); a consumer that inspected the manifest and preloaded
+a decoder for the phantom schema now sees the honest surface.
+
+Fixes: v1.1.0 debugger findings 1+2+3.
+
+### Fixed
+
+- **v1.1.0 finding 1 (HIGH -- correctness / injection).**
+  `JsonLine::json_line_render`'s name-copy loop (`src/json_line.pdx`
+  L202-225 pre-1.1.1) wrote every raw byte from `name_ptr` straight
+  into the `"name":"..."` field with zero escaping, justified with a
+  false claim about `sys_pdxfs_open`'s mint contract. The debugger
+  verified that path is a stub cap-mint constructor with no name
+  argument; the real name-writing path is `tmpfs_create` which caps
+  length only, so a filename like `foo"bar` produced unparseable JSON
+  and a filename with `\n` split one JSON-lines record into two. The
+  copy loop now implements RFC 8259 string escaping: `"` -> `\"`, `\`
+  -> `\\`, `0x08` -> `\b`, `0x09` -> `\t`, `0x0A` -> `\n`, `0x0C` ->
+  `\f`, `0x0D` -> `\r`, and any other control byte (`0x00-0x1F`) ->
+  `\u00XX`. The 104-byte cap is now an INPUT-byte clamp
+  (`JL_NAME_MAX_INPUT`, renamed from `JL_NAME_MAX`); each input byte
+  may expand to up to six output bytes, and the existing
+  `JL_ERR_OVERFLOW` sentinel surfaces cleanly if `dst_cap` cannot
+  accommodate the worst case. The false justification is retracted;
+  the new one names `tmpfs_create` as the writer and
+  `caps.decl :: declares_output_schemas` as the schema authority.
+
+- **v1.1.0 finding 2 (MEDIUM -- schema-registry integrity).**
+  `SchemaDump::_sd_catalog_bytes` (`src/schema_dump.pdx` L96-101
+  pre-1.1.1) named two schemas -- `PdxFsDirEntry@0.1` and
+  `PdxLsSummaryRecord@0.1` -- but ls never emitted a record of the
+  second shape on any code path (`caps.decl :: declares_output_schemas`
+  only declared the first; `SemanticEmit::_se_summary_schema_name`
+  was an inert byte-array constant no emit function ever read). A
+  consumer that ran `ls --schema` and BLAKE3-hashed the second name
+  would preload a decoder for a schema id no record ever arrived
+  against. The catalog is now single-entry:
+  `PdxFsDirEntry@0.1 -- one record per directory entry\n` (52 bytes,
+  down from 125). `caps.decl` gains an INVARIANT note naming its
+  `declares_output_schemas` as the single authoritative source; the
+  `SchemaDump` catalog literal and the `SemanticEmit` schema-name
+  literals are lock-step mirrors. `SemanticEmit::_se_summary_schema
+  _name` gains a `ls.ENH-021 (#39) deferred -- retire this comment
+  when the summary record ships` note so its inert status is honest.
+
+### Added
+
+- **v1.1.0 finding 3 (LOW -- test coverage).**
+  Two new fixture modules under `tests/`, both following the M4
+  fixture convention (`<name>_case_count / _run / _verify_all`
+  triples documented in `tests/README.md`):
+  - `tests/json_line_fixtures.pdx` -- seven byte-exact cases pinning
+    the v1.1.1 escape overhaul: plain name (passthrough), the three
+    single-byte shortcuts most likely to fire in the wild
+    (`\"`, `\\`, `\n`), the six-byte `\u00XX` fallback for `0x01`,
+    the max-input clamp at 104 bytes, and the overflow-sentinel path
+    with an undersized `dst_cap`. Human-readable copies at
+    `tests/goldens/json_line_case<N>_*.txt`.
+  - `tests/schema_dump_fixtures.pdx` -- one byte-diff of the entire
+    52-byte catalog against a local golden copy. This is the
+    tripwire the `caps.decl` invariant note points at: any future
+    edit that adds, drops, or renames a schema in the catalog
+    without updating this golden fails byte-diff. Human-readable
+    copy at `tests/goldens/schema_dump_catalog.txt`.
+  Both fixtures land in the same commit as the renderer fixes;
+  `Phase 2 paideia-as test` remains a parse+encode smoke (see the
+  1.0.1 debugger note), so the runtime cover lands when the M5 QEMU
+  smoke sequences these `_verify_all` entry points.
+
+### Files touched
+
+- `src/json_line.pdx` -- rewrite name-copy loop with escape dispatch;
+  rename `JL_NAME_MAX` -> `JL_NAME_MAX_INPUT`; retract false
+  justification; add `jl_esc_*` label family.
+- `src/schema_dump.pdx` -- shrink `_sd_catalog_bytes` to 52 bytes and
+  the len constant to 52; retract two-entry claim; name `caps.decl`
+  as the authoritative source.
+- `src/semantic_emit.pdx` -- annotate `_se_summary_schema_name` as
+  deferred until `ls.ENH-021 (#39)` and inert until then.
+- `caps.decl` -- add INVARIANT note pointing at the two mirrors
+  (`SchemaDump` catalog and `SemanticEmit` schema-name literals)
+  that must stay lock-step with `declares_output_schemas`.
+- `manifest.pdxproj` -- version 1.1.1; add the two new fixtures to
+  the tests list; bump `mirror_target` and `manifest_pdxsig`.
+- `tests/json_line_fixtures.pdx` (new) + `tests/schema_dump_fixtures
+  .pdx` (new) + goldens under `tests/goldens/`.
 
 ## [1.1.0] -- 2026-09-03 -- wiring wave (ENH-002 + ENH-005 + ENH-006 + ENH-007 + ENH-022 + ENH-023) <a id="110"></a>
 

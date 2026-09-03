@@ -1,4 +1,4 @@
-// src/json_line.pdx -- ls.ENH-007 (paideia-os/ls#26) v1.1.0
+// src/json_line.pdx -- ls.ENH-007 (paideia-os/ls#26) v1.1.1
 //
 // JsonLine module: render one directory entry as a JSON object on a
 // single line, terminated by LF. Selected by Runner when the invoker
@@ -17,19 +17,24 @@
 //                    kind_nibble, inode)
 //     -> bytes_written | JL_ERR_OVERFLOW
 //
-// Line format (canonical bytes; the M4 fixture-golden lane will pin
-// each byte):
+// Line format (canonical bytes; the tests/json_line_fixtures.pdx
+// golden lane pins each byte):
 //
 //   {"name":"<name>","kind":<nibble_dec>,"inode":<inode_dec>}\n
 //
 // where:
-//   - <name> is the raw name_ptr bytes, name_len bytes. NO ESCAPING at
-//     v1.1.0 -- directory entry names on PdxFS-v1 are constrained to
-//     the byte set the kernel accepts on sys_pdxfs_open (per paideia-os
-//     src/kernel/core/cap/kind_pdxfs_file.pdx §mint contract), which
-//     excludes '"', '\\', and control bytes. If a future kernel PdxFS
-//     variant relaxes that constraint, escape support lands here as a
-//     one-branch extension in the copy loop.
+//   - <name> is name_ptr[0..name_len_clamp] passed through RFC 8259
+//     string escaping: '"' -> \" ; '\\' -> \\ ; 0x08 -> \b ; 0x09 -> \t;
+//     0x0A -> \n ; 0x0C -> \f ; 0x0D -> \r ; any other control byte
+//     (0x00-0x1F) -> \u00XX (six-byte hex escape). All other bytes are
+//     emitted verbatim. Escapes RFC 8259 required bytes; safe for
+//     JSON-lines emission with any filename accepted by tmpfs_create.
+//     Rationale (v1.1.1 debugger finding 1): the earlier "no escape
+//     needed" story pointed at sys_pdxfs_open's mint contract, but that
+//     path is a stub cap-mint constructor with no name argument. The
+//     real name-writing path is tmpfs_create, which caps length only.
+//     A filename like `foo"bar` therefore reached the writer and split
+//     the JSON-lines stream; escaping here closes that.
 //   - <nibble_dec> is the kind nibble at record offset 8 (low 4 bits),
 //     rendered as a small decimal (0..15).
 //   - <inode_dec> is the inode qword at record offset 0, rendered as
@@ -42,10 +47,16 @@
 //   - Module name PascalCase basename (`JsonLine`).
 //   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
 //   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediate
-//     is 104 (RN_ENT_NAME_MAX bound); ASCII bytes fit trivially.
+//     is 104 (JL_NAME_MAX_INPUT bound); ASCII bytes fit trivially.
 //     JL_ERR_OVERFLOW sentinel (0xFFFFFFFFFFFFFFFF) stages into r11.
 //   - Byte reads (name copy loop) use `xor rax; mov_b rax, [ptr]`.
 //   - Byte writes go through Render::render_byte_write.
+//   - r10 is scratch across the name loop; used both for the copy idx
+//     (bits [7:0]) and for staging the two `\u00XX` hex-ASCII bytes
+//     (bits [15:8], [23:16]) across the four fixed-byte writes. This
+//     is safe because Render::render_byte_write is a leaf that touches
+//     only rax + memory (does NOT clobber r10); if that ever changes,
+//     the escape helper needs a .bss spill slot instead.
 //   - r11 is scratch for LEA + sentinel staging.
 //   - Non-leaf (calls render_byte_write + render_dec_u64 many times).
 //     6 callee-save pushes (rbx = anchor, r12 = cursor, r13 = cap
@@ -70,10 +81,15 @@ module JsonLine = structure {
   pub let JL_OK              : u64 = 0
   pub let JL_ERR_OVERFLOW    : u64 = 0xFFFFFFFFFFFFFFFF
 
-  // Bound on the name-copy loop (mirrors Runner::RN_ENT_NAME_MAX). Any
-  // caller passing name_len > this is a broken upstream; JsonLine
-  // clamps rather than overflow the dst buffer.
-  pub let JL_NAME_MAX        : u64 = 104
+  // Bound on the INPUT bytes the name-copy loop reads (mirrors
+  // Runner::RN_ENT_NAME_MAX). Any caller passing name_len > this is a
+  // broken upstream; JsonLine clamps rather than overreach name_ptr.
+  // After v1.1.1 escape support this is the INPUT-byte cap only; each
+  // input byte may expand to at most 6 output bytes (`\u00XX`), so a
+  // worst-case name emits up to 6 * 104 = 624 output bytes. dst_cap
+  // must accommodate 30 fixed + 6*name_len_input + <= 22 digits worst
+  // case; the JL_ERR_OVERFLOW sentinel fires cleanly when it does not.
+  pub let JL_NAME_MAX_INPUT  : u64 = 104
 
   // ==========================================================================
   // json_line_render(dst_ptr, dst_cap, name_ptr, name_len,
@@ -85,8 +101,8 @@ module JsonLine = structure {
   //   RDX = name_ptr (NUL-terminated name; length authoritative from
   //                   name_len, NOT strlen -- kernel record carries
   //                   the length explicitly)
-  //   RCX = name_len (bytes to copy from name_ptr; clamped at
-  //                   JL_NAME_MAX defensively)
+  //   RCX = name_len (INPUT bytes to read from name_ptr; clamped at
+  //                   JL_NAME_MAX_INPUT defensively)
   //   R8  = kind_nibble (0..15, low 4 bits of the record's kind qword
   //                      at offset 8)
   //   R9  = inode (record qword at offset 0)
@@ -99,7 +115,8 @@ module JsonLine = structure {
   //   -----------------------------------------
   //    1    {                          1
   //    2    "name":"                   8
-  //    3    <name bytes>               name_len (<= 104)
+  //    3    <escaped name bytes>       1..6 per input byte, name_len_in
+  //                                    input bytes (<= 104)
   //    4    ","kind":                  9
   //    5    <kind_nibble decimal>      1..2
   //    6    ,"inode":                  9
@@ -107,8 +124,14 @@ module JsonLine = structure {
   //    8    }                          1
   //    9    \n                         1
   //
-  // Fixed overhead = 30 bytes; name (<= 104) + digits (<= 22) = 156
-  // upper bound. Caller sizes dst_cap accordingly (Runner picks 256).
+  // Fixed overhead = 30 bytes; name output <= 6*104 = 624; digits <= 22.
+  // Upper bound = 676 bytes. Every write step checks dst_cap via the
+  // Render::render_byte_write overflow sentinel; on refusal the whole
+  // call returns JL_ERR_OVERFLOW without partially patching dst beyond
+  // the writes already stored (mirrors the render/cap_pack precedent).
+  // Caller (Runner) sizes dst_cap for its expected worst case; a name
+  // dense with control bytes on an undersized buffer surfaces as the
+  // sentinel, which Runner routes to LS_ERR_TTY_WRITE.
   //
   // Register plan (non-leaf, 6 pushes + pad):
   //   rbx = anchor       (original dst_ptr; final total = cursor - anchor)
@@ -127,7 +150,7 @@ module JsonLine = structure {
     fn (dst_ptr: u64) (dst_cap: u64) (name_ptr: u64)
        (name_len: u64) (kind_nibble: u64) (inode: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "ls.ENH-007 (#26) v1.1.0: emit one directory entry as a JSON line for --json on KIND_TTY(write). Format: {\"name\":\"<name>\",\"kind\":<nibble>,\"inode\":<inode>}\\n. Runner still emits the 144-byte PdxFsDirEntry@0.1 semantic-pipe record unchanged; --json swaps only the text-fd branch. Six-register cap (P0276) reached exactly: dst_ptr, dst_cap, name_ptr, name_len, kind_nibble, inode. Fixed overhead 30 bytes + name (<= JL_NAME_MAX=104) + digits (<= 22) = 156 byte upper bound; caller sizes dst_cap for the worst case (Runner picks 256). Name copy loop uses the #1248 mitigation (xor rax, rax; mov_b rax, [src]; call render_byte_write). Name escaping deferred: PdxFS-v1's sys_pdxfs_open mint contract rejects '\"'/'\\\\' and control bytes at kernel-cap-narrow time, so unescaped bytes are safe on the v1.x line; a future PdxFS variant relaxing that constraint gets escape support as a one-branch copy-loop extension. Kind emitted as small decimal (0..15, one or two bytes via render_dec_u64). Inode emitted as decimal via render_dec_u64. Every nested call's overflow return (0xFFFFFFFFFFFFFFFF) stages into r11 for the compare and short-circuits to jl_overflow. Because paideia-as's 6-reg cap leaves no room for kind_nibble + inode to survive the name copy loop through r8/r9 (both caller-save; render_byte_write clobbers), we spill them: rbp packs them qword-wise (nibble at [0:4], inode at [4:64]) since inode < 2^60 on PdxFS-v1 (kernel row_id is u32 today). Six callee-save pushes + sub rsp,8 pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at every nested-call site. paideia-as conformance: r11 scratch for LEA + sentinel; no test mnemonic; largest cmp imm 104 (JL_NAME_MAX). Labels prefixed jl_.",
+      justification: "ls.ENH-007 (#26) v1.1.1: emit one directory entry as a JSON line for --json on KIND_TTY(write). Format: {\"name\":\"<escaped-name>\",\"kind\":<nibble>,\"inode\":<inode>}\\n. Runner still emits the 144-byte PdxFsDirEntry@0.1 semantic-pipe record unchanged; --json swaps only the text-fd branch. Six-register cap (P0276) reached exactly: dst_ptr, dst_cap, name_ptr, name_len, kind_nibble, inode. Name escaping (v1.1.1 debugger finding 1): RFC 8259 required bytes are escaped in the copy loop -- 0x22 -> \\\", 0x5C -> \\\\, 0x08 -> \\b, 0x09 -> \\t, 0x0A -> \\n, 0x0C -> \\f, 0x0D -> \\r; every other control byte (0x00-0x1F) -> \\u00XX (six-byte hex). All other bytes pass through verbatim. This closes the pre-1.1.1 defect: the earlier justification pointed at sys_pdxfs_open's mint contract for '\"'/'\\\\'/control-byte rejection, but that path is a stub cap-mint constructor with no name argument -- the real name-writing path is tmpfs_create, which caps length only, so a filename like `foo\"bar` reached the writer and split the JSON-lines stream. Fixed overhead 30 bytes + name output (<= 6*104=624) + digits (<= 22) = 676 byte upper bound; caller sizes dst_cap for expected worst case (Runner picks 256 and accepts JL_ERR_OVERFLOW routing to LS_ERR_TTY_WRITE on a dense-control-byte name). Name copy loop uses the #1248 mitigation (xor rax, rax; mov_b rax, [src]; call render_byte_write). The \\u00XX helper packs the two computed hex-ASCII bytes into r10 upper bytes ([15:8] and [23:16]) across the four fixed-byte writes -- safe because Render::render_byte_write is a leaf that touches only rax + memory, does not clobber r10; if that ever changes, the escape helper needs a .bss spill slot instead. Kind emitted as small decimal (0..15, one or two bytes via render_dec_u64). Inode emitted as decimal via render_dec_u64. Every nested call's overflow return (0xFFFFFFFFFFFFFFFF) stages into r11 for the compare and short-circuits to jl_overflow. Because paideia-as's 6-reg cap leaves no room for kind_nibble + inode to survive the name copy loop through r8/r9 (both caller-save; render_byte_write clobbers), we spill them: rbp packs them qword-wise (nibble at [0:4], inode at [4:64]) since inode < 2^60 on PdxFS-v1 (kernel row_id is u32 today). Six callee-save pushes + sub rsp,8 pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at every nested-call site. paideia-as conformance: r11 scratch for LEA + sentinel; no test mnemonic; largest cmp imm 104 (JL_NAME_MAX_INPUT). Labels prefixed jl_ (jl_esc_, jl_ov_ for the escape and overflow families).",
       block: {
         // ---- prologue: 6 pushes + 8-byte pad -----------------------
         push rbx;
@@ -143,9 +166,10 @@ module JsonLine = structure {
         mov r13, rsi;                        // cap remaining
         mov r14, rdx;                        // name_ptr
 
-        // Clamp name_len at JL_NAME_MAX.
+        // Clamp name_len at JL_NAME_MAX_INPUT (input-byte cap; each
+        // input byte may still expand to up to 6 output bytes below).
         mov r15, rcx;
-        mov r11, 104;                        // JL_NAME_MAX
+        mov r11, 104;                        // JL_NAME_MAX_INPUT
         cmp r15, r11;
         jbe jl_len_ok;
         mov r15, r11;                        // clamp
@@ -199,19 +223,47 @@ module JsonLine = structure {
         mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
         add r12, 1; sub r13, 1;
 
-        // ---- step 3: copy name bytes (0..r15) --------------------
+        // ---- step 3: escape+copy name bytes (0..r15) -------------
+        // r10 layout during the loop:
+        //   [7:0]   = idx (0..104)
+        //   [15:8]  = hex_hi ASCII (only in jl_esc_uxx; cleared after)
+        //   [23:16] = hex_lo ASCII (only in jl_esc_uxx; cleared after)
+        // r10 is preserved across render_byte_write (leaf, touches
+        // only rax + memory). Every escape branch loops back to
+        // jl_name_head after `add r10, 1`.
         xor r10, r10;                        // idx = 0
 
       jl_name_head:
-        cmp r10, r15;
+        mov rax, r10;
+        and rax, 0xFF;                       // pull idx byte
+        cmp rax, r15;
         jae jl_name_done;
 
-        // rax = byte at name_ptr[r10]
+        // rax = byte at name_ptr[idx]
         mov r11, r14;
-        add r11, r10;
+        add r11, rax;
         xor rax, rax;                        // #1248 mitigation
         mov_b rax, [r11];
 
+        // Dispatch by byte value.
+        cmp rax, 0x22;                       // '"'
+        je  jl_esc_dq;
+        cmp rax, 0x5C;                       // '\'
+        je  jl_esc_bs;
+        cmp rax, 0x08;                       // \b
+        je  jl_esc_bck;
+        cmp rax, 0x09;                       // \t
+        je  jl_esc_tab;
+        cmp rax, 0x0A;                       // \n
+        je  jl_esc_nl;
+        cmp rax, 0x0C;                       // \f
+        je  jl_esc_ff;
+        cmp rax, 0x0D;                       // \r
+        je  jl_esc_cr;
+        cmp rax, 0x20;                       // other 0x00-0x1F -> \u00XX
+        jb  jl_esc_uxx;
+
+        // Passthrough single byte.
         mov rdi, r12;
         mov rsi, r13;
         mov rdx, rax;
@@ -221,6 +273,150 @@ module JsonLine = structure {
         je  jl_overflow;
         add r12, 1;
         sub r13, 1;
+        add r10, 1;
+        jmp jl_name_head;
+
+        // ---- escape helper: '"' -> \" -----------------------------
+      jl_esc_dq:
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x5C; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x22; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        add r10, 1;
+        jmp jl_name_head;
+
+        // ---- escape helper: '\' -> \\ -----------------------------
+      jl_esc_bs:
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x5C; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x5C; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        add r10, 1;
+        jmp jl_name_head;
+
+        // ---- escape helper: 0x08 -> \b ----------------------------
+      jl_esc_bck:
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x5C; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x62; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        add r10, 1;
+        jmp jl_name_head;
+
+        // ---- escape helper: 0x09 -> \t ----------------------------
+      jl_esc_tab:
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x5C; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x74; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        add r10, 1;
+        jmp jl_name_head;
+
+        // ---- escape helper: 0x0A -> \n ----------------------------
+      jl_esc_nl:
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x5C; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x6E; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        add r10, 1;
+        jmp jl_name_head;
+
+        // ---- escape helper: 0x0C -> \f ----------------------------
+      jl_esc_ff:
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x5C; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x66; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        add r10, 1;
+        jmp jl_name_head;
+
+        // ---- escape helper: 0x0D -> \r ----------------------------
+      jl_esc_cr:
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x5C; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x72; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        add r10, 1;
+        jmp jl_name_head;
+
+        // ---- escape helper: 0x00-0x1F (other) -> \u00XX ----------
+        // rax has the byte value on entry. Precompute both hex ASCII
+        // digits and pack them into r10[15:8] and r10[23:16] so they
+        // survive the four fixed-byte writes (\, u, 0, 0), then unpack
+        // and write.
+      jl_esc_uxx:
+        // High nibble (only 0 or 1 for 0x00-0x1F, but general path):
+        mov r11, rax;
+        shr r11, 4;
+        cmp r11, 10;
+        jb  jl_esc_uxx_hi_dec;
+        add r11, 0x37;                       // 'A' - 10 = 0x37
+        jmp jl_esc_uxx_hi_pk;
+      jl_esc_uxx_hi_dec:
+        add r11, 0x30;                       // '0'
+      jl_esc_uxx_hi_pk:
+        shl r11, 8;
+        or  r10, r11;
+
+        // Low nibble.
+        mov r11, rax;
+        and r11, 0xF;
+        cmp r11, 10;
+        jb  jl_esc_uxx_lo_dec;
+        add r11, 0x37;
+        jmp jl_esc_uxx_lo_pk;
+      jl_esc_uxx_lo_dec:
+        add r11, 0x30;
+      jl_esc_uxx_lo_pk:
+        shl r11, 16;
+        or  r10, r11;
+
+        // Write '\' 'u' '0' '0'
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x5C; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x75; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x30; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+        mov rdi, r12; mov rsi, r13; mov rdx, 0x30; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+
+        // Write hex_hi (r10[15:8]).
+        mov rax, r10;
+        shr rax, 8;
+        and rax, 0xFF;
+        mov rdi, r12; mov rsi, r13; mov rdx, rax; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+
+        // Write hex_lo (r10[23:16]).
+        mov rax, r10;
+        shr rax, 16;
+        and rax, 0xFF;
+        mov rdi, r12; mov rsi, r13; mov rdx, rax; call render_byte_write;
+        mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11; je jl_overflow;
+        add r12, 1; sub r13, 1;
+
+        // Clear packed hex bytes; advance idx.
+        and r10, 0xFF;
         add r10, 1;
         jmp jl_name_head;
 

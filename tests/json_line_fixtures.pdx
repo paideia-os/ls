@@ -1,0 +1,525 @@
+// tests/json_line_fixtures.pdx -- v1.1.1 debugger finding 3 (post-1.1.0)
+//
+// JsonLineFixtures module: byte-exact goldens for
+// JsonLine::json_line_render (src/json_line.pdx). Pins the v1.1.1
+// escape overhaul (debugger finding 1: pre-1.1.1 the copy loop wrote
+// every raw name byte verbatim, splitting the JSON-lines stream on
+// any name containing '"', '\\', or a control byte). Also pins the
+// overflow-sentinel path so an undersized dst_cap surfaces cleanly.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// FIXTURE module. Seven cases exercising every RFC 8259 escape branch
+// in the new copy loop plus the input-clamp / overflow-sentinel paths:
+//
+//   idx  input name (bytes)                         escape branch    output len
+//   -------------------------------------------------------------------------
+//    0   foo.txt                                    passthrough      39
+//    1   foo"bar    (0x22 mid)                      jl_esc_dq        40
+//    2   foo\bar    (0x5C mid)                      jl_esc_bs        40
+//    3   foo<LF>bar (0x0A mid)                      jl_esc_nl        40
+//    4   foo<SOH>bar (0x01 mid)                     jl_esc_uxx       44
+//    5   a * 104    (max input, no expansion)       passthrough      136
+//    6   a * 104 with dst_cap=30                    overflow         sentinel
+//
+// Every case runs with kind=1, inode=42 so the fixed decimals in the
+// wire are 1 and "42" -- one byte + two bytes respectively -- and the
+// overall shape is `{"name":"<esc>","kind":1,"inode":42}\n`.
+//
+// Case 4 pins the six-byte hex-escape branch. 0x01 is picked from the
+// non-shortcut band 0x00-0x1F (excludes {0x08, 0x09, 0x0A, 0x0C, 0x0D}
+// which have their own two-byte shortcuts). `` verifies that
+// both hex nibbles land in the '0'..'9' half of the low-hex mapping.
+//
+// Case 5 pins the max input clamp (JL_NAME_MAX_INPUT = 104). All 104
+// bytes are `a` (0x61) so no escape branch fires -- the name copies
+// through verbatim, exercising the tight-loop iteration count.
+//
+// Case 6 pins the overflow sentinel. dst_cap = 30 is smaller than the
+// fixed overhead (30 bytes of `{"name":"..","kind":<n>,"inode":<n>}\n`
+// syntax) even before any name byte, so the render aborts partway
+// through the "name":"" prefix and returns 0xFFFFFFFFFFFFFFFF (the
+// existing JL_ERR_OVERFLOW). Human-readable copies of cases 0..5 live
+// at tests/goldens/json_line_case<N>_*.txt.
+//
+// =============================================================================
+// TABLE LAYOUT
+// =============================================================================
+//
+//   _jlf_name_offsets    [u64; 7]  -- byte offset into _jlf_names_all
+//   _jlf_name_lens       [u64; 7]  -- input bytes for name_ptr arg
+//   _jlf_dst_caps        [u64; 7]  -- dst_cap arg per case
+//   _jlf_kind_nibbles    [u64; 7]  -- kind arg per case (always 1)
+//   _jlf_inodes          [u64; 7]  -- inode arg per case (always 42)
+//   _jlf_expected_lens   [u64; 7]  -- expected return (0xFFF... =>
+//                                     overflow expected; byte-diff skipped)
+//   _jlf_golden_offsets  [u64; 7]  -- byte offset into _jlf_golden_all
+//                                     (ignored for overflow cases)
+//   _jlf_names_all       [u8; 139] -- packed input names
+//   _jlf_golden_all      [u8; 339] -- packed expected outputs
+//   _jlf_scratch         [u64; 32] -- 256-byte render dst (@align(8))
+//
+// =============================================================================
+// PUBLIC ENTRY POINTS
+// =============================================================================
+//
+//   json_line_fixtures_case_count() -> u64        -- JLF_CASE_COUNT (7)
+//   json_line_fixtures_run(case_idx) -> u64       -- 0 pass; err+idx on fail
+//   json_line_fixtures_verify_all() -> u64        -- fail-fast walk
+//
+// The verifier signatures match the M4 fixture convention documented
+// in tests/README.md so a future harness iterates every module
+// through a uniform `<name>_verify_all` call.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`JsonLineFixtures`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates:
+//     7 (case cap), 256 (scratch cap), 104/139/339 (table sizes).
+//     Sentinels via `mov rax, imm64` stores; the 0xFFFFFFFFFFFFFFFF
+//     overflow marker stages into r11 for the equality compare against
+//     rax, matching the JsonLine idiom.
+//   - Byte reads (diff loop) use `xor rax, rax; mov_b rax, [ptr]` per
+//     #1248, staged through r11 so the addressing mode is [reg] only
+//     (no [reg + reg] byte reads per U1606).
+//   - r10 / r11 are scratch.
+//   - Labels prefixed jlf_.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   json_line_render      -- JsonLine (src/json_line.pdx)
+
+module JsonLineFixtures = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let JLF_OK               : u64 = 0
+  pub let JLF_ERR_LEN_MISMATCH : u64 = 0xFFFFEB80    // + case_idx (0..6)
+  pub let JLF_ERR_BYTE_MISMATCH: u64 = 0xFFFFEB90    // + case_idx (0..6)
+  pub let JLF_ERR_BAD_CASE_IDX : u64 = 0xFFFFEB9F
+
+  pub let JLF_CASE_COUNT       : u64 = 7
+
+  // ==========================================================================
+  // Per-case name offsets into _jlf_names_all.
+  //
+  //   case 0 -> 0    ("foo.txt"     7 bytes)
+  //   case 1 -> 7    (`foo"bar`     7 bytes)
+  //   case 2 -> 14   (`foo\bar`     7 bytes, 0x5C mid)
+  //   case 3 -> 21   ("foo<LF>bar"  7 bytes, 0x0A mid)
+  //   case 4 -> 28   ("foo<SOH>bar" 7 bytes, 0x01 mid)
+  //   case 5 -> 35   (`a` * 104, offset shared with case 6)
+  //   case 6 -> 35   (same bytes as case 5; overflow test)
+  // ==========================================================================
+  pub let _jlf_name_offsets : [u64; 7] = [ 0, 7, 14, 21, 28, 35, 35 ]
+
+  // ==========================================================================
+  // Per-case input name lengths (bytes).
+  // ==========================================================================
+  pub let _jlf_name_lens : [u64; 7] = [ 7, 7, 7, 7, 7, 104, 104 ]
+
+  // ==========================================================================
+  // Per-case dst_cap. Case 6 forces overflow via a small buffer.
+  // ==========================================================================
+  pub let _jlf_dst_caps : [u64; 7] = [ 256, 256, 256, 256, 256, 256, 30 ]
+
+  // ==========================================================================
+  // Per-case kind_nibble (always 1 -- one-byte decimal).
+  // ==========================================================================
+  pub let _jlf_kind_nibbles : [u64; 7] = [ 1, 1, 1, 1, 1, 1, 1 ]
+
+  // ==========================================================================
+  // Per-case inode (always 42 -- two-byte decimal).
+  // ==========================================================================
+  pub let _jlf_inodes : [u64; 7] = [ 42, 42, 42, 42, 42, 42, 42 ]
+
+  // ==========================================================================
+  // Per-case expected return.
+  //
+  //   case 0: 39   ("foo.txt")
+  //   case 1: 40   (`foo\"bar`)
+  //   case 2: 40   (`foo\\bar`)
+  //   case 3: 40   (`foo\nbar`)
+  //   case 4: 44   (`foobar`)
+  //   case 5: 136  (a*104 + fixed 32 syntax bytes)
+  //   case 6: 0xFFFFFFFFFFFFFFFF  (JL_ERR_OVERFLOW -- undersized dst_cap)
+  // ==========================================================================
+  pub let _jlf_expected_lens : [u64; 7] = [
+      39,
+      40,
+      40,
+      40,
+      44,
+      136,
+      0xFFFFFFFFFFFFFFFF
+  ]
+
+  // ==========================================================================
+  // Per-case byte offset into _jlf_golden_all.
+  //
+  //   case 0 -> 0    (39 bytes)
+  //   case 1 -> 39   (40 bytes)
+  //   case 2 -> 79   (40 bytes)
+  //   case 3 -> 119  (40 bytes)
+  //   case 4 -> 159  (44 bytes)
+  //   case 5 -> 203  (136 bytes)
+  //   case 6 -> 0    (overflow case -- offset ignored)
+  // ==========================================================================
+  pub let _jlf_golden_offsets : [u64; 7] = [ 0, 39, 79, 119, 159, 203, 0 ]
+
+  // ==========================================================================
+  // Packed input names (139 bytes total).
+  //
+  //   ASCII: 'a'=0x61 'b'=0x62 'f'=0x66 'o'=0x6F 'r'=0x72 't'=0x74
+  //          'x'=0x78 '.'=0x2E '"'=0x22 '\\'=0x5C
+  //   Control bytes: 0x0A=LF, 0x01=SOH
+  //
+  // Layout matches _jlf_name_offsets exactly.
+  // ==========================================================================
+  pub let _jlf_names_all : [u8; 139] = [
+      // case 0: "foo.txt" (7 bytes)
+      0x66, 0x6F, 0x6F, 0x2E, 0x74, 0x78, 0x74,
+      // case 1: `foo"bar` (7 bytes; 0x22 quote at index 3)
+      0x66, 0x6F, 0x6F, 0x22, 0x62, 0x61, 0x72,
+      // case 2: `foo\bar` (7 bytes; 0x5C backslash at index 3)
+      0x66, 0x6F, 0x6F, 0x5C, 0x62, 0x61, 0x72,
+      // case 3: "foo<LF>bar" (7 bytes; 0x0A newline at index 3)
+      0x66, 0x6F, 0x6F, 0x0A, 0x62, 0x61, 0x72,
+      // case 4: "foo<SOH>bar" (7 bytes; 0x01 SOH at index 3)
+      0x66, 0x6F, 0x6F, 0x01, 0x62, 0x61, 0x72,
+      // case 5 / case 6: 'a' * 104 (0x61)
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61
+  ]
+
+  // ==========================================================================
+  // Packed expected outputs (339 bytes total).
+  //
+  //   ASCII: '{'=0x7B '}'=0x7D '"'=0x22 ':'=0x3A ','=0x2C '\\'=0x5C
+  //          'n'=0x6E 'a'=0x61 'm'=0x6D 'e'=0x65 'k'=0x6B 'i'=0x69
+  //          'd'=0x64 'o'=0x6F 'f'=0x66 't'=0x74 'x'=0x78 'r'=0x72
+  //          'b'=0x62 'u'=0x75 '1'=0x31 '4'=0x34 '2'=0x32 '0'=0x30
+  //          '.'=0x2E LF=0x0A
+  //
+  // Layout matches _jlf_golden_offsets exactly.
+  // ==========================================================================
+  pub let _jlf_golden_all : [u8; 339] = [
+      // ---- case 0 (39 bytes): {"name":"foo.txt","kind":1,"inode":42}\n
+      0x7B, 0x22, 0x6E, 0x61, 0x6D, 0x65, 0x22, 0x3A,   // {"name":
+      0x22, 0x66, 0x6F, 0x6F, 0x2E, 0x74, 0x78, 0x74,   // "foo.txt
+      0x22, 0x2C, 0x22, 0x6B, 0x69, 0x6E, 0x64, 0x22,   // ","kind"
+      0x3A, 0x31, 0x2C, 0x22, 0x69, 0x6E, 0x6F, 0x64,   // :1,"inod
+      0x65, 0x22, 0x3A, 0x34, 0x32, 0x7D, 0x0A,         // e":42}\n
+
+      // ---- case 1 (40 bytes): {"name":"foo\"bar","kind":1,"inode":42}\n
+      0x7B, 0x22, 0x6E, 0x61, 0x6D, 0x65, 0x22, 0x3A,   // {"name":
+      0x22, 0x66, 0x6F, 0x6F, 0x5C, 0x22, 0x62, 0x61,   // "foo\"ba
+      0x72, 0x22, 0x2C, 0x22, 0x6B, 0x69, 0x6E, 0x64,   // r","kind
+      0x22, 0x3A, 0x31, 0x2C, 0x22, 0x69, 0x6E, 0x6F,   // ":1,"ino
+      0x64, 0x65, 0x22, 0x3A, 0x34, 0x32, 0x7D, 0x0A,   // de":42}\n
+
+      // ---- case 2 (40 bytes): {"name":"foo\\bar","kind":1,"inode":42}\n
+      0x7B, 0x22, 0x6E, 0x61, 0x6D, 0x65, 0x22, 0x3A,   // {"name":
+      0x22, 0x66, 0x6F, 0x6F, 0x5C, 0x5C, 0x62, 0x61,   // "foo\\ba
+      0x72, 0x22, 0x2C, 0x22, 0x6B, 0x69, 0x6E, 0x64,   // r","kind
+      0x22, 0x3A, 0x31, 0x2C, 0x22, 0x69, 0x6E, 0x6F,   // ":1,"ino
+      0x64, 0x65, 0x22, 0x3A, 0x34, 0x32, 0x7D, 0x0A,   // de":42}\n
+
+      // ---- case 3 (40 bytes): {"name":"foo\nbar","kind":1,"inode":42}\n
+      0x7B, 0x22, 0x6E, 0x61, 0x6D, 0x65, 0x22, 0x3A,   // {"name":
+      0x22, 0x66, 0x6F, 0x6F, 0x5C, 0x6E, 0x62, 0x61,   // "foo\nba
+      0x72, 0x22, 0x2C, 0x22, 0x6B, 0x69, 0x6E, 0x64,   // r","kind
+      0x22, 0x3A, 0x31, 0x2C, 0x22, 0x69, 0x6E, 0x6F,   // ":1,"ino
+      0x64, 0x65, 0x22, 0x3A, 0x34, 0x32, 0x7D, 0x0A,   // de":42}\n
+
+      // ---- case 4 (44 bytes): {"name":"foobar","kind":1,"inode":42}\n
+      0x7B, 0x22, 0x6E, 0x61, 0x6D, 0x65, 0x22, 0x3A,   // {"name":
+      0x22, 0x66, 0x6F, 0x6F, 0x5C, 0x75, 0x30, 0x30,   // "foo\u00
+      0x30, 0x31, 0x62, 0x61, 0x72, 0x22, 0x2C, 0x22,   // 01bar","
+      0x6B, 0x69, 0x6E, 0x64, 0x22, 0x3A, 0x31, 0x2C,   // kind":1,
+      0x22, 0x69, 0x6E, 0x6F, 0x64, 0x65, 0x22, 0x3A,   // "inode":
+      0x34, 0x32, 0x7D, 0x0A,                           // 42}\n
+
+      // ---- case 5 (136 bytes): {"name":"<a*104>","kind":1,"inode":42}\n
+      // Fixed prefix (9 bytes): {"name":"
+      0x7B, 0x22, 0x6E, 0x61, 0x6D, 0x65, 0x22, 0x3A, 0x22,
+      // Name (104 bytes of 'a' = 0x61)
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+      // Fixed suffix (23 bytes): ","kind":1,"inode":42}\n
+      0x22, 0x2C, 0x22, 0x6B, 0x69, 0x6E, 0x64, 0x22,
+      0x3A, 0x31, 0x2C, 0x22, 0x69, 0x6E, 0x6F, 0x64,
+      0x65, 0x22, 0x3A, 0x34, 0x32, 0x7D, 0x0A
+  ]
+
+  // ==========================================================================
+  // .bss render scratch -- 256 bytes = 32 u64 lanes. Sized to hold the
+  // widest expected case (136 bytes for case 5) with headroom; the
+  // overflow case uses dst_cap=30 which is smaller than the scratch,
+  // so the render aborts on cap check rather than damaging the buffer.
+  // ==========================================================================
+  pub let mut _jlf_scratch : [u64; 32] = uninit @align(8)
+
+  // ==========================================================================
+  // json_line_fixtures_case_count() -> u64
+  //
+  // Leaf.
+  // ==========================================================================
+  pub let json_line_fixtures_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "v1.1.1 finding 3: return JLF_CASE_COUNT (7) for a harness iterating via json_line_fixtures_run. Leaf pure function. paideia-as conformance: no test mnemonic; no cmp. Labels prefixed jlfcc_.",
+      block: {
+        mov rax, 7;                              // JLF_CASE_COUNT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // json_line_fixtures_run(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI: case_idx (0..6)
+  //   RAX: 0 on pass; JLF_ERR_LEN_MISMATCH + case_idx or
+  //        JLF_ERR_BYTE_MISMATCH + case_idx on fail;
+  //        JLF_ERR_BAD_CASE_IDX on out-of-range.
+  //
+  // Sequence:
+  //   (1) Bounds check case_idx < 7.
+  //   (2) Load expected_len (r12), expected_ptr (r13), scratch (r14).
+  //   (3) Build the 6-arg call:
+  //         rdi = &_jlf_scratch
+  //         rsi = _jlf_dst_caps[case_idx]
+  //         rdx = &_jlf_names_all + _jlf_name_offsets[case_idx]
+  //         rcx = _jlf_name_lens[case_idx]
+  //         r8  = _jlf_kind_nibbles[case_idx]
+  //         r9  = _jlf_inodes[case_idx]
+  //   (4) Call json_line_render.
+  //   (5) cmp rax, r12; mismatch -> JLF_ERR_LEN_MISMATCH + case_idx.
+  //   (6) If r12 is the overflow sentinel (0xFFFFFFFFFFFFFFFF), the
+  //       match on rax already proves the render aborted correctly --
+  //       skip the byte-diff and return pass.
+  //   (7) Otherwise byte-diff scratch[0..r12] vs expected[0..r12];
+  //       first mismatch -> JLF_ERR_BYTE_MISMATCH + case_idx.
+  //
+  // Register plan (non-leaf; five callee-save pushes for pipeline
+  // stability across the json_line_render call):
+  //   rbx = case_idx (survives)
+  //   r12 = expected_len (survives; may be sentinel)
+  //   r13 = expected_ptr (survives)
+  //   r14 = scratch base (survives)
+  //   r15 = byte loop counter
+  //
+  // Alignment: 5 pushes = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48;
+  // 48 % 16 == 0. Aligned at the json_line_render call site. No pad.
+  // Matched 5 pops.
+  // ==========================================================================
+  pub let json_line_fixtures_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "v1.1.1 finding 3: run one json_line_render case. Bounds-check case_idx < 7 -> JLF_ERR_BAD_CASE_IDX. Precompute expected_len (r12) and expected_ptr (r13 = &_jlf_golden_all + _jlf_golden_offsets[case_idx]) before touching rdi..r9 since those alias the call-arg registers. LEA _jlf_scratch into r14. Build the 6-arg call: rdi=r14, rsi=_jlf_dst_caps[case_idx], rdx=(&_jlf_names_all + _jlf_name_offsets[case_idx]), rcx=_jlf_name_lens[case_idx], r8=_jlf_kind_nibbles[case_idx], r9=_jlf_inodes[case_idx]. Each of the six load steps uses r11 and rax as scratch. call json_line_render. Compare rax to r12 -> JLF_ERR_LEN_MISMATCH + case_idx on mismatch. If r12 equals the 0xFFFFFFFFFFFFFFFF overflow sentinel (staged in r11), the match already proves the render aborted correctly -- skip the byte-diff (else the loop would iterate 2^64 times) and return pass. Otherwise byte-diff loop iterates r15 = 0..r12: stage r11 = r14 + r15, xor rax + mov_b rax gives actual byte; stage r11 = r13 + r15, xor rax + mov_b rax gives expected; cmp -> JLF_ERR_BYTE_MISMATCH + case_idx on first drift. Byte reads use [reg]-only addressing (no [reg+reg] mov_b per U1606). Five callee-save pushes (rbx=case_idx, r12=expected_len, r13=expected_ptr, r14=scratch, r15=byte counter) = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48; aligned. paideia-as: no test mnemonic; largest cmp immediate 7 or 256; JLF_ERR_* sentinels via mov rax, imm64 + add. Labels prefixed jlfr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+
+        // Bounds check.
+        cmp rbx, 7;                              // JLF_CASE_COUNT
+        jae jlfr_bad_idx;
+
+        // Load expected_len into r12.
+        lea r11, [rip + _jlf_expected_lens];
+        mov r12, [r11 + rbx * 8];
+
+        // Compute expected_ptr into r13 = &_jlf_golden_all + offset.
+        lea r11, [rip + _jlf_golden_offsets];
+        mov rax, [r11 + rbx * 8];                // rax = offset
+        lea r11, [rip + _jlf_golden_all];
+        add r11, rax;
+        mov r13, r11;
+
+        // Scratch address.
+        lea r14, [rip + _jlf_scratch];
+
+        // ---- Build the six-argument call ----------------------------
+        mov rdi, r14;                            // dst_ptr
+
+        // rsi = _jlf_dst_caps[case_idx]
+        lea r11, [rip + _jlf_dst_caps];
+        mov rsi, [r11 + rbx * 8];
+
+        // rdx = &_jlf_names_all + _jlf_name_offsets[case_idx]
+        lea r11, [rip + _jlf_name_offsets];
+        mov rax, [r11 + rbx * 8];
+        lea r11, [rip + _jlf_names_all];
+        add r11, rax;
+        mov rdx, r11;
+
+        // rcx = _jlf_name_lens[case_idx]
+        lea r11, [rip + _jlf_name_lens];
+        mov rcx, [r11 + rbx * 8];
+
+        // r8 = _jlf_kind_nibbles[case_idx]
+        lea r11, [rip + _jlf_kind_nibbles];
+        mov r8, [r11 + rbx * 8];
+
+        // r9 = _jlf_inodes[case_idx]
+        lea r11, [rip + _jlf_inodes];
+        mov r9, [r11 + rbx * 8];
+
+        call json_line_render;
+
+        // Length check.
+        cmp rax, r12;
+        jne jlfr_len_fail;
+
+        // If r12 is the overflow sentinel, the equality above already
+        // proves the render aborted correctly -- skip the byte-diff.
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp r12, r11;
+        je  jlfr_ok;
+
+        // Byte-diff loop.
+        xor r15, r15;
+
+      jlfr_diff_loop:
+        cmp r15, r12;
+        jae jlfr_ok;
+
+        // Load actual byte from scratch.
+        mov r11, r14;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];
+        mov r10, rax;                            // r10 = actual byte
+
+        // Load expected byte.
+        mov r11, r13;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];                        // rax = expected byte
+
+        cmp rax, r10;
+        jne jlfr_byte_fail;
+
+        add r15, 1;
+        jmp jlfr_diff_loop;
+
+      jlfr_ok:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      jlfr_len_fail:
+        mov rax, 0xFFFFEB80;                     // JLF_ERR_LEN_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      jlfr_byte_fail:
+        mov rax, 0xFFFFEB90;                     // JLF_ERR_BYTE_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      jlfr_bad_idx:
+        mov rax, 0xFFFFEB9F;                     // JLF_ERR_BAD_CASE_IDX
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // json_line_fixtures_verify_all() -> u64
+  //
+  // Walk case_idx 0..6; first non-zero return propagates.
+  //
+  // Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24;
+  // entry rsp %16==8; 8+24=32; aligned at json_line_fixtures_run
+  // call site.
+  // ==========================================================================
+  pub let json_line_fixtures_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "v1.1.1 finding 3: fail-fast walk of all 7 json_line_render cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp %16==8; 8+24=32; aligned at json_line_fixtures_run call site. Matched add rsp,8 + 2 pops. paideia-as: no test; cmp against 7 fits imm32. Labels prefixed jlfva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 7;                              // JLF_CASE_COUNT
+
+      jlfva_loop:
+        cmp rbx, r12;
+        jae jlfva_ok;
+
+        mov rdi, rbx;
+        call json_line_fixtures_run;
+        cmp rax, 0;
+        jne jlfva_out;
+
+        add rbx, 1;
+        jmp jlfva_loop;
+
+      jlfva_ok:
+        xor rax, rax;
+      jlfva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

@@ -192,7 +192,7 @@ module SemanticEmit = structure {
   pub let _se_schema_name : [u8; 17] = "PdxFsDirEntry@0.1"
 
   // ls.ENH-021 (#39): summary schema name for the trailing
-  // PdxLsSummaryRecord@0.1 record. 21 bytes, no NUL terminator (matches
+  // PdxLsSummaryRecord@0.1 record. 22 bytes, no NUL terminator (matches
   // the _se_schema_name convention -- spipe_schema_id_from_name takes an
   // explicit length). Wire body carries {entry_count, total_bytes,
   // total_blocks, filtered_count}. The bind + send wiring lands with
@@ -200,6 +200,14 @@ module SemanticEmit = structure {
   // ships so a follow-up round has a stable literal to imprint.
   //
   // Awaiting #30 (schema registry migration off placeholder hash).
+  //
+  // ls.ENH-021 (#39) deferred -- retire this comment when the summary
+  // record ships. v1.1.1 (debugger finding 2): this literal is inert
+  // .rodata that no emit path reads today; kept only so the ENH-021
+  // wiring lands as a use-site edit rather than a re-declare. When
+  // ship happens, caps.decl :: declares_output_schemas gains the
+  // PdxLsSummaryRecord@0.1 entry and src/schema_dump.pdx's catalog
+  // grows the matching second line in the same commit.
   pub let _se_summary_schema_name : [u8; 22] = "PdxLsSummaryRecord@0.1"
 
   // ==========================================================================

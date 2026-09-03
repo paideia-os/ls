@@ -1,13 +1,36 @@
 # ls — status
 
 **Wave:** R50 (Wave 2)
-**Version:** 1.1.0
-**Current milestone:** Enhancement v1.x wave -- 1.1.0 wiring wave
-LANDED (ENH-002 + ENH-005 + ENH-006 + ENH-007 + ENH-022 + ENH-023 per
+**Version:** 1.1.1
+**Current milestone:** Enhancement v1.x wave -- 1.1.1 patch LANDED
+(post-1.1.0 debugger findings 1 + 2 + 3: JSON name escape + schema
+catalog retraction of the phantom PdxLsSummaryRecord@0.1 line + fixture
+coverage for both new renderers). 1.1.0 wiring wave remains LANDED
+(ENH-002 + ENH-005 + ENH-006 + ENH-007 + ENH-022 + ENH-023 per
 `design/enhancement-plan.md` §5-§6, bundled per the `libpdx-elevate`
 v1.1.2 pattern). 1.0.1 honesty patch remains LANDED
 (ENH-003 + ENH-011 + ENH-012). M5 (signed 1.0 release) closed at
 v1.0.0.
+
+The 1.1.1 patch closes three post-1.1.0 debugger findings without
+touching the frozen 1.0 interface. Finding 1 (HIGH) rewrites the
+`JsonLine::json_line_render` name-copy loop to RFC 8259 escape every
+`"`, `\\`, and control byte (with two-byte shortcuts for `\b \t \n
+\f \r` and a six-byte `\u00XX` fallback for the remaining 0x00-0x1F
+band). The pre-1.1.1 justification claimed `sys_pdxfs_open`'s mint
+contract rejected those bytes; the debugger verified that path is a
+stub cap-mint constructor with no name argument, and the real name-
+writing path is `tmpfs_create` which caps length only -- so any
+filename with a `"` split the JSON-lines stream. Finding 2 (MEDIUM)
+retracts `PdxLsSummaryRecord@0.1` from `SchemaDump`'s catalog (ls
+never emits a record of that shape; the summary emitter is deferred
+to ENH-021 #39). `caps.decl` is now the single authoritative source
+for the two mirrors -- the `SchemaDump` catalog literal and the
+`SemanticEmit` schema-name literals -- and gains an INVARIANT note.
+Finding 3 (LOW) adds `tests/json_line_fixtures.pdx` (7 byte-exact
+cases including three shortcut escapes, the `\u00XX` fallback, the
+max-input clamp, and the overflow sentinel) and
+`tests/schema_dump_fixtures.pdx` (1 byte-diff of the catalog).
 
 The wiring wave activates six flags whose primitives shipped at M2 or
 whose recogniser landed at M1-002 but whose runner-side dispatch

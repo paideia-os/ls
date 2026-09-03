@@ -1,0 +1,1 @@
+{"name":"foo\u0001bar","kind":1,"inode":42}

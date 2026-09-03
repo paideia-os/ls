@@ -1,4 +1,4 @@
-// src/schema_dump.pdx -- ls.ENH-006 (paideia-os/ls#19) v1.1.0
+// src/schema_dump.pdx -- ls.ENH-006 (paideia-os/ls#19) v1.1.1
 //
 // SchemaDump module: emit the ls tool's declared output-schema catalog
 // on KIND_TTY(write) when the invoker passes --schema (AS_BIT_SCHEMA).
@@ -6,6 +6,14 @@
 // records the tool produces on its semantic-pipe stdout endpoint
 // without invoking a full listing pass -- the "semantically-queryable
 // terminal" thesis the plan doc §D2 pins.
+//
+// AUTHORITATIVE SOURCE: `caps.decl :: declares_output_schemas`. This
+// file's catalog table MUST list exactly the schema names caps.decl
+// declares. Any drift is a schema-registry integrity bug -- a consumer
+// that BLAKE3-hashes a name in this catalog and receives no record of
+// that shape has been mis-directed. The two must move in lock-step:
+// grow caps.decl first, then extend the .rodata table below and the
+// catalog length constant.
 //
 // =============================================================================
 // SCOPE
@@ -33,16 +41,24 @@
 //
 //   <name>@<version> -- <purpose>\n
 //
-// The v1.1.0 catalog carries the two schemas ls declares on its
-// semantic-pipe stdout (see caps.decl declares_output_schemas + the
-// literal name strings in src/semantic_emit.pdx):
+// v1.1.1 (debugger finding 2): single-entry catalog.
 //
-//   PdxFsDirEntry@0.1 -- directory entry emitted per accepted row\n
-//   PdxLsSummaryRecord@0.1 -- run summary emitted after last entry\n
+//   PdxFsDirEntry@0.1 -- one record per directory entry\n
 //
-// The name strings are the byte-exact values libpdx-semantic-pipe's
-// spipe_schema_id_from_name computes hashes over -- so a consumer that
-// captures this output can BLAKE3-hash them and index a schema
+// The v1.1.0 catalog also listed `PdxLsSummaryRecord@0.1`, but ls
+// never emitted a record of that shape on any code path (the trailing
+// summary record is deferred until ls.ENH-021 (#39) ships the emitter
+// wiring). Advertising a schema no consumer ever sees on the pipe is
+// a schema-registry integrity defect: a consumer that BLAKE3-hashes
+// the second name and preloads a decoder for it silently binds a
+// schema id that will never receive a matching record. Retracting
+// keeps caps.decl :: declares_output_schemas the single authoritative
+// source; when the summary record ships, both caps.decl and this
+// table gain the second entry in the same commit.
+//
+// The name string is the byte-exact value libpdx-semantic-pipe's
+// spipe_schema_id_from_name computes hashes over -- so a consumer
+// that captures this output can BLAKE3-hash it and index a schema
 // registry directly (once the registry ships at libpdx-schema-
 // registry.M1 per ENH-010's plan-doc entry).
 //
@@ -87,20 +103,17 @@ module SchemaDump = structure {
   // ==========================================================================
   // Catalog bytes (.rodata).
   //
-  // Two lines, LF-terminated. Character count pinned in
-  // _sd_catalog_len so a future addition of a third schema is a
-  // one-line change (append bytes, bump the len).
+  // v1.1.1: single line, LF-terminated. Character count pinned in
+  // _sd_catalog_len; adding a schema is a one-line change (extend the
+  // literal + bump the len + add the entry to caps.decl in the same
+  // commit).
   //
-  //   "PdxFsDirEntry@0.1 -- directory entry emitted per accepted row\n"
-  //     = 62 bytes
-  //   "PdxLsSummaryRecord@0.1 -- run summary emitted after last entry\n"
-  //     = 63 bytes
-  //   TOTAL = 125 bytes
+  //   "PdxFsDirEntry@0.1 -- one record per directory entry\n" = 52 bytes
   // ==========================================================================
-  pub let _sd_catalog_bytes : [u8; 125] =
-      "PdxFsDirEntry@0.1 -- directory entry emitted per accepted row\nPdxLsSummaryRecord@0.1 -- run summary emitted after last entry\n"
+  pub let _sd_catalog_bytes : [u8; 52] =
+      "PdxFsDirEntry@0.1 -- one record per directory entry\n"
 
-  pub let _sd_catalog_len : u64 = 125
+  pub let _sd_catalog_len : u64 = 52
 
   // ==========================================================================
   // schema_dump_emit() -> u64
@@ -115,19 +128,19 @@ module SchemaDump = structure {
   // Register plan (non-leaf; one push for alignment):
   //   r12 = alignment pad (SysV callee-save; unused body-side)
   //   rdi = buf_ptr (LEA _sd_catalog_bytes)
-  //   rsi = len (125)
+  //   rsi = len (52)
   //   rax = return
   // ==========================================================================
   pub let schema_dump_emit : () -> u64 !{mem, sysreg} @{} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "ls.ENH-006 (#19) v1.1.0: emit the ls schema catalog on KIND_TTY(write) so `ls --schema` discovers the two typed records ls produces on its semantic-pipe stdout without invoking a listing pass. Two lines packed as a 125-byte .rodata literal, LF-terminated, one tty_write call so a concurrent stdout writer cannot interleave. Called by Dispatch::ls_dispatch BEFORE Runner::runner_ls when AS_BIT_SCHEMA is set on _as_flag_bits; no DirListRecord audit frame opens (no directory read) and no semantic-pipe record emits (this is stateless read-of-manifest, not a listing). Return: SD_OK (0) on success -> Dispatch folds to LS_OK via ExitMap -> exit 0. Negative-errno u64 from sys_write (bit 63 set) -> SD_ERR_TTY (0xFFFFEB23 mirror of LS_ERR_TTY_WRITE) -> ExitMap folds to exit 4. Single r12 push for SysV alignment across the nested tty_write call: entry rsp % 16 == 8; +8 -> 0; matched pop before every ret. paideia-as conformance: no test mnemonic; imm 125 fits imm32; SD_ERR_TTY stages via mov rax, imm64 (return, not compare); no byte read (the packed literal is handed to tty_write by pointer). Labels prefixed sde_.",
+      justification: "ls.ENH-006 (#19) v1.1.1: emit the ls schema catalog on KIND_TTY(write) so `ls --schema` discovers the typed records ls produces on its semantic-pipe stdout without invoking a listing pass. Single line packed as a 52-byte .rodata literal, LF-terminated, one tty_write call so a concurrent stdout writer cannot interleave. v1.1.1 shrinks the catalog from 125 bytes / two entries to 52 bytes / one entry, retracting the phantom PdxLsSummaryRecord@0.1 line (debugger finding 2: ls never emits a record of that shape on any code path; the summary emitter is deferred to ls.ENH-021 #39). caps.decl :: declares_output_schemas is the authoritative source both this catalog and the SemanticEmit schema-name .rodata mirror; the three must move in lock-step when a new schema ships. Called by Dispatch::ls_dispatch BEFORE Runner::runner_ls when AS_BIT_SCHEMA is set on _as_flag_bits; no DirListRecord audit frame opens (no directory read) and no semantic-pipe record emits (this is stateless read-of-manifest, not a listing). Return: SD_OK (0) on success -> Dispatch folds to LS_OK via ExitMap -> exit 0. Negative-errno u64 from sys_write (bit 63 set) -> SD_ERR_TTY (0xFFFFEB23 mirror of LS_ERR_TTY_WRITE) -> ExitMap folds to exit 4. Single r12 push for SysV alignment across the nested tty_write call: entry rsp % 16 == 8; +8 -> 0; matched pop before every ret. paideia-as conformance: no test mnemonic; imm 52 fits imm32; SD_ERR_TTY stages via mov rax, imm64 (return, not compare); no byte read (the packed literal is handed to tty_write by pointer). Labels prefixed sde_ (schema_dump_emit).",
       block: {
         push r12;
 
         lea r11, [rip + _sd_catalog_bytes];
         mov rdi, r11;                          // buf_ptr
-        mov rsi, 125;                          // len (=_sd_catalog_len)
+        mov rsi, 52;                           // len (=_sd_catalog_len)
         call tty_write;
 
         // sys_write returns bytes on success, negative-errno on

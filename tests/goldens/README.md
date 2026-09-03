@@ -61,6 +61,35 @@ tenth + unit letter, base-2):
 None of the six carries a trailing byte -- `human_size_render` does
 not emit a terminator, so the golden has none either.
 
+## JSON-line cases (`tests/json_line_fixtures.pdx`)
+
+`JsonLine::json_line_render` cases pinning the v1.1.1 RFC 8259 escape
+overhaul (post-1.1.0 debugger finding 1). Every case runs with
+`kind=1, inode=42`; the resulting fixed decimals are `1` and `42`.
+
+- `json_line_case0_plain.txt`      -- `foo.txt` (passthrough, 39 bytes)
+- `json_line_case1_quote.txt`      -- `foo"bar` -> `\"` (40 bytes)
+- `json_line_case2_backslash.txt`  -- `foo\bar` -> `\\` (40 bytes)
+- `json_line_case3_newline.txt`    -- `foo<LF>bar` -> `\n` (40 bytes)
+- `json_line_case4_ctrl01.txt`     -- `foo<SOH>bar` -> `` (44 bytes)
+- `json_line_case5_max_input.txt`  -- `a` * 104 at the input clamp
+                                      (136 bytes, no expansion)
+
+Case 6 (overflow-sentinel) has no golden `.txt` -- the fixture asserts
+the return value directly (`0xFFFFFFFFFFFFFFFF`, the existing
+`JL_ERR_OVERFLOW`) with a deliberately undersized `dst_cap = 30`.
+
+## Schema-dump catalog (`tests/schema_dump_fixtures.pdx`)
+
+- `schema_dump_catalog.txt`        -- v1.1.1 single-entry catalog:
+  `PdxFsDirEntry@0.1 -- one record per directory entry\n` (52 bytes).
+  The v1.1.0 catalog was two lines / 125 bytes; the second line
+  advertised a `PdxLsSummaryRecord@0.1` schema that ls never emitted
+  on any code path (post-1.1.0 debugger finding 2). Retracted in
+  v1.1.1; `caps.decl :: declares_output_schemas` is now the single
+  authoritative source and any future schema addition ships the
+  catalog line + the golden byte-array edit in the same commit.
+
 ## Regenerating
 
 There is no automated regeneration script. `human_size_render` and
