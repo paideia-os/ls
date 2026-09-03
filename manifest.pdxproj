@@ -8,8 +8,10 @@
 # and lines starting with `#` are ignored. The M5 build produces the
 # byte-frozen 1.0 artefact: one output at build-out/ls (the elaborated
 # .pdx -> ELF-like Paideia binary) plus a caps-manifest copy at
-# build-out/ls.caps for the InitCap sidecar packaging step + the
-# dual-signed manifest.pdxsig staged under dist/ per design/release-1.0.md.
+# build-out/ls.caps for the InitCap sidecar packaging step. The signed
+# manifest.pdxsig is composed at `pkgs.paideia-os` mirror-push time per
+# design/mirror-push.md (see 1.0.1 CHANGELOG ENH-012 retraction); it is
+# NOT built in-tree and is NOT staged under dist/.
 #
 # paideia-as v0.33+ is the required toolchain floor (mov_b narrow-load
 # mnemonic + @align attribute on .bss slots per the #1248 mitigation).
@@ -18,7 +20,7 @@
 # a new PAIDEIA_AS_VER KV record.
 
 name        = ls
-version     = 1.0.0
+version     = 1.0.1
 kind        = tool
 entry       = Dispatch::ls_dispatch
 output      = build-out/ls
@@ -76,10 +78,12 @@ deps:
 
 # --- Test list (order-insensitive; every fixture lives at tests/). ------
 tests:
-  - tests/color_fixtures.pdx      # M4-001 10 dispatch + 3 SGR goldens
-  - tests/owner_fixtures.pdx      # M4-002 7 row + 2 wire-cap cases
-  - tests/exit_matrix.pdx         # M4-003 13-case exit-code map witness
-  - tests/schema_golden.pdx       # M4-004 hash-imprint + 144-byte wire body
+  - tests/color_fixtures.pdx        # M4-001 10 dispatch + 3 SGR goldens
+  - tests/owner_fixtures.pdx        # M4-002 7 row + 2 wire-cap cases
+  - tests/exit_matrix.pdx           # M4-003 13-case exit-code map witness
+  - tests/schema_golden.pdx         # M4-004 hash-imprint + 144-byte wire body
+  - tests/long_format_fixtures.pdx  # 1.0.1 ENH-003 3 long_format_line cases
+  - tests/human_size_fixtures.pdx   # 1.0.1 ENH-003 6 human_size_render cases
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49/R50 tool observes and every M1
@@ -94,18 +98,17 @@ compliance:
   - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call
 
 # --- Release-1.0 signing block references ------------------------------
-# The dual-signed manifest.pdxsig for this build lives at
-# dist/manifest.pdxsig once `paideia-as release` composes it. Its wire
-# shape, KV body contents, and the scaffold-epoch discipline for the
-# two ML-DSA-65 signature slots are pinned in design/release-1.0.md.
-# In the scaffold epoch (pre-R32) both signature slots are bytewise
-# zero and the verifier returns SIG_UNSIGNED_SCAFFOLD (per
-# design/drivers/blob-policy.md §1.7 in the paideia-os repo); the
-# 1.0 tag freezes the shape, and a re-sign at R32 will bump the
-# manifest header's `created_unix_secs` field without a source-tree
-# change.
+# The dual-signed manifest.pdxsig for this build is composed at
+# `pkgs.paideia-os` mirror-push time per design/mirror-push.md (see
+# 1.0.1 CHANGELOG ENH-012 retraction). It is NOT built in-tree and
+# is NOT staged under dist/. It lives at
+# pkgs.paideia-os/ls/<version>/manifest.pdxsig. Its wire shape, KV
+# body contents, and the scaffold-epoch discipline for the two
+# ML-DSA-65 signature slots are pinned in design/release-1.0.md; the
+# 1.0 tag freezes those, and a re-sign at R32 rewrites the mirror
+# copy only (source tree unchanged).
 release:
-  manifest_pdxsig = dist/manifest.pdxsig
-  changelog_entry = CHANGELOG.md#100
+  manifest_pdxsig = pkgs.paideia-os/ls/1.0.1/manifest.pdxsig
+  changelog_entry = CHANGELOG.md#101
   pdxdoc          = doc/ls.pdxdoc
-  mirror_target   = pkgs.paideia-os/ls/1.0.0/
+  mirror_target   = pkgs.paideia-os/ls/1.0.1/

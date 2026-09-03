@@ -1,0 +1,471 @@
+// tests/long_format_fixtures.pdx -- ls.ENH-003 (paideia-os/ls#17)
+//
+// LongFormatFixtures module: byte-exact goldens for
+// LongFormat::long_format_line (src/long_format.pdx). Retires the
+// enhancement-plan §2.2 "dead code with no fixture" status for the
+// `-l` line renderer; when ENH-002 (#24) wires it into the read
+// loop, the wire shape is already pinned.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// FIXTURE module. Three cases pinning one kind letter each. Every
+// column is exercised (kind letter, three octal mode digits, owner
+// u:<row>, size, ns:<mtime> and name) and the single-space column
+// separator + terminating '\n' are pinned exactly.
+//
+//   idx  kind  mode    owner  size   mtime                name              bytes
+//   -----------------------------------------------------------------------------
+//    0   file  0o644   0      12103  1755808140000000000  argv_surface.pdx   56
+//    1   dir   0o755   0      4096   1755850440000000000  src                42
+//    2  link   0o777   42     21     1755808141000000000  link               42
+//
+// All three cases run with human_size_flag = 0 so the size column
+// emits raw decimal via render_dec_u64. The `-h` path is exercised
+// by HumanSizeFixtures below (tests/human_size_fixtures.pdx); this
+// fixture pins the long-format skeleton independent of the size
+// dispatch.
+//
+// Human-readable copies of each expected byte sequence live at
+// tests/goldens/long_format_case<N>_*.txt. Those files are NOT read
+// by this fixture (paideia-as fixture modules have no filesystem
+// cap); they exist so a human reviewing a regression can eyeball
+// the expected output. The .rodata tables below are the authority
+// the comparator asserts against.
+//
+// =============================================================================
+// PACKING OF kind_mode_flags
+// =============================================================================
+//
+// LongFormat::long_format_line packs three small fields into rcx per
+// the 6-parameter SysV register cap (P0276):
+//
+//   bits [3:0]   kind_nibble
+//   bits [12:4]  mode_bits (9 bits)
+//   bit  [13]    human_size_flag
+//
+// For the three fixture cases:
+//   case 0: 0x8 | (0x1A4 << 4) | (0 << 13) = 0x1A48   (file, 0o644)
+//   case 1: 0x4 | (0x1ED << 4) | (0 << 13) = 0x1ED4   (dir,  0o755)
+//   case 2: 0xA | (0x1FF << 4) | (0 << 13) = 0x1FFA   (link, 0o777)
+//
+// =============================================================================
+// TABLE LAYOUT
+// =============================================================================
+//
+//   _lff_kind_mode_flags   [u64; 3]  -- kind_nibble | (mode << 4)
+//   _lff_sizes             [u64; 3]  -- size_bytes per case
+//   _lff_extras            [u64; 6]  -- pairs of (mtime_ns, owner_row);
+//                                       LEA base + case_idx * 16 hands
+//                                       long_format_line its extra_ptr.
+//   _lff_name_offsets      [u64; 3]  -- byte offset into _lff_names_all
+//                                       for each case's NUL-terminated
+//                                       name.
+//   _lff_names_all         [u8; 26]  -- all three names packed with NUL
+//                                       terminators: "argv_surface.pdx\0"
+//                                       (17) + "src\0" (4) + "link\0" (5)
+//                                       = 26 bytes.
+//   _lff_expected_lens     [u64; 3]  -- byte count long_format_line
+//                                       must return per case
+//   _lff_offsets           [u64; 3]  -- byte offset into _lff_golden_all
+//   _lff_golden_all        [u8; 140] -- all three expected lines packed
+//                                       contiguously: 56 + 42 + 42 = 140
+//
+// The single packed goldens array + per-case offset+len table lets
+// one comparator loop cover every case without a per-case symbol
+// dispatch.
+//
+// =============================================================================
+// PUBLIC ENTRY POINTS
+// =============================================================================
+//
+//   long_format_fixtures_case_count() -> u64          -- LFF_CASE_COUNT (3)
+//   long_format_fixtures_run(case_idx) -> u64         -- 0 pass; err+idx on fail
+//   long_format_fixtures_verify_all() -> u64          -- fail-fast walk
+//
+// The verifier signatures match the M4 fixture convention documented
+// in tests/README.md so a future harness iterates every module
+// through a uniform `<name>_verify_all` call.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`LongFormatFixtures`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates:
+//     3 (case cap), 128 (scratch cap), 16 (extra-row stride).
+//     The LFF_ERR_* sentinels are mov rax, imm64 stores or ADD-
+//     relative arithmetic.
+//   - Byte reads (diff loop) use `xor rax, rax; mov_b rax, [ptr]`
+//     per #1248, staged through r11 so the addressing mode is [reg]
+//     only (no [reg + reg] byte reads, per U1606).
+//   - r10 / r11 are scratch.
+//   - Labels prefixed lff_.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   long_format_line     -- LongFormat (src/long_format.pdx)
+
+module LongFormatFixtures = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let LFF_OK               : u64 = 0
+  pub let LFF_ERR_LEN_MISMATCH : u64 = 0xFFFFEB40    // + case_idx (0..2)
+  pub let LFF_ERR_BYTE_MISMATCH: u64 = 0xFFFFEB50    // + case_idx (0..2)
+  pub let LFF_ERR_BAD_CASE_IDX : u64 = 0xFFFFEB5F
+
+  pub let LFF_CASE_COUNT       : u64 = 3
+
+  // ==========================================================================
+  // Per-case inputs -- kind_mode_flags packing.
+  //
+  //   case 0: file    kind_nibble=0x8, mode=0o644 (0x1A4) -> 0x1A48
+  //   case 1: dir     kind_nibble=0x4, mode=0o755 (0x1ED) -> 0x1ED4
+  //   case 2: symlink kind_nibble=0xA, mode=0o777 (0x1FF) -> 0x1FFA
+  // ==========================================================================
+  pub let _lff_kind_mode_flags : [u64; 3] = [
+      0x1A48,     // case 0
+      0x1ED4,     // case 1
+      0x1FFA      // case 2
+  ]
+
+  // ==========================================================================
+  // Per-case size_bytes (goes to r8 for the call).
+  // ==========================================================================
+  pub let _lff_sizes : [u64; 3] = [
+      12103,      // case 0
+      4096,       // case 1
+      21          // case 2
+  ]
+
+  // ==========================================================================
+  // Per-case extra_ptr contents: pairs of (mtime_ns, owner_row) per
+  // long_format.pdx §SCOPE. Total 6 u64 = 48 bytes; LEA base +
+  // case_idx * 16 recovers the pair.
+  // ==========================================================================
+  pub let _lff_extras : [u64; 6] = [
+      1755808140000000000, 0,        // case 0: mtime, owner_row=0
+      1755850440000000000, 0,        // case 1: mtime, owner_row=0
+      1755808141000000000, 42        // case 2: mtime, owner_row=42
+  ]
+
+  // ==========================================================================
+  // Per-case name offsets into _lff_names_all.
+  //
+  //   case 0 -> offset 0   ("argv_surface.pdx\0" spans [0..17))
+  //   case 1 -> offset 17  ("src\0"              spans [17..21))
+  //   case 2 -> offset 21  ("link\0"             spans [21..26))
+  // ==========================================================================
+  pub let _lff_name_offsets : [u64; 3] = [ 0, 17, 21 ]
+
+  // ==========================================================================
+  // Packed NUL-terminated names (26 bytes total).
+  //
+  //   ASCII: 'a'=0x61 'r'=0x72 'g'=0x67 'v'=0x76 '_'=0x5F 's'=0x73
+  //          'u'=0x75 'f'=0x66 'c'=0x63 'e'=0x65 '.'=0x2E 'p'=0x70
+  //          'd'=0x64 'x'=0x78 'l'=0x6C 'i'=0x69 'n'=0x6E 'k'=0x6B
+  // ==========================================================================
+  pub let _lff_names_all : [u8; 26] = [
+      // "argv_surface.pdx\0"
+      0x61, 0x72, 0x67, 0x76, 0x5F, 0x73, 0x75, 0x72,
+      0x66, 0x61, 0x63, 0x65, 0x2E, 0x70, 0x64, 0x78,
+      0x00,
+      // "src\0"
+      0x73, 0x72, 0x63, 0x00,
+      // "link\0"
+      0x6C, 0x69, 0x6E, 0x6B, 0x00
+  ]
+
+  // ==========================================================================
+  // Expected byte counts long_format_line must return per case.
+  // ==========================================================================
+  pub let _lff_expected_lens : [u64; 3] = [
+      56,         // case 0
+      42,         // case 1
+      42          // case 2
+  ]
+
+  // ==========================================================================
+  // Byte offset into _lff_golden_all for each case.
+  //
+  //   case 0 -> [0..56)     56 bytes
+  //   case 1 -> [56..98)    42 bytes
+  //   case 2 -> [98..140)   42 bytes
+  // ==========================================================================
+  pub let _lff_offsets : [u64; 3] = [ 0, 56, 98 ]
+
+  // ==========================================================================
+  // Packed goldens (140 bytes total). Each case pins the byte-for-
+  // byte output of long_format_line for the paired input row.
+  //
+  // Case 0 (56 bytes): "- 644 u:0 12103 ns:1755808140000000000 argv_surface.pdx\n"
+  // Case 1 (42 bytes): "d 755 u:0 4096 ns:1755850440000000000 src\n"
+  // Case 2 (42 bytes): "l 777 u:42 21 ns:1755808141000000000 link\n"
+  //
+  // Human-readable copies live under tests/goldens/.
+  // ==========================================================================
+  pub let _lff_golden_all : [u8; 140] = [
+      // ---- case 0: "- 644 u:0 12103 ns:1755808140000000000 argv_surface.pdx\n" (56 bytes)
+      0x2D, 0x20, 0x36, 0x34, 0x34, 0x20, 0x75, 0x3A,   // "- 644 u:"
+      0x30, 0x20, 0x31, 0x32, 0x31, 0x30, 0x33, 0x20,   // "0 12103 "
+      0x6E, 0x73, 0x3A, 0x31, 0x37, 0x35, 0x35, 0x38,   // "ns:17558"
+      0x30, 0x38, 0x31, 0x34, 0x30, 0x30, 0x30, 0x30,   // "08140000"
+      0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x20, 0x61,   // "000000 a"
+      0x72, 0x67, 0x76, 0x5F, 0x73, 0x75, 0x72, 0x66,   // "rgv_surf"
+      0x61, 0x63, 0x65, 0x2E, 0x70, 0x64, 0x78, 0x0A,   // "ace.pdx\n"
+
+      // ---- case 1: "d 755 u:0 4096 ns:1755850440000000000 src\n" (42 bytes)
+      0x64, 0x20, 0x37, 0x35, 0x35, 0x20, 0x75, 0x3A,   // "d 755 u:"
+      0x30, 0x20, 0x34, 0x30, 0x39, 0x36, 0x20, 0x6E,   // "0 4096 n"
+      0x73, 0x3A, 0x31, 0x37, 0x35, 0x35, 0x38, 0x35,   // "s:175585"
+      0x30, 0x34, 0x34, 0x30, 0x30, 0x30, 0x30, 0x30,   // "04400000"
+      0x30, 0x30, 0x30, 0x30, 0x30, 0x20, 0x73, 0x72,   // "00000 sr"
+      0x63, 0x0A,                                       // "c\n"
+
+      // ---- case 2: "l 777 u:42 21 ns:1755808141000000000 link\n" (42 bytes)
+      0x6C, 0x20, 0x37, 0x37, 0x37, 0x20, 0x75, 0x3A,   // "l 777 u:"
+      0x34, 0x32, 0x20, 0x32, 0x31, 0x20, 0x6E, 0x73,   // "42 21 ns"
+      0x3A, 0x31, 0x37, 0x35, 0x35, 0x38, 0x30, 0x38,   // ":1755808"
+      0x31, 0x34, 0x31, 0x30, 0x30, 0x30, 0x30, 0x30,   // "14100000"
+      0x30, 0x30, 0x30, 0x30, 0x20, 0x6C, 0x69, 0x6E,   // "0000 lin"
+      0x6B, 0x0A                                        // "k\n"
+  ]
+
+  // ==========================================================================
+  // .bss render scratch -- 128 bytes = 16 u64 lanes. Sized bigger
+  // than the widest expected (56 bytes for case 0) so a corrupt
+  // oversized render surfaces as a length mismatch (rax > 56) rather
+  // than an overflow bomb.
+  // ==========================================================================
+  pub let mut _lff_scratch : [u64; 16] = uninit @align(8)
+
+  // ==========================================================================
+  // long_format_fixtures_case_count() -> u64
+  //
+  // Leaf.
+  // ==========================================================================
+  pub let long_format_fixtures_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-003 (#17): return LFF_CASE_COUNT (3) for a harness iterating via long_format_fixtures_run. Leaf pure function. paideia-as conformance: no test mnemonic; no cmp. Labels prefixed lffcc_.",
+      block: {
+        mov rax, 3;                              // LFF_CASE_COUNT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // long_format_fixtures_run(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI: case_idx (0..2)
+  //   RAX: 0 on pass; LFF_ERR_LEN_MISMATCH + case_idx or
+  //        LFF_ERR_BYTE_MISMATCH + case_idx on fail;
+  //        LFF_ERR_BAD_CASE_IDX on out-of-range.
+  //
+  // Sequence:
+  //   (1) Bounds check case_idx < 3.
+  //   (2) Load expected_len (r12), expected_ptr (r13), scratch (r14).
+  //   (3) Build the 6-arg call:
+  //         rdi = &_lff_scratch
+  //         rsi = 128
+  //         rdx = &_lff_names_all + _lff_name_offsets[case_idx]
+  //         rcx = _lff_kind_mode_flags[case_idx]
+  //         r8  = _lff_sizes[case_idx]
+  //         r9  = &_lff_extras + case_idx * 16
+  //   (4) Call long_format_line.
+  //   (5) cmp rax, r12; mismatch -> LFF_ERR_LEN_MISMATCH.
+  //   (6) Byte-diff loop scratch[0..len] vs expected[0..len]; first
+  //       mismatch -> LFF_ERR_BYTE_MISMATCH.
+  //
+  // Register plan (non-leaf; five callee-save pushes for pipeline
+  // stability across the long_format_line call):
+  //   rbx = case_idx (survives)
+  //   r12 = expected_len (survives)
+  //   r13 = expected_ptr (survives)
+  //   r14 = scratch base (survives)
+  //   r15 = byte loop counter
+  //
+  // Alignment: 5 pushes = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48;
+  // 48 % 16 == 0. Aligned at the long_format_line call site. No pad.
+  // Matched 5 pops.
+  // ==========================================================================
+  pub let long_format_fixtures_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-003 (#17): run one long_format_line case. Bounds-check case_idx < 3 -> LFF_ERR_BAD_CASE_IDX. Precompute expected_len (r12) and expected_ptr (r13 = &_lff_golden_all + _lff_offsets[case_idx]) before touching rdi..r9 since those alias the call-arg registers. LEA _lff_scratch into r14. Build the 6-arg call: rdi=r14, rsi=128, rdx=(&_lff_names_all + _lff_name_offsets[case_idx]), rcx=_lff_kind_mode_flags[case_idx], r8=_lff_sizes[case_idx], r9=(&_lff_extras + case_idx*16). Each of the six load steps uses r11 and rax as scratch; r10 is unused here. call long_format_line. Compare rax to r12 -> LFF_ERR_LEN_MISMATCH + case_idx on mismatch. Byte-diff loop iterates r15 = 0..r12: stage r11 = r14 + r15, xor rax + mov_b rax gives actual byte; stage r11 = r13 + r15, xor rax + mov_b rax gives expected; cmp -> LFF_ERR_BYTE_MISMATCH + case_idx on first drift. Byte reads use [reg]-only addressing (no [reg+reg] mov_b per U1606). Five callee-save pushes (rbx=case_idx, r12=expected_len, r13=expected_ptr, r14=scratch, r15=byte counter) = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48; aligned. paideia-as: no test mnemonic; largest cmp immediate 3 or 128; LFF_ERR_* sentinels via mov rax, imm64 + add. Labels prefixed lffr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+
+        // Bounds check.
+        cmp rbx, 3;                              // LFF_CASE_COUNT
+        jae lffr_bad_idx;
+
+        // Load expected_len into r12.
+        lea r11, [rip + _lff_expected_lens];
+        mov r12, [r11 + rbx * 8];
+
+        // Compute expected_ptr into r13 = &_lff_golden_all + offset.
+        lea r11, [rip + _lff_offsets];
+        mov rax, [r11 + rbx * 8];                // rax = offset
+        lea r11, [rip + _lff_golden_all];
+        add r11, rax;
+        mov r13, r11;
+
+        // Scratch address.
+        lea r14, [rip + _lff_scratch];
+
+        // ---- Build the six-argument call ----------------------------
+        mov rdi, r14;                            // dst_ptr
+        mov rsi, 128;                            // dst_cap
+
+        // rdx = &_lff_names_all + _lff_name_offsets[case_idx]
+        lea r11, [rip + _lff_name_offsets];
+        mov rax, [r11 + rbx * 8];
+        lea r11, [rip + _lff_names_all];
+        add r11, rax;
+        mov rdx, r11;
+
+        // rcx = _lff_kind_mode_flags[case_idx]
+        lea r11, [rip + _lff_kind_mode_flags];
+        mov rcx, [r11 + rbx * 8];
+
+        // r8 = _lff_sizes[case_idx]
+        lea r11, [rip + _lff_sizes];
+        mov r8, [r11 + rbx * 8];
+
+        // r9 = &_lff_extras + case_idx * 16
+        mov rax, rbx;
+        shl rax, 4;
+        lea r11, [rip + _lff_extras];
+        add r11, rax;
+        mov r9, r11;
+
+        call long_format_line;
+
+        // Length check.
+        cmp rax, r12;
+        jne lffr_len_fail;
+
+        // Byte-diff loop.
+        xor r15, r15;
+
+      lffr_diff_loop:
+        cmp r15, r12;
+        jae lffr_ok;
+
+        // Load actual byte from scratch.
+        mov r11, r14;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];
+        mov r10, rax;                            // r10 = actual byte
+
+        // Load expected byte.
+        mov r11, r13;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];                        // rax = expected byte
+
+        cmp rax, r10;
+        jne lffr_byte_fail;
+
+        add r15, 1;
+        jmp lffr_diff_loop;
+
+      lffr_ok:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      lffr_len_fail:
+        mov rax, 0xFFFFEB40;                     // LFF_ERR_LEN_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      lffr_byte_fail:
+        mov rax, 0xFFFFEB50;                     // LFF_ERR_BYTE_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      lffr_bad_idx:
+        mov rax, 0xFFFFEB5F;                     // LFF_ERR_BAD_CASE_IDX
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // long_format_fixtures_verify_all() -> u64
+  //
+  // Walk case_idx 0..2; first non-zero return propagates.
+  //
+  // Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24;
+  // entry rsp %16==8; 8+24=32; aligned at long_format_fixtures_run
+  // call site.
+  // ==========================================================================
+  pub let long_format_fixtures_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-003 (#17): fail-fast walk of all 3 long_format_line cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp %16==8; 8+24=32; aligned at long_format_fixtures_run call site. Matched add rsp,8 + 2 pops. paideia-as: no test; cmp against 3 fits imm32. Labels prefixed lffva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 3;                              // LFF_CASE_COUNT
+
+      lffva_loop:
+        cmp rbx, r12;
+        jae lffva_ok;
+
+        mov rdi, rbx;
+        call long_format_fixtures_run;
+        cmp rax, 0;
+        jne lffva_out;
+
+        add rbx, 1;
+        jmp lffva_loop;
+
+      lffva_ok:
+        xor rax, rax;
+      lffva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

@@ -1,18 +1,63 @@
 # ls -- CHANGELOG
 
-Every ls release ships as a dual-signed `manifest.pdxsig` per
-`design/release-1.0.md`; the CHANGELOG entry moves in lock-step with
-the version stamp in `manifest.pdxproj` and the git tag.
+Signing is performed at `pkgs.paideia-os` mirror-push time (see
+`design/mirror-push.md`); the in-tree release does NOT carry a signed
+`manifest.pdxsig`. The CHANGELOG entry moves in lock-step with the
+version stamp in `manifest.pdxproj` and the git tag; the signed
+`manifest.pdxsig` is composed against those inputs at the mirror push
+and stored under `pkgs.paideia-os/ls/<version>/`.
 
 ## [Unreleased]
 
-Enhancement v1.x wave (`design/enhancement-plan.md`), 1.0.1
-honesty-patch items landing ahead of the 1.1.0 wiring milestone. No
-frozen 1.0 interface (argv surface, exit-code map, wire body shape,
-`caps.decl`) changes in this section.
+Post-1.0.1 items on the Enhancement v1.x wave
+(`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
+exit-code map, wire body shape, `caps.decl`) changes in this section.
+
+## [1.0.1] -- 2026-09-03 -- honesty patch (ENH-003 + ENH-011 + ENH-012) <a id="101"></a>
+
+**1.0.1 (v1.x honesty patch).** Closes the seven 1.0.1-wave items from
+`design/enhancement-plan.md` §5 (ENH-001/003/004/010/011/012/013) --
+the three headline honesty items (ENH-003 + ENH-011 + ENH-012, from
+which this release takes its subtitle) plus the four cheap-and-
+unblocked items that had already landed under `[Unreleased]` before
+the version bump. Every entry is either a documentation retraction,
+a test-harness tightening, or a small correctness fold behind an
+existing entry point: no change to any frozen 1.0 interface (argv
+surface, exit-code map, wire body, `caps.decl`) per §"Compatibility
+rules from 1.0 forward". Wave 2 (ENH-002 / ENH-005 / ENH-006 /
+ENH-007) lands as 1.1.0 per the same plan.
 
 ### Fixed
 
+- **ENH-003** (#17) -- adds byte-exact golden fixtures for
+  `LongFormat::long_format_line` (`tests/long_format_fixtures.pdx`,
+  3 cases: file mode 0o644, dir mode 0o755, symlink mode 0o777 with
+  deterministic uid/gid/size/mtime) and for
+  `HumanSize::human_size_render` (`tests/human_size_fixtures.pdx`,
+  6 boundary cases: 0, 999, 1024 -> "1.0K", 1536 -> "1.5K",
+  1048576 -> "1.0M", 1099511627776 -> "1.0T"). Human-readable copies
+  of each expected byte sequence live under `tests/goldens/`; the
+  `.pdx` fixtures pin the same bytes as `.rodata` tables so the
+  comparator is byte-for-byte exact without a filesystem read.
+  Retires the enhancement-plan §2.2 "dead code with no fixture"
+  status for both renderers at HEAD.
+- **ENH-001** (#23) -- `doc/ls.pdxdoc`'s `-l`/`-l -h`/`--schema`
+  examples now match the actual renderers: `kind` is `-` (not `f`),
+  `mode` is three raw octal digits (not POSIX `rwx` glyphs), `mtime`
+  is `ns:<decimal>` (not ISO-8601), `-h` sizes carry a tenths digit
+  (`11.8K`, not `12K`), and the `-lh` clustered form is replaced with
+  `-l -h` (clustered short flags are rejected upstream). Also adds
+  the disclosure `README.md` already carried: at 1.0.0 `-l`/`-h`/
+  `--color=` are parsed but not wired into the read loop, `--json`/
+  `--schema` have no consumer, and the `--schema` example is a
+  proposed shape (`ls.ENH-006`), not shipped output.
+- **ENH-004** (#18) -- `Dispatch::ls_dispatch` now folds its return
+  value through `ExitMap::exit_map` before returning. Previously
+  `exit_map` had no caller anywhere in the tool and `ls_dispatch`
+  (this repo's `entry`, since there is no `_start` frame) returned a
+  raw `0xFFFFEBxx` sentinel verbatim; a successful run exited
+  `0xFFFFEB00`, not `0`. Every documented exit code (0/2/3/4, README
+  and `doc/ls.pdxdoc`) is now what the tool actually returns.
 - **ENH-010** (#27) -- `SemanticEmit::sem_emit_reset` now imprints the
   real `PdxFsDirEntry@0.1` schema id via `libpdx-semantic-pipe::
   Schema::spipe_schema_id_from_name`, replacing the M3-001 placeholder
@@ -24,38 +69,60 @@ frozen 1.0 interface (argv surface, exit-code map, wire body shape,
   see `src/semantic_emit.pdx` §Schema Hash for the pre-BLAKE3 bridge
   rationale. `tests/schema_golden.pdx`'s hash golden is updated to
   match.
-- **ENH-004** (#18) -- `Dispatch::ls_dispatch` now folds its return
-  value through `ExitMap::exit_map` before returning. Previously
-  `exit_map` had no caller anywhere in the tool and `ls_dispatch`
-  (this repo's `entry`, since there is no `_start` frame) returned a
-  raw `0xFFFFEBxx` sentinel verbatim; a successful run exited
-  `0xFFFFEB00`, not `0`. Every documented exit code (0/2/3/4, README
-  and `doc/ls.pdxdoc`) is now what the tool actually returns.
-- **ENH-001** (#23) -- `doc/ls.pdxdoc`'s `-l`/`-l -h`/`--schema`
-  examples now match the actual renderers: `kind` is `-` (not `f`),
-  `mode` is three raw octal digits (not POSIX `rwx` glyphs), `mtime`
-  is `ns:<decimal>` (not ISO-8601), `-h` sizes carry a tenths digit
-  (`11.8K`, not `12K`), and the `-lh` clustered form is replaced with
-  `-l -h` (clustered short flags are rejected upstream). Also adds
-  the disclosure `README.md` already carried: at 1.0.0 `-l`/`-h`/
-  `--color=` are parsed but not wired into the read loop, `--json`/
-  `--schema` have no consumer, and the `--schema` example is a
-  proposed shape (`ls.ENH-006`), not shipped output.
+- **ENH-011** (#20) -- `tools/build.sh` now iterates every
+  `tests/*.pdx` and invokes `paideia-as test <fixture>` on each,
+  propagating a non-zero exit. The runtime evaluator is not on-tree
+  today (paideia-as-test §"Phase-4-m12-001: execution gates on the
+  runtime evaluator") so this is a parse+encode smoke pass per
+  fixture rather than a live `verify_all` run; it does catch the
+  scenario the pre-1.0.1 script missed (a fixture that fails to
+  parse under a paideia-as bump, silently non-invoked). Also adds a
+  link-check pass that greps `src/` and `tests/` for orphan
+  `[legacy: ... OK]` fingerprint tags: any decl missing the
+  space-`OK`-space closing is flagged. Currently a no-op (no legacy
+  tags in the ls repo) but active as a forward guard for the
+  God-file refactor cadence.
+- **ENH-012** (#21) -- retracts the `dist/manifest.pdxsig` claim.
+  CHANGELOG, STATUS, and `manifest.pdxproj` previously stated the
+  in-tree release ships `dist/manifest.pdxsig` "composed per
+  `design/release-1.0.md`". `dist/` does not exist in the tree
+  (`git ls-files dist` empty) and was never composed. The signing
+  chain moves to `pkgs.paideia-os` mirror-push time (per
+  `design/mirror-push.md`): the manifest is composed and signed by
+  the mirror pipeline against the tagged source tree + tar, and lives
+  at `pkgs.paideia-os/ls/<version>/manifest.pdxsig`. The in-tree
+  release carries CHANGELOG + STATUS + `manifest.pdxproj` + tag only.
+  The four-way byte-identity invariant `design/mirror-push.md` builds
+  degrades to a three-way (compose / mirror-standalone / in-tar);
+  the tree copy is dropped from the invariant.
 - **ENH-013** (#22) -- drops the phantom `libpdx-elevate @ ^1.0` entry
   from `manifest.pdxproj`'s `deps:` block. No call site in this repo
   ever consumed it; `libpdx-elevate` appears elsewhere only as a
   naming-convention precedent cited in comments, not as a real
   dependency.
 
+### Deferred (upstream fix)
+
+- `src/argv_surface.pdx:266-268` carries a one-line NOTE pointing to
+  libpdx-argv#42, which tracks the argv[0] convention: `parse_argv`
+  currently treats argv[0] as a real arg, which is silently latent
+  until multi-path listing (#29 / ENH-014) lands. The fix belongs
+  upstream in libpdx-argv, not here; ls's passthrough is byte-for-
+  byte unchanged in 1.0.1 and will land automatically when the
+  libpdx-argv fix bumps the submodule.
+
 ## [1.0.0] -- 2026-08-22 <a id="100"></a>
 
 **M5 close.** First byte-frozen release. The 1.0 line is the R50
 Wave-2 core-utility contract that every downstream consumer (shell
 pipelines, `doc ls`, `pkg install ls`, the R50.M5 QEMU smoke) binds
-against. Version bump + git tag `v1.0.0` + dual-signed
-`manifest.pdxsig` under `dist/` all move together per this repo's
-version discipline (mirrors `feedback_paideia_as_version_discipline`
-across the ls repo boundary).
+against. Version bump + git tag `v1.0.0` move together per this
+repo's version discipline (mirrors
+`feedback_paideia_as_version_discipline` across the ls repo boundary).
+NB: the original 1.0.0 entry claimed a `dist/manifest.pdxsig` shipped
+with the tree; that was incorrect (see 1.0.1 ENH-012). The signed
+manifest is composed at `pkgs.paideia-os` mirror-push time and lives
+at `pkgs.paideia-os/ls/1.0.0/manifest.pdxsig`.
 
 ### Contract frozen at 1.0
 
@@ -93,13 +160,16 @@ across the ls repo boundary).
 ### Release artefacts (M5-001, #15)
 
 - `manifest.pdxproj` version bumped to `1.0.0`.
-- `dist/manifest.pdxsig` composed per `design/release-1.0.md` --
-  header + KV body + 2 x ML-DSA-65 sigblock. In the scaffold epoch
-  (pre-R32) both signature slots are bytewise zero and the pkg
-  verifier returns `SIG_UNSIGNED_SCAFFOLD` per
-  `design/drivers/blob-policy.md` §1.7 in the paideia-os repo. A
-  re-sign at R32 bumps the header's `created_unix_secs` field
-  without a source-tree change.
+- `manifest.pdxsig` is NOT in the tree (see 1.0.1 ENH-012). The
+  signed manifest is composed and dual-signed at `pkgs.paideia-os`
+  mirror-push time per `design/mirror-push.md`, against the tagged
+  source tree + `pkg.tar`. It lives at
+  `pkgs.paideia-os/ls/1.0.0/manifest.pdxsig`, not under `dist/` in
+  this repo. In the scaffold epoch (pre-R32) both signature slots
+  are bytewise zero and the pkg verifier returns
+  `SIG_UNSIGNED_SCAFFOLD` per `design/drivers/blob-policy.md` §1.7 in
+  the paideia-os repo. A re-sign at R32 rewrites the mirror copy
+  only; the source tree does not change.
 - `doc/ls.pdxdoc` -- man-equivalent for `doc ls` per `design/tooling/
   plan.md` I7.
 - `CHANGELOG.md` (this file).

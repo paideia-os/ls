@@ -1,23 +1,30 @@
 # ls — status
 
 **Wave:** R50 (Wave 2)
-**Version:** 1.0.0
-**Current milestone:** M5 (signed 1.0 release) — CLOSED.
-M5-001 landed `manifest.pdxproj` (version bumped 0.4→1.0.0), `CHANGELOG.md`
-with the 1.0.0 entry freezing the argv surface + PdxFsDirEntry wire body +
-exit-code map + caps.decl at 1.0, `doc/ls.pdxdoc` (man-equivalent per I7
-for the `doc ls` back-end), and `design/release-1.0.md` pinning the
-`manifest.pdxsig` wire shape KV-record-by-record in the scaffold epoch
-(all-zero signature slots → SIG_UNSIGNED_SCAFFOLD verdict per
-`design/drivers/blob-policy.md` §1.7 in paideia-os; live re-sign at R32
-bumps `created_unix_secs` only). M5-002 landed `design/mirror-push.md`
-(mirror tree layout + five-step release-day runbook + four-way byte-
-identity invariant across compose/in-tar/mirror-standalone/mirror-in-tar
-copies of `manifest.pdxsig` + the ten-step `pkg install ls` end-to-end
-path), `tests/pkg_install_e2e.md` (17-row scaffold-epoch/R32-flip matrix
-witness), and tagged `v1.0.0` on `main`. Live QEMU smoke is deferred to
-pkg-repo M5-002 which reads this repo's matrix row order to compose its
-own assertions against a live pkg substrate.
+**Version:** 1.0.1
+**Current milestone:** Enhancement v1.x wave -- 1.0.1 honesty patch
+LANDED (ENH-003 + ENH-011 + ENH-012 per `design/enhancement-plan.md`
+§5-§6). M5 (signed 1.0 release) closed at v1.0.0.
+
+M5-001 landed `manifest.pdxproj` (version bumped 0.4→1.0.0),
+`CHANGELOG.md` with the 1.0.0 entry freezing the argv surface +
+PdxFsDirEntry wire body + exit-code map + caps.decl at 1.0,
+`doc/ls.pdxdoc` (man-equivalent per I7 for the `doc ls` back-end),
+and `design/release-1.0.md` pinning the `manifest.pdxsig` wire shape
+KV-record-by-record in the scaffold epoch (all-zero signature slots
+→ SIG_UNSIGNED_SCAFFOLD verdict per `design/drivers/blob-policy.md`
+§1.7 in paideia-os). The signed `manifest.pdxsig` is composed and
+dual-signed at `pkgs.paideia-os` mirror-push time (see 1.0.1
+ENH-012 retraction and Follow-ups §Release-artefact discipline
+below); the in-tree release does NOT carry it. M5-002 landed
+`design/mirror-push.md` (mirror tree layout + five-step release-day
+runbook + three-way byte-identity invariant across
+compose/mirror-standalone/mirror-in-tar copies of
+`manifest.pdxsig`), `tests/pkg_install_e2e.md` (17-row
+scaffold-epoch/R32-flip matrix witness), and tagged `v1.0.0` on
+`main`. Live QEMU smoke is deferred to pkg-repo M5-002 which reads
+this repo's matrix row order to compose its own assertions against a
+live pkg substrate.
 
 M4 recap: M4-001 landed `tests/color_fixtures.pdx` (10 dispatch + 3 SGR
 goldens). M4-002 landed `tests/owner_fixtures.pdx` (7 row + 2
@@ -116,10 +123,12 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   sub-band → I4 exit-code mapping (0 / 2 / 3 / 4). Used by the
   M4-003 fixture and by the eventual R14b `_start` frame.
 - `manifest.pdxproj` — paideia-as build manifest at version
-  `1.0.0` (M5-001): source list (15 files), test list (4
-  fixtures), version-pinned deps, and the `release:` block
-  naming `dist/manifest.pdxsig`, the CHANGELOG anchor, the
-  `.pdxdoc`, and the mirror target.
+  `1.0.1` (M5-001 + 1.0.1 honesty patch): source list (15 files),
+  test list (6 fixtures; 1.0.1 adds `long_format_fixtures.pdx` and
+  `human_size_fixtures.pdx` per ENH-003), version-pinned deps, and
+  the `release:` block referring the signed `manifest.pdxsig` to
+  the mirror target (see 1.0.1 ENH-012 retraction), plus the
+  CHANGELOG anchor and the `.pdxdoc`.
 - `CHANGELOG.md` — Keep-a-Changelog-style release log (M5-001).
   The `[1.0.0]` entry freezes the 1.0 contract; `[0.1.0]..[0.4.0]`
   roll up M1..M4 close.
@@ -128,8 +137,10 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
   Consumed by `doc ls` per `design/tooling/plan.md` I7 §2.
 - `design/release-1.0.md` — release-1.0 specification (M5-001):
   §1 scaffold epoch, §2 `manifest.pdxsig` KV-record-by-record,
-  §3 release process, §4 byte-identity invariant with the mirror
-  copy, §5 what freezes at 1.0.
+  §3 release process (composed at mirror-push time per 1.0.1
+  ENH-012 retraction, not in-tree), §4 byte-identity invariant
+  with the mirror copy (three-way now the tree copy is dropped),
+  §5 what freezes at 1.0.
 - `design/mirror-push.md` — mirror-push runbook + `pkg install
   ls` end-to-end path (M5-002): §1 mirror tree, §2 five-step
   release-day runbook, §3 four-way byte-identity invariant,
@@ -155,3 +166,36 @@ body at M3-001; live emission lights up once shell.M2 InitCap
 populates ls's cap_table (LS_DIR_CAP_SLOT = 2 for the pre-narrowed
 KIND_PDXFS_FILE(read, `<arg-path>`); LS_STDOUT_ENDPOINT_SLOT = 3
 for the KIND_IPC_ENDPOINT stdout sink).
+
+## Follow-ups
+
+### Release-artefact discipline (1.0.1 ENH-012 retraction)
+
+The pre-1.0.1 CHANGELOG / STATUS / README / `manifest.pdxproj` said
+this repo ships `dist/manifest.pdxsig`; it does not, and it never did
+(`git ls-files dist` is empty at v1.0.0). The retraction is recorded
+in the 1.0.1 CHANGELOG entry (ENH-012, #21). Going forward:
+
+- The in-tree release carries CHANGELOG + STATUS + `manifest.pdxproj`
+  + git tag only. No signed manifest lives under `dist/`.
+- The signed `manifest.pdxsig` is composed and dual-signed by the
+  `pkgs.paideia-os` mirror-push pipeline per `design/mirror-push.md`,
+  against the tagged source tree + `pkg.tar`. It lives at
+  `pkgs.paideia-os/ls/<version>/manifest.pdxsig`.
+- The `design/mirror-push.md` four-way byte-identity invariant
+  degrades to a three-way (compose / mirror-standalone / in-tar). The
+  tree copy is dropped from the invariant.
+- Composing a `manifest.pdxsig` in-repo (as opposed to at mirror-push
+  time) is out of scope until an on-tree ML-DSA-65 signing tool
+  exists (R32 signing chain); attempting it earlier would just pin
+  an all-zero-sigslot artefact whose only purpose is byte identity
+  with the pkg substrate, and the pkg substrate composes its own.
+
+### argv[0] convention (deferred to libpdx-argv)
+
+`src/argv_surface.pdx:266-268` carries a one-line NOTE pointing to
+libpdx-argv#42, which tracks the argv[0] convention: `parse_argv`
+currently treats argv[0] as a real arg, which is silently latent
+until multi-path listing (#29 / ENH-014) lands. The fix belongs
+upstream in libpdx-argv, not here; ls's passthrough stays byte-for-
+byte unchanged until the upstream fix lands and the submodule bumps.

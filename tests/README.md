@@ -32,6 +32,22 @@ sub-band sentinel on fail.
   composition via `SemanticEmit::sem_emit_wire_compose` (a compose-
   only sibling of `sem_emit_entry` added at M4-004 so the wire
   spec is testable without a live libpdx-semantic-pipe substrate).
+- `long_format_fixtures.pdx` — `ls.ENH-003` (#17). Byte-exact
+  goldens for `LongFormat::long_format_line`; 3 cases (file mode
+  0o644, dir mode 0o755, symlink mode 0o777) with deterministic
+  uid/size/mtime. Pins the six-column `-l` layout (`kind mode owner
+  size mtime name\n`, single-space separators). Retires the
+  enhancement-plan §2.2 "dead code with no fixture" status ahead
+  of ENH-002 (#24) wiring `LongFormat` into the read loop.
+- `human_size_fixtures.pdx` — `ls.ENH-003` (#17). Byte-exact
+  goldens for `HumanSize::human_size_render`; 6 boundary cases
+  spanning the fast path (0, 999) and the slow path (1024→`1.0K`,
+  1536→`1.5K`, 1048576→`1.0M`, 1099511627776→`1.0T`). Pins both the
+  base-2 unit dispatch and the tenth-digit derivation.
+- `goldens/` — human-readable copies of each fixture case's
+  expected byte sequence. Not read at build/test time (paideia-as
+  fixture modules have no filesystem cap); the `.rodata` tables in
+  the `.pdx` fixtures are the authority. See `goldens/README.md`.
 
 ## Public entry-point convention
 

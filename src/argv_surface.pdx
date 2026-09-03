@@ -263,6 +263,7 @@ module ArgvSurface = structure {
         call parsed_args_reset;
 
         // ---- drive the parse -------------------------------------------
+        // NOTE: libpdx-argv#42 tracks argv[0] convention (parse_argv currently treats argv[0] as a real arg -- silently latent until #29 lands).
         mov rdi, r12;                      // argv
         mov rsi, r13;                      // argc
         call parse_argv;
