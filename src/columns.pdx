@@ -1,0 +1,552 @@
+// src/columns.pdx -- ls.ENH-018 (paideia-os/ls#36)
+//
+// Columns module: the multi-column fitted-layout primitive. Given a
+// caller-owned array of names (pointer + length pairs), computes the
+// widest column count that fits `term_width` and renders the names
+// column-major (POSIX `ls` default -- column 0 fills top-to-bottom
+// first, then column 1, etc.) into a caller-owned destination buffer.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// One entry point:
+//
+//   columns_layout(names_ptr, lens_ptr, count, term_width, dst_ptr, dst_cap) -> u64
+//
+// `names_ptr` / `lens_ptr` are caller-owned parallel arrays of `count`
+// u64 elements: `names_ptr[i]` is a byte pointer to entry i's name
+// (not necessarily NUL-terminated -- only `lens_ptr[i]` bytes are
+// defined), matching the shape `Runner::runner_ls` already builds at
+// `_rn_col_name_ptrs` / `_rn_col_name_lens` (src/runner.pdx) from its
+// buffered, already-sorted/grouped `_rn_gdf_buf` records. This module
+// has no idea a PdxFsDirEntry record exists -- it only ever sees name
+// bytes and lengths, exactly like `JsonLine::json_line_render` and
+// `LongFormat::long_format_line` do for their own per-entry fields.
+//
+// =============================================================================
+// THE FITTING ALGORITHM
+// =============================================================================
+//
+// Candidate row-counts are tried in ASCENDING order starting at 1 (the
+// most compact, most-columns layout) up to `count` (one column, the
+// guaranteed-fits fallback). For a candidate `rows`, the derived
+// column count is `cols = ceil(count / rows)`, and column c (0-indexed)
+// holds the entries at global index `[c*rows, min((c+1)*rows, count))`
+// -- because `cols` is DERIVED from `rows` this way, every column
+// 0..cols-1 is guaranteed non-empty (there is no "trailing phantom
+// empty column" failure mode a naive "try decreasing cols" search
+// would hit). Each column's width is the max name length among its
+// members; the candidate's total rendered width is the sum of all
+// column widths plus `COL_GAP` (2) between every adjacent pair. The
+// FIRST candidate (smallest rows, i.e. most columns) whose total width
+// fits `term_width` is accepted; ascending order means the first fit
+// found is also the widest (most-columns) fit, matching GNU ls's own
+// "maximum columns that fit" behaviour. `rows == count` (cols == 1) is
+// accepted UNCONDITIONALLY regardless of total width -- a single name
+// longer than `term_width` still gets its own line rather than being
+// truncated or wrapped (see tests/multicol_fixtures.pdx case 4, "one-
+// per-column / very-wide-entry"), matching GNU ls: one filename wider
+// than the terminal collapses the WHOLE listing to one column, not
+// just that row.
+//
+// No multiplication or division instruction is used anywhere in this
+// module (paideia-as strict forbids `neg`/`cqo`/`idiv` and this tree's
+// own convention avoids `imul` in its 2-operand form entirely). Every
+// `ceil(a / b)` this module needs is instead computed by repeated
+// subtraction (subtract `b` from a `remaining` counter, incrementing a
+// result counter each time, until `remaining <= 0`) -- see cl_cols_loop
+// below, the same technique `Runner::runner_ls`'s own comments would
+// reach for if it ever needed one (it doesn't; every offset there is a
+// power-of-two shift). Every `c * rows` this module needs (column
+// start offsets) is likewise never multiplied: `_cl_col_start_buf[c]`
+// is built by an INCREMENTAL running accumulator (`+= rows` once per
+// column, during the same pass that computes each column's width), not
+// recomputed per-column from scratch.
+//
+// =============================================================================
+// RENDER PHASE -- AVOIDING TRAILING WHITESPACE ON A SHORT LAST COLUMN
+// =============================================================================
+//
+// A naive "emit gap+pad after every column except the statically last
+// one" rule is WRONG once a column can be short: in a row where the
+// last populated column falls short of `cols`, that rule still emits a
+// gap after the second-to-last column before discovering (one column
+// later) that there was nothing left to pad against, leaving trailing
+// spaces before the newline. This module instead peeks ONE column
+// ahead using the precomputed `_cl_col_start_buf` before deciding to
+// emit a gap: gap+pad is written after column c's name ONLY IF column
+// c+1 exists (`c+1 < cols`) AND has a real entry in this row
+// (`_cl_col_start_buf[c+1] + row < count`). See tests/
+// multicol_fixtures.pdx case 2 ("uneven-fit") for the executable pin --
+// its second row's last column is empty, and the golden has no
+// trailing spaces before that row's newline.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Columns`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates:
+//     64 (COL_MAX_ENTRIES), 2 (COL_GAP). COL_ERR_OVERFLOW
+//     (0xFFFFFFFFFFFFFFFF) is staged via a `mov r10, imm64` before every
+//     equality compare, never used as a direct `cmp reg, imm`.
+//   - No `and` with a 64-bit immediate anywhere in this module.
+//   - Byte reads/writes (the name/pad/gap/newline emit loops) use
+//     `xor rax, rax; mov_b rax, [reg]` / `mov_b [reg], rax` with
+//     [reg]-only addressing (no `[reg + reg]` mov_b), matching the
+//     `rn_ls_copy_head` idiom in src/runner.pdx.
+//   - No `lea reg, [reg + reg * 8]` -- every scaled-index memory
+//     operand used as a `mov` source/destination has a plain register
+//     base (`[base + idx * 8]`, matching every table lookup elsewhere
+//     in this tree); `lea` itself is reserved for `[rip + sym]` reaches
+//     only.
+//   - `columns_layout` is a LEAF: no CALL instructions anywhere in its
+//     body, so no push/pop parity and no SysV pre-call alignment to
+//     maintain. Every register it touches (rax, rcx, rdx, rsi, rdi,
+//     r8, r9, r10, r11) is caller-save; rbx/rbp/r12-r15 are never
+//     touched. Because the function is a leaf with many sequential
+//     sub-computations, cross-step state (candidate rows/cols, the
+//     per-candidate width/col-start tables, the render cursor, the
+//     current cell's resolved name pointer/length, and the running
+//     bytes-written count) all live in .bss rather than being juggled
+//     across registers -- the same "compute once, stash in .bss"
+//     idiom `Runner::runner_ls` uses for its own mode flags, applied
+//     here to a single-function's local working set instead of a
+//     whole function's flag state.
+//   - Labels prefixed `cl_`.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called by:
+//   runner_ls -- Runner (src/runner.pdx), `rn_ls_multicol_render` label,
+//                whenever `_rn_multicol_mode` is set (ls.ENH-018, #36).
+
+module Columns = structure {
+
+  // ==========================================================================
+  // Constants.
+  // ==========================================================================
+  pub let COL_GAP           : u64 = 2
+  pub let COL_MAX_ENTRIES   : u64 = 64
+  pub let COL_DEFAULT_WIDTH : u64 = 80
+  pub let COL_ERR_OVERFLOW  : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
+  // .bss -- stashed args, per-candidate working tables, and render
+  // cursor state. See the module doc's PAIDEIA-AS CONFORMANCE section
+  // for why a leaf function keeps all of this in .bss instead of
+  // registers.
+  // ==========================================================================
+  pub let mut _cl_names_ptr      : u64 = uninit @align(8)
+  pub let mut _cl_lens_ptr       : u64 = uninit @align(8)
+  pub let mut _cl_count          : u64 = uninit @align(8)
+  pub let mut _cl_term_width     : u64 = uninit @align(8)
+  pub let mut _cl_dst_ptr        : u64 = uninit @align(8)
+  pub let mut _cl_dst_cap        : u64 = uninit @align(8)
+
+  pub let mut _cl_rows           : u64 = uninit @align(8)
+  pub let mut _cl_cols           : u64 = uninit @align(8)
+  pub let mut _cl_widths_buf     : [u64; 64] = uninit @align(8)
+  pub let mut _cl_col_start_buf  : [u64; 64] = uninit @align(8)
+
+  pub let mut _cl_bytes_written  : u64 = uninit @align(8)
+  pub let mut _cl_render_row     : u64 = uninit @align(8)
+  pub let mut _cl_render_col     : u64 = uninit @align(8)
+  pub let mut _cl_render_idx     : u64 = uninit @align(8)
+  pub let mut _cl_render_name_ptr: u64 = uninit @align(8)
+  pub let mut _cl_render_name_len: u64 = uninit @align(8)
+
+  // ==========================================================================
+  // columns_layout(names_ptr, lens_ptr, count, term_width, dst_ptr, dst_cap) -> u64
+  //
+  // Signature: (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI (input): names_ptr  -- u64[count] array of name byte pointers
+  //   RSI (input): lens_ptr   -- u64[count] array of name byte lengths
+  //   RDX (input): count      -- number of entries (0 is a legal no-op)
+  //   RCX (input): term_width -- target line width in bytes
+  //   R8  (input): dst_ptr    -- caller-owned destination buffer
+  //   R9  (input): dst_cap    -- destination buffer capacity in bytes
+  //   RAX (output): total bytes composed into dst_ptr, or
+  //                 COL_ERR_OVERFLOW (0xFFFFFFFFFFFFFFFF) if dst_cap is
+  //                 too small for the chosen layout.
+  //
+  // count == 0 returns 0 immediately (nothing to render -- the caller's
+  // hidden-filter pass may have dropped every entry). count >
+  // COL_MAX_ENTRIES (64) refuses with COL_ERR_OVERFLOW rather than
+  // silently truncating the listing, mirroring the RN_GDF_MAX_ENTRIES /
+  // RN_R_MAX_ENTRIES overflow discipline in src/runner.pdx (unreachable
+  // at HEAD for the same "kernel readnext is a fixed small stub"
+  // reason those bounds are).
+  //
+  // See the module doc's "THE FITTING ALGORITHM" and "RENDER PHASE"
+  // sections for the full body walkthrough.
+  // ==========================================================================
+  pub let columns_layout : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (names_ptr: u64) (lens_ptr: u64) (count: u64) (term_width: u64) (dst_ptr: u64) (dst_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-018 (#36): compute the widest column count that fits term_width (candidate rows tried ascending from 1, cols = ceil(count/rows) derived per candidate so no column is ever empty) and render column-major into dst_ptr. Stash all six args into .bss (_cl_names_ptr.._cl_dst_cap) immediately -- this is a leaf function (no CALL instructions anywhere in its body) so every register is caller-save, but the body has many sequential sub-computations and keeping cross-step state in .bss avoids any register-lifetime mistake across them, mirroring Runner::runner_ls's own 'compute once, stash in .bss' idiom. count==0 returns 0 immediately; count>64 (COL_MAX_ENTRIES) refuses with COL_ERR_OVERFLOW, mirroring RN_GDF_MAX_ENTRIES's overflow discipline in src/runner.pdx. Candidate loop (cl_try_candidate): rows starts at 1 and increments on rejection. cl_cols_loop computes cols=ceil(count/rows) by repeated subtraction (no idiv anywhere in this module). cl_width_loop walks col_idx 0..cols-1, storing _cl_col_start_buf[col_idx] = the running col_start_accum (incremented by rows once per column -- never multiplied), scanning lens_ptr[col_start_accum..col_end) for the column's max width via cl_width_scan_loop, and accumulating total_width (+COL_GAP for every column after the first). cl_width_done accepts the candidate (jumps to cl_accept) when rows>=count (the unconditional single-column fallback) or total_width<=term_width; otherwise rows+=1 and the candidate loop retries. Render phase (cl_accept..): walks row 0..rows-1 (_cl_render_row) and, per row, column 0..cols-1 (_cl_render_col), computing idx=_cl_col_start_buf[c]+row into _cl_render_idx; idx>=count ends the row (jumps to cl_render_row_done, which appends '\\n' and advances to the next row -- this only ever fires on the last column of a short trailing column, per the module doc's fitting-algorithm invariant). Each populated cell resolves name_ptr/name_len from names_ptr[idx]/lens_ptr[idx] into _cl_render_name_ptr/_cl_render_name_len, dst-cap-checks then byte-copies the name (cl_emit_name_loop, #1248-mitigated xor+mov_b, [reg]-only addressing), then decides whether to emit pad+gap by peeking column c+1's idx for the SAME row (cl_render_col_gap vs cl_render_col_advance) -- this one-column lookahead against _cl_col_start_buf is what prevents trailing whitespace before a short last column's newline (see the module doc's dedicated section; pinned by tests/multicol_fixtures.pdx case 2). Every emit site (name bytes, pad spaces, gap spaces, the row's trailing newline) dst-cap-checks bytes_written+chunk_len against _cl_dst_cap before writing and returns COL_ERR_OVERFLOW (staged via mov r10, 0xFFFFFFFFFFFFFFFF; the equality compare, never a direct cmp against the 64-bit immediate) on refusal. cl_ret_bytes returns _cl_bytes_written once _cl_render_row reaches _cl_rows. paideia-as conformance: no test mnemonic; every cmp immediate (0, 64, 2) fits imm32 trivially; no and with a 64-bit immediate anywhere (this module issues no and at all); byte loads/stores use xor rax,rax + mov_b with [reg]-only addressing; every scaled-index table access ([base + idx*8]) uses a plain register base, never [rip + reg*8] -- lea is reserved for [rip + sym] reaches. Leaf: no push/pop, no alignment concerns. Labels prefixed cl_.",
+      block: {
+        // ---- stash args -------------------------------------------------
+        lea r11, [rip + _cl_names_ptr];
+        mov [r11], rdi;
+        lea r11, [rip + _cl_lens_ptr];
+        mov [r11], rsi;
+        lea r11, [rip + _cl_count];
+        mov [r11], rdx;
+        lea r11, [rip + _cl_term_width];
+        mov [r11], rcx;
+        lea r11, [rip + _cl_dst_ptr];
+        mov [r11], r8;
+        lea r11, [rip + _cl_dst_cap];
+        mov [r11], r9;
+
+        lea r11, [rip + _cl_bytes_written];
+        mov r10, 0;
+        mov [r11], r10;
+
+        cmp rdx, 0;
+        je  cl_ret_zero;
+
+        cmp rdx, 64;                              // COL_MAX_ENTRIES
+        ja  cl_ret_overflow;
+
+        // rows candidate starts at 1.
+        mov r10, 1;
+        lea r11, [rip + _cl_rows];
+        mov [r11], r10;
+
+      cl_try_candidate:
+        // ---- cols = ceil(count / rows) via repeated subtraction -------
+        mov r10, 0;                               // cols accumulator
+        lea r11, [rip + _cl_count];
+        mov r9, [r11];                            // remaining = count
+
+      cl_cols_loop:
+        cmp r9, 0;
+        je  cl_cols_done;                         // r9 (remaining) never goes negative
+        add r10, 1;                               // cols++
+        lea r11, [rip + _cl_rows];
+        mov rax, [r11];
+        cmp r9, rax;
+        jbe cl_cols_zero;
+        sub r9, rax;
+        jmp cl_cols_loop;
+
+      cl_cols_zero:
+        mov r9, 0;
+        jmp cl_cols_loop;
+
+      cl_cols_done:
+        lea r11, [rip + _cl_cols];
+        mov [r11], r10;                           // store cols
+
+        // ---- column-width pass ------------------------------------------
+        // r10 = col_idx, r9 = col_start_accum, r8 = total_width. None of
+        // these are touched by the inner scan loop (cl_width_scan_loop),
+        // which uses only rax/rcx/rdx/rsi/r11.
+        mov r10, 0;
+        mov r9, 0;
+        mov r8, 0;
+
+      cl_width_loop:
+        lea r11, [rip + _cl_cols];
+        mov rax, [r11];
+        cmp r10, rax;
+        jae cl_width_done;
+
+        lea r11, [rip + _cl_col_start_buf];
+        mov [r11 + r10 * 8], r9;                  // col_start_buf[col_idx]
+
+        // col_end = min(col_start_accum + rows, count)
+        lea r11, [rip + _cl_rows];
+        mov rax, [r11];
+        mov rcx, r9;
+        add rcx, rax;                             // tentative col_end
+        lea r11, [rip + _cl_count];
+        mov rax, [r11];
+        cmp rcx, rax;
+        jbe cl_width_end_ok;
+        mov rcx, rax;                             // clamp to count
+
+      cl_width_end_ok:
+        // Scan idx = col_start_accum (r9) .. col_end (rcx) for max len.
+        mov rax, 0;                               // max_len
+        mov rdx, r9;                              // scan idx
+
+      cl_width_scan_loop:
+        cmp rdx, rcx;
+        jae cl_width_scan_done;
+        lea r11, [rip + _cl_lens_ptr];
+        mov r11, [r11];                           // lens_ptr base
+        mov rsi, [r11 + rdx * 8];                 // lens_ptr[idx]
+        cmp rsi, rax;
+        jbe cl_width_scan_next;
+        mov rax, rsi;
+
+      cl_width_scan_next:
+        add rdx, 1;
+        jmp cl_width_scan_loop;
+
+      cl_width_scan_done:
+        lea r11, [rip + _cl_widths_buf];
+        mov [r11 + r10 * 8], rax;                 // widths_buf[col_idx] = max_len
+
+        cmp r10, 0;
+        je  cl_width_no_gap;
+        add r8, 2;                                // COL_GAP, columns after the first
+
+      cl_width_no_gap:
+        add r8, rax;                              // total_width += width
+
+        lea r11, [rip + _cl_rows];
+        mov rax, [r11];
+        add r9, rax;                              // col_start_accum += rows
+
+        add r10, 1;                               // col_idx++
+        jmp cl_width_loop;
+
+      cl_width_done:
+        // r8 = total_width for this candidate.
+        lea r11, [rip + _cl_rows];
+        mov rax, [r11];
+        lea r11, [rip + _cl_count];
+        mov rcx, [r11];
+        cmp rax, rcx;
+        jae cl_accept;                            // rows >= count -> forced accept
+
+        lea r11, [rip + _cl_term_width];
+        mov rax, [r11];
+        cmp r8, rax;
+        jbe cl_accept;                            // fits
+
+        // reject -- try the next candidate.
+        lea r11, [rip + _cl_rows];
+        mov r10, [r11];
+        add r10, 1;
+        mov [r11], r10;
+        jmp cl_try_candidate;
+
+      cl_accept:
+        lea r11, [rip + _cl_render_row];
+        mov r10, 0;
+        mov [r11], r10;
+
+      cl_render_row_loop:
+        lea r11, [rip + _cl_render_row];
+        mov rax, [r11];
+        lea r11, [rip + _cl_rows];
+        mov rcx, [r11];
+        cmp rax, rcx;
+        jae cl_ret_bytes;                         // every row rendered
+
+        lea r11, [rip + _cl_render_col];
+        mov r10, 0;
+        mov [r11], r10;
+
+      cl_render_col_loop:
+        lea r11, [rip + _cl_render_col];
+        mov rax, [r11];                           // c
+        lea r11, [rip + _cl_cols];
+        mov rcx, [r11];
+        cmp rax, rcx;
+        jae cl_render_row_done;                   // ran through every column
+
+        // idx = col_start_buf[c] + render_row
+        lea r11, [rip + _cl_col_start_buf];
+        mov rdx, [r11 + rax * 8];
+        lea r11, [rip + _cl_render_row];
+        mov rcx, [r11];
+        add rdx, rcx;
+
+        lea r11, [rip + _cl_count];
+        mov rcx, [r11];
+        cmp rdx, rcx;
+        jae cl_render_row_done;                   // idx >= count -> row ends here
+
+        lea r11, [rip + _cl_render_idx];
+        mov [r11], rdx;                           // stash idx
+
+        // resolve name_ptr / name_len from the caller's arrays
+        lea r11, [rip + _cl_names_ptr];
+        mov r11, [r11];
+        mov rax, [r11 + rdx * 8];
+        lea r11, [rip + _cl_render_name_ptr];
+        mov [r11], rax;
+
+        lea r11, [rip + _cl_lens_ptr];
+        mov r11, [r11];
+        mov rax, [r11 + rdx * 8];
+        lea r11, [rip + _cl_render_name_len];
+        mov [r11], rax;
+
+        // ---- dst-cap check + emit name bytes ---------------------------
+        lea r11, [rip + _cl_bytes_written];
+        mov r9, [r11];                            // bytes_written
+        mov rcx, r9;
+        lea r11, [rip + _cl_render_name_len];
+        mov rax, [r11];
+        add rcx, rax;                             // bytes_written + name_len
+        lea r11, [rip + _cl_dst_cap];
+        mov r10, [r11];
+        cmp rcx, r10;
+        ja  cl_ret_overflow;
+
+        lea r11, [rip + _cl_dst_ptr];
+        mov r10, [r11];
+        add r10, r9;                              // dst cursor
+        lea r11, [rip + _cl_render_name_ptr];
+        mov rsi, [r11];                           // src
+        lea r11, [rip + _cl_render_name_len];
+        mov rcx, [r11];                           // len
+        xor r9, r9;                               // copy idx
+
+      cl_emit_name_loop:
+        cmp r9, rcx;
+        jae cl_emit_name_done;
+        mov r8, rsi;
+        add r8, r9;
+        xor rax, rax;
+        mov_b rax, [r8];                          // #1248 mitigation
+        mov r11, r10;
+        add r11, r9;
+        mov_b [r11], rax;
+        add r9, 1;
+        jmp cl_emit_name_loop;
+
+      cl_emit_name_done:
+        lea r11, [rip + _cl_bytes_written];
+        mov r9, [r11];
+        lea r11, [rip + _cl_render_name_len];
+        mov rax, [r11];
+        add r9, rax;
+        lea r11, [rip + _cl_bytes_written];
+        mov [r11], r9;
+
+        // ---- peek column c+1 in this row: emit pad+gap only if it has
+        // a real entry (see the module doc's trailing-whitespace note) --
+        lea r11, [rip + _cl_render_col];
+        mov rax, [r11];
+        add rax, 1;                               // next_c
+        lea r11, [rip + _cl_cols];
+        mov r10, [r11];
+        cmp rax, r10;
+        jae cl_render_col_advance;                // no next column
+
+        lea r11, [rip + _cl_col_start_buf];
+        mov rdx, [r11 + rax * 8];                 // col_start_buf[next_c]
+        lea r11, [rip + _cl_render_row];
+        mov r10, [r11];
+        add rdx, r10;                             // idx_next
+        lea r11, [rip + _cl_count];
+        mov r10, [r11];
+        cmp rdx, r10;
+        jae cl_render_col_advance;                // next column empty this row
+
+      cl_render_col_gap:
+        // pad = widths_buf[c] - name_len
+        lea r11, [rip + _cl_render_col];
+        mov rax, [r11];                           // c
+        lea r11, [rip + _cl_widths_buf];
+        mov rcx, [r11 + rax * 8];                 // widths_buf[c]
+        lea r11, [rip + _cl_render_name_len];
+        mov rax, [r11];
+        sub rcx, rax;                             // pad count
+
+        // dst-cap check for pad + COL_GAP
+        mov rdx, rcx;
+        add rdx, 2;                               // + COL_GAP
+        lea r11, [rip + _cl_bytes_written];
+        mov r9, [r11];
+        add rdx, r9;
+        lea r11, [rip + _cl_dst_cap];
+        mov r10, [r11];
+        cmp rdx, r10;
+        ja  cl_ret_overflow;
+
+        lea r11, [rip + _cl_dst_ptr];
+        mov r10, [r11];
+        add r10, r9;                              // dst cursor
+        mov rax, 0x20;                            // ' '
+        xor r8, r8;                               // idx = 0
+
+      cl_pad_loop:
+        cmp r8, rcx;
+        jae cl_pad_done;
+        mov r11, r10;
+        add r11, r8;
+        mov_b [r11], rax;
+        add r8, 1;
+        jmp cl_pad_loop;
+
+      cl_pad_done:
+        // bytes_written += pad
+        lea r11, [rip + _cl_bytes_written];
+        mov r9, [r11];
+        add r9, rcx;
+        mov [r11], r9;
+
+        // emit COL_GAP (2) spaces
+        lea r11, [rip + _cl_dst_ptr];
+        mov r10, [r11];
+        add r10, r9;
+        mov rax, 0x20;
+        mov_b [r10], rax;
+        mov r11, r10;
+        add r11, 1;
+        mov_b [r11], rax;
+        add r9, 2;                                // COL_GAP
+        lea r11, [rip + _cl_bytes_written];
+        mov [r11], r9;
+
+      cl_render_col_advance:
+        lea r11, [rip + _cl_render_col];
+        mov r10, [r11];
+        add r10, 1;
+        mov [r11], r10;
+        jmp cl_render_col_loop;
+
+      cl_render_row_done:
+        // dst-cap check + emit trailing '\n'
+        lea r11, [rip + _cl_bytes_written];
+        mov r9, [r11];
+        mov rcx, r9;
+        add rcx, 1;
+        lea r11, [rip + _cl_dst_cap];
+        mov r10, [r11];
+        cmp rcx, r10;
+        ja  cl_ret_overflow;
+
+        lea r11, [rip + _cl_dst_ptr];
+        mov r10, [r11];
+        add r10, r9;
+        mov rax, 0x0A;                            // '\n'
+        mov_b [r10], rax;
+        add r9, 1;
+        lea r11, [rip + _cl_bytes_written];
+        mov [r11], r9;
+
+        lea r11, [rip + _cl_render_row];
+        mov r10, [r11];
+        add r10, 1;
+        mov [r11], r10;
+        jmp cl_render_row_loop;
+
+      cl_ret_zero:
+        mov rax, 0;
+        ret;
+
+      cl_ret_overflow:
+        mov rax, 0xFFFFFFFFFFFFFFFF;               // COL_ERR_OVERFLOW
+        ret;
+
+      cl_ret_bytes:
+        lea r11, [rip + _cl_bytes_written];
+        mov rax, [r11];
+        ret
+      }
+    }
+}

@@ -1,0 +1,483 @@
+// tests/multicol_fixtures.pdx -- ls.ENH-018 (paideia-os/ls#36)
+//
+// MulticolFixtures module: byte-exact goldens for
+// Columns::columns_layout (src/columns.pdx). Follows the M4 fixture
+// convention documented in tests/README.md and the packed-table shape
+// SortOptionsFixtures / JsonLineFixtures already establish for a SUT
+// that consumes caller-owned arrays rather than a single scalar
+// argument set.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Five cases, covering the boundary (count == 0) plus the four named
+// scenarios ls.ENH-018's own review asked for:
+//
+//   idx  scenario                            count  term_width  out len
+//   -----------------------------------------------------------------------
+//    0   empty (count == 0)                  0      80          0
+//    1   even-fit                            6      12          22
+//    2   uneven-fit                          5      12          18
+//    3   single-column-fallback (narrow)     3      1           12
+//    4   one-per-column (very-wide-entry)    3      10          21
+//
+// Case 1 ("aa","bb","cc","dd","ee","ff", all 2 bytes): the widest
+// candidate (rows=2, cols=3) fits term_width=12 exactly (3*2 + 2*2 =
+// 10 <= 12) and every column has exactly 2 entries -- no short trailing
+// column, pinning the plain fitted-grid path.
+//
+// Case 2 ("aa","bb","cc","dd","ee", same 2-byte names, one fewer
+// entry): the SAME rows=2/cols=3 candidate is chosen, but column 2 now
+// holds only 1 entry ("ee") -- row 1's third column is empty. This is
+// the dedicated pin for the module's trailing-whitespace fix: row 1's
+// golden is `bb  dd\n`, NOT `bb  dd  \n` -- a regression that emits a
+// gap after "dd" because it only checks "is dd the statically-last
+// column" (it is not; column 2 is) would fail this case's byte-diff
+// but pass case 1's.
+//
+// Case 3 ("cat","dog","emu", 3 bytes each, term_width=1): no multi-
+// column candidate can ever fit a term_width this narrow, so the
+// candidate loop runs all the way to rows==count (cols==1) and the
+// unconditional single-column-fallback accepts regardless of width --
+// pinning that a narrow terminal degrades to one-per-line instead of
+// truncating names or refusing.
+//
+// Case 4 ("ab", "reallylongname" (14 bytes), "cd", term_width=10): one
+// entry alone exceeds term_width. Every 2/3-column candidate is
+// rejected (the wide entry inflates whichever column contains it past
+// term_width), so the WHOLE listing falls back to one column -- not
+// just the wide entry's own row -- matching GNU ls's real behaviour and
+// pinning that columns_layout never truncates or wraps a name.
+//
+// =============================================================================
+// TABLE LAYOUT
+// =============================================================================
+//
+//   _mcf_counts              [u64; 5]  -- entry count per case
+//   _mcf_term_widths         [u64; 5]  -- term_width arg per case
+//   _mcf_entry_base          [u64; 5]  -- starting index into the
+//                                         flattened 17-entry name tables
+//   _mcf_expected_lens       [u64; 5]  -- expected columns_layout return
+//   _mcf_golden_offsets      [u64; 5]  -- byte offset into _mcf_golden_all
+//   _mcf_entry_name_offsets  [u64; 17] -- byte offset into _mcf_names_all,
+//                                         one row per flattened entry
+//   _mcf_entry_lens          [u64; 17] -- byte length, one row per entry
+//   _mcf_names_all           [u8; 49]  -- packed input name bytes
+//   _mcf_golden_all          [u8; 73]  -- packed expected rendered output
+//   _mcf_ptrs_scratch        [u64; 8]  -- per-run names_ptr array (built
+//                                         fresh each case from the
+//                                         flattened tables above)
+//   _mcf_lens_scratch        [u64; 8]  -- per-run lens_ptr array
+//   _mcf_render_scratch      [u64; 32] -- 256-byte columns_layout dst
+//
+// =============================================================================
+// PUBLIC ENTRY POINTS
+// =============================================================================
+//
+//   multicol_fixtures_case_count() -> u64
+//   multicol_fixtures_run(case_idx) -> u64      -- 0 pass; err+idx on fail
+//   multicol_fixtures_verify_all() -> u64       -- fail-fast walk
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`MulticolFixtures`).
+//   - No `test` mnemonic; every zero-check / bound-check uses `cmp
+//     reg, 0` or `cmp reg, reg`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates:
+//     256 (render scratch cap), 73/49/17/5 (table sizes).
+//   - Byte reads (the diff loop) use `xor rax, rax; mov_b rax, [reg]`
+//     with [reg]-only addressing, matching src/columns.pdx's own
+//     convention.
+//   - r8 / r9 / r10 / r11 are scratch in the build loop; rax/rcx/rdx/r11
+//     are scratch in the diff loop. Labels prefixed mcfr_ / mcfva_.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   columns_layout -- Columns (src/columns.pdx)
+
+module MulticolFixtures = structure {
+
+  // ==========================================================================
+  // Return codes.
+  // ==========================================================================
+  pub let MCF_OK                 : u64 = 0
+  pub let MCF_ERR_LEN_MISMATCH   : u64 = 0xFFFFEBC1    // + case_idx (0..4)
+  pub let MCF_ERR_BYTE_MISMATCH  : u64 = 0xFFFFEBD1    // + case_idx (0..4)
+  pub let MCF_ERR_BAD_CASE_IDX   : u64 = 0xFFFFEBCF
+
+  pub let MCF_CASE_COUNT         : u64 = 5
+
+  // ==========================================================================
+  // Per-case metadata.
+  // ==========================================================================
+  pub let _mcf_counts : [u64; 5] = [
+      0,    // case 0: empty
+      6,    // case 1: even-fit
+      5,    // case 2: uneven-fit
+      3,    // case 3: single-column-fallback (narrow terminal)
+      3     // case 4: one-per-column (very-wide-entry)
+  ]
+
+  pub let _mcf_term_widths : [u64; 5] = [
+      80, 12, 12, 1, 10
+  ]
+
+  // Starting index into the flattened 17-row _mcf_entry_name_offsets /
+  // _mcf_entry_lens tables (case 0 has no entries; its base is unused).
+  pub let _mcf_entry_base : [u64; 5] = [
+      0, 0, 6, 11, 14
+  ]
+
+  // Expected columns_layout(...) return value per case.
+  pub let _mcf_expected_lens : [u64; 5] = [
+      0, 22, 18, 12, 21
+  ]
+
+  // Byte offset into _mcf_golden_all per case.
+  pub let _mcf_golden_offsets : [u64; 5] = [
+      0, 0, 22, 40, 52
+  ]
+
+  // ==========================================================================
+  // Flattened per-entry tables (17 rows total: 6 for case 1, 5 for
+  // case 2, 3 for case 3, 3 for case 4; case 0 contributes none).
+  // ==========================================================================
+  pub let _mcf_entry_name_offsets : [u64; 17] = [
+      // case 1: aa, bb, cc, dd, ee, ff
+      0, 2, 4, 6, 8, 10,
+      // case 2: aa, bb, cc, dd, ee
+      12, 14, 16, 18, 20,
+      // case 3: cat, dog, emu
+      22, 25, 28,
+      // case 4: ab, reallylongname, cd
+      31, 33, 47
+  ]
+
+  pub let _mcf_entry_lens : [u64; 17] = [
+      // case 1
+      2, 2, 2, 2, 2, 2,
+      // case 2
+      2, 2, 2, 2, 2,
+      // case 3
+      3, 3, 3,
+      // case 4
+      2, 14, 2
+  ]
+
+  // ==========================================================================
+  // Packed input name bytes (49 bytes total). ASCII: a=0x61 b=0x62
+  // c=0x63 d=0x64 e=0x65 f=0x66 g=0x67 l=0x6C m=0x6D n=0x6E o=0x6F
+  // r=0x72 t=0x74 u=0x75 y=0x79. Layout matches
+  // _mcf_entry_name_offsets exactly.
+  // ==========================================================================
+  pub let _mcf_names_all : [u8; 49] = [
+      // case 1 (offsets 0..11): aa bb cc dd ee ff
+      0x61, 0x61, 0x62, 0x62, 0x63, 0x63, 0x64, 0x64, 0x65, 0x65, 0x66, 0x66,
+      // case 2 (offsets 12..21): aa bb cc dd ee
+      0x61, 0x61, 0x62, 0x62, 0x63, 0x63, 0x64, 0x64, 0x65, 0x65,
+      // case 3 (offsets 22..30): cat dog emu
+      0x63, 0x61, 0x74, 0x64, 0x6F, 0x67, 0x65, 0x6D, 0x75,
+      // case 4 (offsets 31..48): ab reallylongname cd
+      0x61, 0x62,
+      0x72, 0x65, 0x61, 0x6C, 0x6C, 0x79, 0x6C, 0x6F, 0x6E, 0x67, 0x6E, 0x61, 0x6D, 0x65,
+      0x63, 0x64
+  ]
+
+  // ==========================================================================
+  // Packed expected rendered output (73 bytes total). Layout matches
+  // _mcf_golden_offsets exactly. Space=0x20, LF=0x0A.
+  // ==========================================================================
+  pub let _mcf_golden_all : [u8; 73] = [
+      // ---- case 1 (22 bytes): "aa  cc  ee\nbb  dd  ff\n"
+      0x61, 0x61, 0x20, 0x20, 0x63, 0x63, 0x20, 0x20, 0x65, 0x65, 0x0A,
+      0x62, 0x62, 0x20, 0x20, 0x64, 0x64, 0x20, 0x20, 0x66, 0x66, 0x0A,
+
+      // ---- case 2 (18 bytes): "aa  cc  ee\nbb  dd\n"
+      // (row 1's third column is empty -- NO trailing spaces after "dd")
+      0x61, 0x61, 0x20, 0x20, 0x63, 0x63, 0x20, 0x20, 0x65, 0x65, 0x0A,
+      0x62, 0x62, 0x20, 0x20, 0x64, 0x64, 0x0A,
+
+      // ---- case 3 (12 bytes): "cat\ndog\nemu\n"
+      0x63, 0x61, 0x74, 0x0A,
+      0x64, 0x6F, 0x67, 0x0A,
+      0x65, 0x6D, 0x75, 0x0A,
+
+      // ---- case 4 (21 bytes): "ab\nreallylongname\ncd\n"
+      0x61, 0x62, 0x0A,
+      0x72, 0x65, 0x61, 0x6C, 0x6C, 0x79, 0x6C, 0x6F, 0x6E, 0x67, 0x6E, 0x61, 0x6D, 0x65, 0x0A,
+      0x63, 0x64, 0x0A
+  ]
+
+  // ==========================================================================
+  // .bss scratch -- rebuilt fresh by every multicol_fixtures_run call.
+  // ==========================================================================
+  pub let mut _mcf_ptrs_scratch   : [u64; 8]  = uninit @align(8)
+  pub let mut _mcf_lens_scratch   : [u64; 8]  = uninit @align(8)
+  pub let mut _mcf_render_scratch : [u64; 32] = uninit @align(8)
+
+  // ==========================================================================
+  // multicol_fixtures_case_count() -> u64
+  //
+  // Leaf.
+  // ==========================================================================
+  pub let multicol_fixtures_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-018 (#36): return MCF_CASE_COUNT (5) for a harness iterating via multicol_fixtures_run. Leaf pure function. paideia-as conformance: no test mnemonic; no cmp. Labels prefixed mcfcc_.",
+      block: {
+        mov rax, 5;                              // MCF_CASE_COUNT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // multicol_fixtures_run(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI: case_idx (0..4)
+  //   RAX: 0 on pass; MCF_ERR_LEN_MISMATCH + case_idx or
+  //        MCF_ERR_BYTE_MISMATCH + case_idx on fail;
+  //        MCF_ERR_BAD_CASE_IDX on out-of-range.
+  //
+  // Sequence:
+  //   (1) Bounds check case_idx < 5.
+  //   (2) Load count (r12), term_width (r13), entry_base (r14) from the
+  //       three per-case tables.
+  //   (3) Build loop (mcfr_build_loop): for i=0..count, resolve
+  //       global_idx = entry_base + i and populate
+  //       _mcf_ptrs_scratch[i] = &_mcf_names_all + _mcf_entry_name_
+  //       offsets[global_idx], _mcf_lens_scratch[i] =
+  //       _mcf_entry_lens[global_idx].
+  //   (4) r14 <- expected_len, rbp <- golden_ptr (both computed AFTER
+  //       the build loop, since entry_base (r14) is dead by then and
+  //       rbp is not yet used).
+  //   (5) call columns_layout(&_mcf_ptrs_scratch, &_mcf_lens_scratch,
+  //       count, term_width, &_mcf_render_scratch, 256).
+  //   (6) cmp rax, r14 (expected_len); mismatch -> MCF_ERR_LEN_MISMATCH
+  //       + case_idx.
+  //   (7) Byte-diff loop (mcfr_diff_loop) over [0, r14) comparing
+  //       _mcf_render_scratch against _mcf_golden_all[golden_offset..];
+  //       first mismatch -> MCF_ERR_BYTE_MISMATCH + case_idx. r14 == 0
+  //       (case 0) makes this a zero-iteration no-op, which is correct.
+  //
+  // Register plan (six callee-save pushes, mirroring
+  // SortOptionsFixtures::sort_options_fixtures_run's own widest plan):
+  //   rbx = case_idx (survives)
+  //   r12 = count (survives; build-loop bound + columns_layout arg)
+  //   r13 = term_width (survives; columns_layout arg)
+  //   r14 = entry_base during the build loop, then repurposed as
+  //         expected_len after the build loop completes (entry_base is
+  //         dead by then)
+  //   r15 = build-loop index i, then repurposed as the diff-loop index
+  //         after the call (both are simple 0..bound counters, neither
+  //         live across the other)
+  //   rbp = golden_ptr (computed once, after the build loop, survives
+  //         through the diff loop)
+  //
+  // Alignment: 6 pushes = 48 bytes + sub rsp,8 pad = 56; entry
+  // rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at the columns_layout call
+  // site. Matched add rsp,8 + 6 pops before every ret.
+  // ==========================================================================
+  pub let multicol_fixtures_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-018 (#36): run one Columns::columns_layout boundary/scenario case. Bounds-check case_idx < 5 -> MCF_ERR_BAD_CASE_IDX. Load count (r12), term_width (r13), entry_base (r14) from the three per-case tables at index rbx. Build loop (mcfr_build_loop, index r15) walks i=0..count, computing global_idx=entry_base+i (staged in r10) and populating _mcf_ptrs_scratch[i] = &_mcf_names_all + _mcf_entry_name_offsets[global_idx] (rax/r11 staging, r9 as the scratch-array base) and _mcf_lens_scratch[i] = _mcf_entry_lens[global_idx]. After the build loop, entry_base (r14) is dead and is repurposed as expected_len = _mcf_expected_lens[rbx]; rbp is computed once as golden_ptr = &_mcf_golden_all + _mcf_golden_offsets[rbx]. The six-argument columns_layout call is built fresh (rdi=&_mcf_ptrs_scratch, rsi=&_mcf_lens_scratch, rdx=r12, rcx=r13, r8=&_mcf_render_scratch, r9=256). Length check (cmp rax, r14) catches a SUT that renders the wrong candidate before the diff loop even runs. Byte-diff loop (mcfr_diff_loop, index r15 reused -- the build loop's own use of r15 is fully drained by this point) walks [0, r14) comparing _mcf_render_scratch[idx] (xor rax,rax; mov_b rax,[reg], [reg]-only addressing per U1606/#1248) against _mcf_golden_all[golden_offset+idx] (rbp + idx, same addressing discipline); first mismatch -> MCF_ERR_BYTE_MISMATCH + case_idx. r14==0 (case 0, the empty-listing boundary) makes the diff loop a correct zero-iteration no-op. Six callee-save pushes (rbx=case_idx, r12=count, r13=term_width, r14=entry_base-then-expected_len, r15=build-idx-then-diff-idx, rbp=golden_ptr) + sub rsp,8 pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; aligned at the columns_layout call site. paideia-as: no test mnemonic; largest cmp immediate is 5 (MCF_CASE_COUNT); MCF_ERR_* sentinels via mov rax, imm64 + add rax, rbx. Labels prefixed mcfr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // case_idx
+
+        cmp rbx, 5;                              // MCF_CASE_COUNT
+        jae mcfr_bad_idx;
+
+        lea r11, [rip + _mcf_counts];
+        mov r12, [r11 + rbx * 8];                // count
+
+        lea r11, [rip + _mcf_term_widths];
+        mov r13, [r11 + rbx * 8];                // term_width
+
+        lea r11, [rip + _mcf_entry_base];
+        mov r14, [r11 + rbx * 8];                // entry_base
+
+        // ---- build _mcf_ptrs_scratch / _mcf_lens_scratch ---------------
+        xor r15, r15;                            // i = 0
+
+      mcfr_build_loop:
+        cmp r15, r12;
+        jae mcfr_build_done;
+
+        mov r10, r14;                            // entry_base
+        add r10, r15;                            // global_idx
+
+        lea r11, [rip + _mcf_entry_name_offsets];
+        mov rax, [r11 + r10 * 8];                // byte offset
+        lea r11, [rip + _mcf_names_all];
+        add r11, rax;                            // ptr = &names_all + offset
+
+        lea r9, [rip + _mcf_ptrs_scratch];
+        mov [r9 + r15 * 8], r11;                 // ptrs_scratch[i] = ptr
+
+        lea r11, [rip + _mcf_entry_lens];
+        mov rax, [r11 + r10 * 8];                // len
+
+        lea r9, [rip + _mcf_lens_scratch];
+        mov [r9 + r15 * 8], rax;                 // lens_scratch[i] = len
+
+        add r15, 1;
+        jmp mcfr_build_loop;
+
+      mcfr_build_done:
+        // entry_base (r14) is dead -- repurpose as expected_len.
+        lea r11, [rip + _mcf_expected_lens];
+        mov r14, [r11 + rbx * 8];
+
+        // golden_ptr = &_mcf_golden_all + _mcf_golden_offsets[case_idx]
+        lea r11, [rip + _mcf_golden_offsets];
+        mov rax, [r11 + rbx * 8];
+        lea r11, [rip + _mcf_golden_all];
+        add r11, rax;
+        mov rbp, r11;
+
+        // ---- build the six-argument call --------------------------------
+        lea r11, [rip + _mcf_ptrs_scratch];
+        mov rdi, r11;
+        lea r11, [rip + _mcf_lens_scratch];
+        mov rsi, r11;
+        mov rdx, r12;                            // count
+        mov rcx, r13;                            // term_width
+        lea r11, [rip + _mcf_render_scratch];
+        mov r8, r11;
+        mov r9, 256;                             // dst_cap
+
+        call columns_layout;
+
+        cmp rax, r14;                            // expected_len
+        jne mcfr_len_fail;
+
+        // ---- byte-diff loop ---------------------------------------------
+        xor r15, r15;                            // idx = 0
+
+      mcfr_diff_loop:
+        cmp r15, r14;
+        jae mcfr_ok;
+
+        lea r11, [rip + _mcf_render_scratch];
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];                        // actual byte
+        mov r10, rax;
+
+        mov r11, rbp;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];                        // expected byte
+
+        cmp rax, r10;
+        jne mcfr_byte_fail;
+
+        add r15, 1;
+        jmp mcfr_diff_loop;
+
+      mcfr_ok:
+        xor rax, rax;
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mcfr_len_fail:
+        mov rax, 0xFFFFEBC1;                     // MCF_ERR_LEN_MISMATCH
+        add rax, rbx;
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mcfr_byte_fail:
+        mov rax, 0xFFFFEBD1;                     // MCF_ERR_BYTE_MISMATCH
+        add rax, rbx;
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mcfr_bad_idx:
+        mov rax, 0xFFFFEBCF;                     // MCF_ERR_BAD_CASE_IDX
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // multicol_fixtures_verify_all() -> u64
+  //
+  // Walk case_idx 0..4; first non-zero return propagates.
+  //
+  // Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24;
+  // entry rsp % 16 == 8; 8 + 24 = 32; aligned at multicol_fixtures_run's
+  // call site.
+  // ==========================================================================
+  pub let multicol_fixtures_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-018 (#36): fail-fast walk of all 5 columns_layout boundary/scenario cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp % 16 == 8; 8 + 24 = 32; aligned at multicol_fixtures_run's call site. Matched add rsp,8 + 2 pops. paideia-as: no test mnemonic; cmp against 5 fits imm32. Labels prefixed mcfva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 5;                              // MCF_CASE_COUNT
+
+      mcfva_loop:
+        cmp rbx, r12;
+        jae mcfva_ok;
+
+        mov rdi, rbx;
+        call multicol_fixtures_run;
+        cmp rax, 0;
+        jne mcfva_out;
+
+        add rbx, 1;
+        jmp mcfva_loop;
+
+      mcfva_ok:
+        xor rax, rax;
+      mcfva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

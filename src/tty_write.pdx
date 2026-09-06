@@ -102,6 +102,48 @@ module TtyWrite = structure {
   //   rsi = buf_ptr (shuffled from original rdi)
   //   rdx = len     (shuffled from original rsi)
   // ==========================================================================
+  // ==========================================================================
+  // tty_probe_is_tty() -> u64
+  //
+  // ls.ENH-018 (#36): "is stdout a terminal" probe for the multi-column
+  // default-output decision (Runner::runner_ls's `_rn_multicol_mode`
+  // gate, src/runner.pdx). Returns 1 if stdout is a TTY, 0 otherwise.
+  //
+  // Honestly returns 0 (not a TTY) unconditionally today. This is the
+  // SAME sub-blocker AS_BIT_COLOR_AUTO's own probe already documents at
+  // TW_KIND_TTY above ("today fd 1 does not resolve to a cap slot in
+  // the M3 compat shim"): there is no cap-bound fd 1 and no kernel
+  // syscall (`sys_ttywinsize` or any KIND_TTY row-query trampoline) a
+  // userspace tool could call to ask "is my stdout sink a terminal or a
+  // pipe" -- confirmed absent from paideia-os's syscall table at HEAD
+  // (design/user/syscall-table.md carries no ioctl/ttywinsize/isatty
+  // entry). Rather than fabricate a syscall number that does not exist,
+  // or silently guess, this probe states the honest answer for today's
+  // substrate: "not a TTY", so `_rn_multicol_mode`'s auto-detect path
+  // keeps `ls`'s pre-#36 one-per-line default until the sub-blocker
+  // clears -- exactly the behaviour `AS_BIT_COLOR_AUTO`'s own probe
+  // already settled on, and the reason `-C` (AS_BIT_C_MAJ, unconditional
+  // multi-column) exists as the real, live, testable path #36 ships
+  // today. When a real cap-bound fd 1 / KIND_TTY read wire lands, this
+  // function's single `mov rax, 0` flips to a real probe and neither
+  // `columns_layout` (src/columns.pdx) nor `runner_ls`'s gate logic
+  // needs to change at all.
+  //
+  // Signature: () -> u64 !{} @{}
+  //   RAX (output): 1 if stdout is a TTY, 0 otherwise (always 0 today).
+  //
+  // Leaf; touches no memory, no capability, no register but rax.
+  // ==========================================================================
+  pub let tty_probe_is_tty : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-018 (#36): honest 'is stdout a TTY' probe for Runner::runner_ls's multicol auto-detect gate. No cap-bound fd 1 and no kernel ioctl/ttywinsize/isatty syscall exist at HEAD (confirmed absent from design/user/syscall-table.md) -- the identical sub-blocker AS_BIT_COLOR_AUTO's own probe already documents above (TW_KIND_TTY). Rather than fabricate a nonexistent syscall or guess, this function states the honest answer for today's substrate: always 0 (not a TTY), so bare `ls` keeps its pre-#36 one-per-line default until the sub-blocker clears; `-C` (AS_BIT_C_MAJ) is the real, live, unconditional path to multi-column output today. Leaf, effects {}: no memory access, no register touched but rax. paideia-as conformance: no test mnemonic; no cmp; no branches. Labels: none needed.",
+      block: {
+        mov rax, 0;
+        ret
+      }
+    }
+
   pub let tty_write : (u64, u64) -> u64 !{mem, sysreg} @{} =
     fn (buf_ptr: u64) (len: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},

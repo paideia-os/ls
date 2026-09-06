@@ -20,7 +20,7 @@
 # a new PAIDEIA_AS_VER KV record.
 
 name        = ls
-version     = 1.1.5
+version     = 1.1.6
 kind        = tool
 entry       = Dispatch::ls_dispatch
 output      = build-out/ls
@@ -63,6 +63,7 @@ sources:
   - src/recurse_filter.pdx        # 1.1.4 ENH-017 (#35) -R recursion-candidacy predicate
   - src/recurse_header.pdx        # 1.1.4 ENH-017 (#35) -R "<path>/<name>:" header composer
   - src/sort_options.pdx          # 1.1.5 ENH-016 (#34) -t/-S/-r sort comparators
+  - src/columns.pdx               # 1.1.6 ENH-018 (#36) multi-column fitted layout
 
 # --- Library dependencies -----------------------------------------------
 # ls consumes four libraries at 1.0.1+ (ls.ENH-013, #22: the phantom
@@ -97,6 +98,7 @@ tests:
   - tests/recurse_filter_fixtures.pdx # 1.1.4 ENH-017 (#35) 8 recurse_should_descend cases
   - tests/recurse_header_fixtures.pdx # 1.1.4 ENH-017 (#35) 5 recurse_header_compose cases
   - tests/sort_options_fixtures.pdx   # 1.1.5 ENH-016 (#34) 10 sort_options_by_{name,mtime,size} cases
+  - tests/multicol_fixtures.pdx       # 1.1.6 ENH-018 (#36) 5 columns_layout cases
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49/R50 tool observes and every M1

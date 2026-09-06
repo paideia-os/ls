@@ -106,6 +106,19 @@ sub-band sentinel on fail.
   Runner's buffered-listing wiring (`src/runner.pdx`,
   `rn_ls_gdf_partition`) that calls these comparators is exercised
   end-to-end by the qemu smoke path, not here.
+- `multicol_fixtures.pdx` — `ls.ENH-018` (#36). 5 byte-exact cases
+  for `Columns::columns_layout`: the empty-listing boundary
+  (count == 0), an even-fit grid (6 equal-length names, every
+  column full), an uneven-fit grid (5 equal-length names -- the
+  dedicated pin for the trailing-column lookahead that prevents
+  trailing whitespace before a short last column's newline),
+  a single-column-fallback case (term_width too narrow for any
+  multi-column candidate to fit), and a one-per-column case (one
+  entry alone wider than term_width, collapsing the whole listing
+  to a single column rather than truncating it). Runner's buffered-
+  listing wiring (`src/runner.pdx`, `rn_ls_multicol_collect`/
+  `rn_ls_multicol_render`) that calls `columns_layout` is exercised
+  end-to-end by the qemu smoke path, not here.
 - `goldens/` — human-readable copies of each fixture case's
   expected byte sequence. Not read at build/test time (paideia-as
   fixture modules have no filesystem cap); the `.rodata` tables in

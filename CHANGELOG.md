@@ -9,9 +9,74 @@ and stored under `pkgs.paideia-os/ls/<version>/`.
 
 ## [Unreleased]
 
-Post-1.1.5 items on the Enhancement v1.x wave
+Post-1.1.6 items on the Enhancement v1.x wave
 (`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
 exit-code map, wire body shape, `caps.decl`) changes in this section.
+
+## [1.1.6] -- 2026-09-06 -- multi-column default output (ls.ENH-018) <a id="116"></a>
+
+**1.1.6.** `-1`/`-C` already parsed (`AS_BIT_ONE`/`AS_BIT_C_MAJ`) but
+had no Runner-side behaviour -- this release lands the fitted-grid
+column algorithm and wires it into Runner's buffered-listing path (the
+same one `-t`/`-S`/`-r`/`--group-directories-first` already use), so
+multicol always renders the already-sorted/grouped buffer, column-major.
+
+### Added
+
+- **`Columns::columns_layout`** (`src/columns.pdx`, new module) --
+  given a caller-owned array of name pointers/lengths, tries candidate
+  row-counts ascending from 1 (`cols = ceil(count/rows)` derived per
+  candidate so no column is ever empty) and accepts the first
+  (therefore widest) candidate whose total rendered width fits
+  `term_width`; `rows == count` (one column) is accepted
+  unconditionally as the guaranteed-fits fallback, so a single name
+  wider than the terminal collapses the whole listing to one column
+  rather than being truncated or wrapped. Renders column-major with a
+  one-column lookahead against the precomputed column-start table so a
+  short trailing column never leaves trailing whitespace before its
+  row's newline. No multiplication or division instruction anywhere in
+  the module -- every `ceil`/`c*rows` is computed by repeated
+  subtraction / incremental accumulation.
+- **`TtyWrite::tty_probe_is_tty`** (`src/tty_write.pdx`) -- the
+  "is stdout a TTY" probe multicol's auto-detect gate reads. Honestly
+  returns 0 (not a TTY) unconditionally: no cap-bound fd 1 and no
+  `ioctl`/`ttywinsize`/`isatty` syscall exist in paideia-os at HEAD
+  (confirmed absent from `design/user/syscall-table.md`), the same
+  substrate gap `AS_BIT_COLOR_AUTO`'s own probe already documents.
+  Bare `ls` therefore keeps its pre-1.1.6 one-per-line default until
+  that sub-blocker clears; `-C` is the real, live, unconditional path
+  to multi-column output today.
+- **`Runner::runner_ls`** -- computes `_rn_multicol_mode` once at entry
+  (OFF when `-l`/`--json`/`-1`/`-F`/`--color` is set -- `-F`'s suffix
+  and `--color`'s ANSI escapes would corrupt columns_layout's byte-
+  length-based width math, a documented v1 scope cut, not a silent
+  gap; else ON when `-C` is explicit or `tty_probe_is_tty()` reports a
+  TTY), widens the buffered-path trigger alongside GDF/sort, and adds
+  a dedicated `rn_ls_multicol_collect`/`rn_ls_multicol_render` phase
+  that walks the finalized order buffer (hidden-filter + the same `-R`
+  recursion-candidate detection the per-entry path runs, `sem_emit_entry`
+  unchanged per accepted entry) before handing the whole accepted set
+  to `columns_layout` and `tty_write`ing the composed grid in one call.
+- **`tests/multicol_fixtures.pdx`** (new, 5 cases) -- empty, even-fit,
+  uneven-fit (the dedicated trailing-whitespace-on-a-short-column pin),
+  single-column-fallback (narrow terminal), and one-per-column
+  (a single very-wide entry collapses the whole listing).
+
+### Known gaps (tracked, not regressions)
+
+- Auto-detect ("on over TTY") cannot be made real yet: no kernel
+  primitive exposes terminal width or TTY-ness to userspace
+  (`design/user/syscall-table.md` has no `ioctl`/`ttywinsize`/`isatty`
+  entry, and fd 1 has no cap-slot binding in the M3 compat shim). `-C`
+  is the live, testable path; `tty_probe_is_tty`'s single instruction
+  flips when the sub-blocker clears, with no change needed to
+  `columns_layout` or Runner's gate.
+- `-F` and `--color` disable multicol mode at v1 (fall back to the
+  existing one-per-line renderer, which already handles both
+  correctly) rather than threading a "display width" concept through
+  `columns_layout` separate from raw byte length.
+- Terminal width is a fixed `RN_COL_TERM_WIDTH` (80) constant for the
+  same reason auto-detect isn't real yet -- no live width query exists.
 
 ## [1.1.5] -- 2026-09-06 -- `-t`/`-S`/`-r` sort options (ls.ENH-016) <a id="115"></a>
 
