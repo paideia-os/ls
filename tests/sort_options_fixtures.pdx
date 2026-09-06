@@ -1,0 +1,507 @@
+// tests/sort_options_fixtures.pdx -- ls.ENH-016 (paideia-os/ls#34)
+//
+// SortOptionsFixtures module: byte-exact (128-byte-record-exact)
+// goldens for SortOptions::sort_options_by_name /
+// sort_options_by_mtime / sort_options_by_size (src/sort_options.pdx).
+// Follows the M4 fixture convention documented in tests/README.md,
+// and the "one fixture module dispatches across every SUT function
+// its source file exports" precedent ColorFixtures set for
+// ColorPicker's three entry points.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Ten cases, dispatched by a per-case `target` selector (0 = name,
+// 1 = mtime, 2 = size) against a shared packed record table:
+//
+//   idx  target  count  reverse  names (encounter order)         expected order
+//   -----------------------------------------------------------------------------
+//    0   name    0      0        (none)                          (none)
+//    1   name    1      0        solo                            solo
+//    2   name    4      0        dave, bob, alice, carol         alice, bob, carol, dave
+//    3   name    4      1        dave, bob, alice, carol         dave, carol, bob, alice
+//    4   name    4      0        annb, anna, ann, an             an, ann, anna, annb
+//    5   name    4      0        alpha, bravo, charlie, delta    (unchanged -- already sorted)
+//    6   mtime   4      0        one, two, three, four           (unchanged -- see gap note)
+//    7   mtime   4      1        one, two, three, four           (unchanged -- see gap note)
+//    8   size    4      0        one, two, three, four           (unchanged -- see gap note)
+//    9   size    4      1        one, two, three, four           (unchanged -- see gap note)
+//
+// Case 0 pins the count == 0 no-op guard (`sort_options_by_name`'s
+// `cmp r12, 1; jbe son_done` fires on the very first check). Case 1
+// pins the count == 1 no-op guard on the same branch. Case 4 is the
+// prefix/length tiebreak pin: "ann" vs "annb" tie on their shared
+// 3-byte prefix, so `so_name_compare` falls through to the length
+// comparison ("ann", len 3, sorts before "annb", len 4) -- the exact
+// case a naive fixed-width memcmp would get wrong. Case 5 pins
+// stability-as-no-op: an already-ascending input triggers zero swaps
+// (every `so_name_compare` call returns GT-only-if-out-of-order, so
+// an in-order run never shifts anything).
+//
+// Cases 6-9 pin the documented, honest ls.ENH-016 gap: the kernel's
+// PdxFsDirEntry record (inode@0, kind@8, name_len@16, name@24 -- see
+// Runner::RN_ENT_OFF_* in src/runner.pdx) carries no mtime or size
+// field at HEAD, so `sort_options_by_mtime` / `sort_options_by_size`
+// are pass-through identity functions (see src/sort_options.pdx's
+// module doc for the full rationale). All four cases -- both
+// reverse=0 and reverse=1, for both functions -- assert the SAME
+// unchanged-order golden, which is the executable pin for that gap:
+// a future change that starts discriminating by a real mtime_ns /
+// size_bytes field has to touch this golden, making the behaviour
+// change visible in review exactly like GroupSortFixtures case 4
+// does for symlink-promotion.
+//
+// =============================================================================
+// RECORD SHAPE
+// =============================================================================
+//
+// Every record is 128 bytes / 16 u64 lanes, matching the kernel
+// PdxFsDirEntry shape Runner already buffers into `_rn_gdf_buf`:
+//   lane 0        : inode        (0 placeholder -- unused by any
+//                                 comparator this module tests)
+//   lane 1        : kind         (8 = "file" placeholder, unused)
+//   lane 2        : name_len
+//   lanes 3..15   : name bytes (104 B), little-endian packed, zero
+//                   padded past name_len. Every test name here is
+//                   <= 8 bytes, so only lane 3 carries non-zero data;
+//                   lanes 4..15 are always 0.
+//
+// =============================================================================
+// TABLE LAYOUT
+// =============================================================================
+//
+//   _sof_counts    [u64; 10] -- entries per case
+//   _sof_reverse   [u64; 10] -- reverse flag per case (0 or 1)
+//   _sof_target    [u64; 10] -- 0 = sort_options_by_name,
+//                               1 = sort_options_by_mtime,
+//                               2 = sort_options_by_size
+//   _sof_offsets   [u64; 10] -- record-unit (not lane-unit) offset
+//                               into the packed 21-record tables
+//   _sof_input_all    [u64; 336] -- every case's input records, packed
+//   _sof_expected_all [u64; 336] -- every case's expected records,
+//                                   packed at the same offsets
+//
+// offsets (record units): [0, 0, 1, 5, 9, 13, 17, 17, 17, 17]; total
+// packed length = 21 records (case 0 contributes 0; cases 6-9 all
+// point at the SAME 4-record block, since the pass-through identity
+// golden is identical for every (target, reverse) combination there).
+//
+// =============================================================================
+// PUBLIC ENTRY POINTS
+// =============================================================================
+//
+//   sort_options_fixtures_case_count() -> u64
+//   sort_options_fixtures_run(case_idx) -> u64      -- 0 pass; err+idx on fail
+//   sort_options_fixtures_verify_all() -> u64       -- fail-fast walk
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`SortOptionsFixtures`).
+//   - No `test` mnemonic; every zero-check / bound-check uses `cmp
+//     reg, 0` or `cmp reg, reg`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates:
+//     10 (case cap), 2 (target discriminator). The SOF_ERR_* sentinels
+//     are `mov rax, imm64` stores.
+//   - No byte reads/writes in the harness itself -- every table
+//     element is a full u64 lane, loaded/stored via
+//     `[base + index * 8]` (the #1248 mitigation is for narrow
+//     `mov_b` loads only, and this harness never inspects name bytes
+//     directly -- `so_name_compare`, inside the SUT, does that).
+//   - r8 / r9 / r10 / r11 are scratch. Labels prefixed sofr_ / sofva_.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   sort_options_by_name  -- SortOptions (src/sort_options.pdx)
+//   sort_options_by_mtime -- SortOptions (src/sort_options.pdx)
+//   sort_options_by_size  -- SortOptions (src/sort_options.pdx)
+
+module SortOptionsFixtures = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let SOF_OK                  : u64 = 0
+  pub let SOF_ERR_COUNT_MISMATCH  : u64 = 0xFFFFEB15    // + case_idx (0..9)
+  pub let SOF_ERR_ORDER_MISMATCH  : u64 = 0xFFFFEB32    // + case_idx (0..9)
+  pub let SOF_ERR_BAD_CASE_IDX    : u64 = 0xFFFFEB3F
+
+  pub let SOF_CASE_COUNT          : u64 = 10
+
+  // ==========================================================================
+  // Per-case metadata.
+  // ==========================================================================
+  pub let _sof_counts : [u64; 10] = [
+      0,    // case 0: empty
+      1,    // case 1: single entry
+      4,    // case 2: name-sort ascending
+      4,    // case 3: name-sort descending
+      4,    // case 4: name-sort prefix/length tiebreak
+      4,    // case 5: name-sort already-ascending no-op
+      4,    // case 6: mtime pass-through, reverse=0
+      4,    // case 7: mtime pass-through, reverse=1
+      4,    // case 8: size pass-through, reverse=0
+      4     // case 9: size pass-through, reverse=1
+  ]
+
+  pub let _sof_reverse : [u64; 10] = [
+      0, 0, 0, 1, 0, 0, 0, 1, 0, 1
+  ]
+
+  // 0 = sort_options_by_name, 1 = sort_options_by_mtime,
+  // 2 = sort_options_by_size.
+  pub let _sof_target : [u64; 10] = [
+      0, 0, 0, 0, 0, 0, 1, 1, 2, 2
+  ]
+
+  // Record-unit offset into _sof_input_all / _sof_expected_all.
+  pub let _sof_offsets : [u64; 10] = [
+      0, 0, 1, 5, 9, 13, 17, 17, 17, 17
+  ]
+
+  // ==========================================================================
+  // Packed input records (21 records * 16 lanes = 336 u64 elements).
+  //
+  // Name -> packed little-endian lane-3 value (byte0 = first char):
+  //   solo=0x6F6C6F73  dave=0x65766164  bob=0x00626F62  alice=0x6563696C61
+  //   carol=0x6C6F726163  annb=0x626E6E61  anna=0x616E6E61  ann=0x6E6E61
+  //   an=0x6E61  alpha=0x6168706C61  bravo=0x6F76617262
+  //   charlie=0x65696C72616863  delta=0x61746C6564
+  //   one=0x656E6F  two=0x6F7774  three=0x6565726874  four=0x72756F66
+  // ==========================================================================
+  pub let _sof_input_all : [u64; 336] = [
+      // case 1 (record 0): "solo" -- count 1, unchanged
+      0, 8, 4, 0x6F6C6F73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+
+      // cases 2+3 (records 1..4): dave, bob, alice, carol
+      0, 8, 4, 0x65766164, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // dave
+      0, 8, 3, 0x00626F62, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // bob
+      0, 8, 5, 0x6563696C61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // alice
+      0, 8, 5, 0x6C6F726163, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // carol
+
+      // case 3 input is identical to case 2's (records 5..8): dave, bob, alice, carol
+      0, 8, 4, 0x65766164, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // dave
+      0, 8, 3, 0x00626F62, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // bob
+      0, 8, 5, 0x6563696C61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // alice
+      0, 8, 5, 0x6C6F726163, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // carol
+
+      // case 4 (records 9..12): annb, anna, ann, an
+      0, 8, 4, 0x626E6E61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // annb
+      0, 8, 4, 0x616E6E61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // anna
+      0, 8, 3, 0x6E6E61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,     // ann
+      0, 8, 2, 0x6E61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,       // an
+
+      // case 5 (records 13..16): alpha, bravo, charlie, delta -- already sorted
+      0, 8, 5, 0x6168706C61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,     // alpha
+      0, 8, 5, 0x6F76617262, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,     // bravo
+      0, 8, 7, 0x65696C72616863, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // charlie
+      0, 8, 5, 0x61746C6564, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,     // delta
+
+      // cases 6..9 shared block (records 17..20): one, two, three, four
+      0, 8, 3, 0x656E6F, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,     // one
+      0, 8, 3, 0x6F7774, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,     // two
+      0, 8, 5, 0x6565726874, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // three
+      0, 8, 4, 0x72756F66, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0    // four
+  ]
+
+  // ==========================================================================
+  // Packed expected records, same 336-element shape and same
+  // record-unit offsets as _sof_input_all.
+  // ==========================================================================
+  pub let _sof_expected_all : [u64; 336] = [
+      // case 1 (record 0): "solo" unchanged
+      0, 8, 4, 0x6F6C6F73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+
+      // case 2 (records 1..4): ascending -- alice, bob, carol, dave
+      0, 8, 5, 0x6563696C61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // alice
+      0, 8, 3, 0x00626F62, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // bob
+      0, 8, 5, 0x6C6F726163, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // carol
+      0, 8, 4, 0x65766164, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // dave
+
+      // case 3 (records 5..8): descending -- dave, carol, bob, alice
+      0, 8, 4, 0x65766164, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // dave
+      0, 8, 5, 0x6C6F726163, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // carol
+      0, 8, 3, 0x00626F62, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // bob
+      0, 8, 5, 0x6563696C61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // alice
+
+      // case 4 (records 9..12): ascending with prefix/length tiebreak --
+      // an, ann, anna, annb
+      0, 8, 2, 0x6E61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,       // an
+      0, 8, 3, 0x6E6E61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,     // ann
+      0, 8, 4, 0x616E6E61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // anna
+      0, 8, 4, 0x626E6E61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // annb
+
+      // case 5 (records 13..16): unchanged -- alpha, bravo, charlie, delta
+      0, 8, 5, 0x6168706C61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,     // alpha
+      0, 8, 5, 0x6F76617262, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,     // bravo
+      0, 8, 7, 0x65696C72616863, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // charlie
+      0, 8, 5, 0x61746C6564, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,     // delta
+
+      // cases 6..9 (records 17..20): unchanged -- one, two, three, four
+      // (the pass-through-identity golden for the documented mtime/size gap)
+      0, 8, 3, 0x656E6F, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,     // one
+      0, 8, 3, 0x6F7774, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,     // two
+      0, 8, 5, 0x6565726874, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // three
+      0, 8, 4, 0x72756F66, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0    // four
+  ]
+
+  // ==========================================================================
+  // .bss working copy -- 64 u64 lanes (4 records), the widest case
+  // any row in _sof_counts declares. sort_options_by_* mutates its
+  // entries_ptr argument in place, so every run copies the golden
+  // input into this scratch buffer first rather than sorting
+  // _sof_input_all itself (which must stay pristine across repeated
+  // sort_options_fixtures_run calls, e.g. from verify_all's walk).
+  // ==========================================================================
+  pub let mut _sof_scratch : [u64; 64] = uninit @align(8)
+
+  // ==========================================================================
+  // sort_options_fixtures_case_count() -> u64
+  //
+  // Leaf.
+  // ==========================================================================
+  pub let sort_options_fixtures_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-016 (#34): return SOF_CASE_COUNT (10) for a harness iterating via sort_options_fixtures_run. Leaf pure function. paideia-as conformance: no test mnemonic; no cmp. Labels prefixed sofcc_.",
+      block: {
+        mov rax, 10;                              // SOF_CASE_COUNT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sort_options_fixtures_run(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI: case_idx (0..9)
+  //   RAX: 0 on pass; SOF_ERR_COUNT_MISMATCH + case_idx or
+  //        SOF_ERR_ORDER_MISMATCH + case_idx on fail;
+  //        SOF_ERR_BAD_CASE_IDX on out-of-range.
+  //
+  // Sequence:
+  //   (1) Bounds check case_idx < 10.
+  //   (2) Load count (r12), reverse (r13), target (r14, 0/1/2) and
+  //       record-unit offset (r15, then shl 4 -> lane_offset) from
+  //       the four per-case tables.
+  //   (3) scratch_ptr (rbp) = &_sof_scratch.
+  //   (4) Copy count*16 lanes from _sof_input_all[lane_offset..] into
+  //       the scratch buffer (word copy, no #1248 mitigation needed).
+  //   (5) Dispatch on target: 0 -> sort_options_by_name(scratch_ptr,
+  //       count, reverse); 1 -> sort_options_by_mtime(same args);
+  //       2 -> sort_options_by_size(same args).
+  //   (6) cmp rax, count; mismatch -> SOF_ERR_COUNT_MISMATCH + case_idx
+  //       (every SortOptions entry point echoes count on well-formed
+  //       input, mirroring GroupSort::group_sort_partition's contract).
+  //   (7) Word-diff loop scratch[0..count*16) vs
+  //       _sof_expected_all[lane_offset..]; first mismatch ->
+  //       SOF_ERR_ORDER_MISMATCH + case_idx.
+  //
+  // Register plan (six callee-save pushes -- every one of rbx/r12..
+  // r15/rbp is committed, mirroring the widest register plans already
+  // in this tree, e.g. Runner::runner_ls):
+  //   rbx = case_idx (survives)
+  //   r12 = count (survives; also the sort call's 2nd arg + the
+  //         diff-loop's iteration count after shl 4)
+  //   r13 = reverse (survives; the sort call's 3rd arg)
+  //   r14 = target selector (survives; consumed once at dispatch)
+  //   r15 = lane_offset (survives; = _sof_offsets[case_idx] * 16)
+  //   rbp = scratch_ptr (survives; the sort call's 1st arg)
+  //
+  // Alignment: 6 pushes = 48 bytes + sub rsp,8 pad = 56; entry
+  // rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at the
+  // sort_options_by_{name,mtime,size} call site. Matched add rsp,8 +
+  // 6 pops before every ret.
+  // ==========================================================================
+  pub let sort_options_fixtures_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-016 (#34): run one SortOptions boundary/behaviour case. Bounds-check case_idx < 10 -> SOF_ERR_BAD_CASE_IDX. Load count/reverse/target/offset from the four per-case tables at index rbx (case_idx), staging lane_offset = offset * 16 via shl r15,4. scratch_ptr = &_sof_scratch. Copy loop moves count*16 u64 lanes from _sof_input_all[lane_offset..] into the scratch buffer (plain qword mov, no byte-level #1248 mitigation -- every table element is a full lane). Dispatch on target (r14): 0 -> sort_options_by_name, 1 -> sort_options_by_mtime, 2 -> sort_options_by_size, each called as (scratch_ptr, count, reverse). Count-echo check (cmp rax, r12) catches a SUT that returns the wrong count before the diff loop even runs. Word-diff loop reuses rcx as the 0..count*16 index (free after the one call already happened) and r8/r9/r10/r11 as scratch address/value registers for the expected-side lookup (r10 = &_sof_expected_all, r8 = lane_offset+idx staged fresh each iteration since r9 already carries the loop bound count*16). Six callee-save pushes (rbx=case_idx, r12=count, r13=reverse, r14=target, r15=lane_offset, rbp=scratch_ptr) + sub rsp,8 pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; aligned at every SortOptions call site. paideia-as: no test mnemonic; largest cmp immediate 10 (SOF_CASE_COUNT) / 2 (target discriminator); SOF_ERR_* sentinels via mov rax, imm64 + add rax, rbx. No byte reads -- every table element is a full u64 lane. Labels prefixed sofr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // case_idx
+
+        cmp rbx, 10;                              // SOF_CASE_COUNT
+        jae sofr_bad_idx;
+
+        lea r11, [rip + _sof_counts];
+        mov r12, [r11 + rbx * 8];                 // count
+
+        lea r11, [rip + _sof_reverse];
+        mov r13, [r11 + rbx * 8];                 // reverse
+
+        lea r11, [rip + _sof_target];
+        mov r14, [r11 + rbx * 8];                 // target (0/1/2)
+
+        lea r11, [rip + _sof_offsets];
+        mov r15, [r11 + rbx * 8];                 // offset (record units)
+        shl r15, 4;                               // lane_offset = offset * 16
+
+        lea rbp, [rip + _sof_scratch];            // scratch_ptr
+
+        // ---- copy input_all[lane_offset .. lane_offset + count*16) ----
+        mov r9, r12;
+        shl r9, 4;                                // total lanes to copy
+        lea r10, [rip + _sof_input_all];
+        xor rcx, rcx;
+
+      sofr_copy_loop:
+        cmp rcx, r9;
+        jae sofr_copy_done;
+
+        mov r8, r15;
+        add r8, rcx;                              // source lane index
+        mov rax, [r10 + r8 * 8];
+        mov [rbp + rcx * 8], rax;
+
+        add rcx, 1;
+        jmp sofr_copy_loop;
+
+      sofr_copy_done:
+        // ---- dispatch ----
+        mov rdi, rbp;                             // entries_ptr
+        mov rsi, r12;                             // count
+        mov rdx, r13;                             // reverse
+
+        cmp r14, 1;
+        je  sofr_call_mtime;
+        cmp r14, 2;
+        je  sofr_call_size;
+
+        call sort_options_by_name;
+        jmp sofr_after_call;
+
+      sofr_call_mtime:
+        call sort_options_by_mtime;
+        jmp sofr_after_call;
+
+      sofr_call_size:
+        call sort_options_by_size;
+
+      sofr_after_call:
+        cmp rax, r12;
+        jne sofr_count_fail;
+
+        // ---- word-diff scratch vs expected_all[lane_offset..] ----
+        mov r9, r12;
+        shl r9, 4;                                // total lanes
+        lea r10, [rip + _sof_expected_all];
+        xor rcx, rcx;
+
+      sofr_diff_loop:
+        cmp rcx, r9;
+        jae sofr_ok;
+
+        mov rax, [rbp + rcx * 8];                 // actual
+        mov r8, r15;
+        add r8, rcx;                              // expected lane index
+        mov r11, [r10 + r8 * 8];                  // expected
+        cmp rax, r11;
+        jne sofr_order_fail;
+
+        add rcx, 1;
+        jmp sofr_diff_loop;
+
+      sofr_ok:
+        xor rax, rax;
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sofr_count_fail:
+        mov rax, 0xFFFFEB15;                      // SOF_ERR_COUNT_MISMATCH
+        add rax, rbx;
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sofr_order_fail:
+        mov rax, 0xFFFFEB32;                      // SOF_ERR_ORDER_MISMATCH
+        add rax, rbx;
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sofr_bad_idx:
+        mov rax, 0xFFFFEB3F;                      // SOF_ERR_BAD_CASE_IDX
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sort_options_fixtures_verify_all() -> u64
+  //
+  // Walk case_idx 0..9; first non-zero return propagates.
+  //
+  // Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24;
+  // entry rsp % 16 == 8; 8 + 24 = 32; aligned at
+  // sort_options_fixtures_run's call site.
+  // ==========================================================================
+  pub let sort_options_fixtures_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-016 (#34): fail-fast walk of all 10 SortOptions boundary/behaviour cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp % 16 == 8; 8 + 24 = 32; aligned at sort_options_fixtures_run's call site. Matched add rsp,8 + 2 pops. paideia-as: no test mnemonic; cmp against 10 fits imm32. Labels prefixed sofva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 10;                              // SOF_CASE_COUNT
+
+      sofva_loop:
+        cmp rbx, r12;
+        jae sofva_ok;
+
+        mov rdi, rbx;
+        call sort_options_fixtures_run;
+        cmp rax, 0;
+        jne sofva_out;
+
+        add rbx, 1;
+        jmp sofva_loop;
+
+      sofva_ok:
+        xor rax, rax;
+      sofva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

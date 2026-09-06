@@ -1,0 +1,470 @@
+// src/sort_options.pdx -- ls.ENH-016 (paideia-os/ls#34)
+//
+// SortOptions module: the `-t` / `-S` / `-r` sort-order comparators.
+// `ArgvSurface::AS_BIT_T` / `AS_BIT_S` / `AS_BIT_R_REV` (0x40 / 0x80 /
+// 0x100) already parse at HEAD (commit 52e14a7) -- this module
+// supplies the comparator half so `Runner::runner_ls` can actually
+// reorder a buffered listing instead of merely accepting the flags.
+// The wiring lives in src/runner.pdx's `rn_ls_gdf_partition` label,
+// which now runs a requested sort BEFORE any `--group-directories-
+// first` partition (ls.ENH-020, #38) so the partition's stability
+// preserves the sort's order within each of the two groups.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Three entry points, one per sort mode Runner can request:
+//
+//   sort_options_by_name(entries_ptr, count, reverse)  -> count
+//   sort_options_by_mtime(entries_ptr, count, reverse) -> count
+//   sort_options_by_size(entries_ptr, count, reverse)  -> count
+//
+// `entries_ptr` is a caller-owned array of `count` 128-byte
+// PdxFsDirEntry-shaped records (the exact shape Runner already
+// buffers into `_rn_gdf_buf` for `--group-directories-first`; see
+// `Runner::RN_ENT_OFF_*` in src/runner.pdx). Every function sorts
+// IN PLACE (an in-place insertion sort, per the issue's own choice --
+// paideia-as has no libc qsort, and insertion sort is fine at the
+// N <= 64 scale `RN_GDF_MAX_ENTRIES` / `RN_R_MAX_ENTRIES` already
+// bound every buffered listing to) and echoes `count` back in RAX,
+// mirroring `GroupSort::group_sort_partition`'s own "cannot fail on
+// well-formed input" contract.
+//
+// `reverse` (0 or 1, `ArgvSurface::AS_BIT_R_REV` decoded by the
+// caller) flips the comparison sense: ascending when 0, descending
+// when non-zero. Default sort with none of -t/-S/-r is lexicographic
+// ascending by name -- that IS `sort_options_by_name(..., reverse=0)`;
+// bare `-r` alone is `sort_options_by_name(..., reverse=1)`.
+//
+// =============================================================================
+// so_name_compare: THE ONLY REAL COMPARATOR
+// =============================================================================
+//
+// `sort_options_by_name` is a genuine lexicographic byte-compare
+// insertion sort over the `name_len` (offset 16) / name-bytes (offset
+// 24, up to 104 B) fields every buffered record actually carries.
+// The comparator (`so_name_compare`) is a standard bounded
+// byte-by-byte compare over `min(a_len, b_len)` bytes, falling back
+// to a length tiebreak when every compared byte ties -- the shorter
+// name sorts first (POSIX `strcmp`-on-a-length-bounded-buffer
+// semantics; "ann" < "annb" because both share the 3-byte prefix
+// "ann" and "ann" is shorter). This does NOT depend on the record's
+// 104-byte name field being NUL/zero-padded past `name_len` (it might
+// not be, depending on what wrote it); the comparator only ever reads
+// the first `min(a_len, b_len)` bytes of each name.
+//
+// =============================================================================
+// sort_options_by_mtime / sort_options_by_size: THE HONEST GAP
+// =============================================================================
+//
+// The kernel's PdxFsDirEntry record, as `sys_pdxfs_dir_readnext`
+// (sysno 72) fills it and as Runner buffers it, is exactly 128 bytes:
+// inode @0, kind @8, name_len @16, name @24 (104 B) -- see
+// `Runner::RN_ENT_OFF_*` in src/runner.pdx, which are the same
+// offsets this module's own SO_ENT_OFF_* constants mirror. There is
+// NO mtime field and NO size field anywhere in that record. This is
+// the same kernel-record gap `LongFormat::long_format_line` already
+// works around by hardcoding a 0 placeholder for both columns in `-l`
+// output (see src/runner.pdx's rn_ls_render_long comment: "Size and
+// mtime are similarly 0 placeholders (kernel-blocked per plan doc
+// §7)"), and the same gap `GroupSort::group_sort_partition`'s own
+// module doc calls out for a hypothetical stat-follow symlink check.
+//
+// Rather than pretend a substitute key (e.g. inode order, which is
+// often roughly creation-order on a real filesystem but is NOT mtime
+// and NOT size, and presenting it as either would be a silent wrong
+// answer -- exactly the discipline this whole repo refuses to cut
+// corners on), `sort_options_by_mtime` and `sort_options_by_size` are
+// honest pass-through identity functions: every pairwise "compare" a
+// real implementation would run ties (there is no field to read), so
+// a stable insertion sort over an all-ties key performs zero swaps
+// regardless of `reverse` -- the buffered listing keeps its original
+// readdir encounter order for `-t`, `-tr`, `-S`, and `-Sr` alike. This
+// is pinned as an executable golden by
+// `tests/sort_options_fixtures.pdx` (cases 6-9): once the kernel
+// record grows real `mtime_ns` / `size_bytes` fields, only these two
+// functions' key-extraction step needs to change to a real insertion
+// sort shaped exactly like `sort_options_by_name` (swap the
+// `so_name_compare` call for a numeric key compare); the fixture
+// golden is the trip-wire that makes that future change visible in
+// review, matching `GroupSortFixtures` case 4's symlink-promotion
+// pin.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`SortOptions`), no directory
+//     prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates
+//     in this module: 128 (SO_ENT_SIZE, never compared -- only used
+//     as a doc constant), 16 (lane count), 2 (SO_CMP_GT).
+//   - `and` never targets r11 with a 64-bit immediate; r11 is used
+//     only via `lea r11, [rip + sym]` and as a general address-
+//     staging scratch register (its established role throughout this
+//     tree), never as an `and` destination.
+//   - Byte reads (inside `so_name_compare` only) use `xor rax, rax;
+//     mov_b rax, [ptr]` per #1248.
+//   - No `lea reg, [reg + reg * 8]` -- every scaled-index memory
+//     operand uses a plain register base (no `rip`), matching this
+//     tree's exclusive use of `lea` for `[rip + sym]` reaches only;
+//     byte-address materialization goes through explicit
+//     `mov`/`shl`/`add` chains (the `rn_ls_recurse_emit_loop`
+//     precedent in src/runner.pdx).
+//   - `so_name_compare` is a LEAF (no calls; every register is
+//     caller-save; no push/pop). `sort_options_by_name` is NON-LEAF
+//     (calls `so_name_compare`); six callee-save pushes (rbx =
+//     entries_ptr, r12 = count, r13 = reverse, r14 = outer index i,
+//     r15 = inner index j, rbp = tmp-record name pointer) + `sub rsp,
+//     8` pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 ==
+//     0 at the `so_name_compare` call site. `sort_options_by_mtime`
+//     and `sort_options_by_size` are LEAF pass-throughs (no memory
+//     access at all -- they never dereference `entries_ptr`).
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called by:
+//   runner_ls -- Runner (src/runner.pdx), `rn_ls_gdf_partition` label,
+//                whenever `_rn_sort_mode` is set (any of
+//                AS_BIT_T / AS_BIT_S / AS_BIT_R_REV).
+
+module SortOptions = structure {
+
+  // ==========================================================================
+  // PdxFsDirEntry record-shape constants (mirrors Runner::RN_ENT_OFF_*
+  // in src/runner.pdx; re-declared locally per this tree's convention
+  // of not importing numeric constants across module boundaries --
+  // only functions cross-call).
+  // ==========================================================================
+  pub let SO_ENT_LANES        : u64 = 16     // 128 B / 8
+  pub let SO_ENT_SIZE         : u64 = 128
+  pub let SO_ENT_OFF_NAME_LEN : u64 = 16
+  pub let SO_ENT_OFF_NAME     : u64 = 24
+  pub let SO_ENT_NAME_MAX     : u64 = 104
+
+  // so_name_compare return-value vocabulary.
+  pub let SO_CMP_LT : u64 = 0
+  pub let SO_CMP_EQ : u64 = 1
+  pub let SO_CMP_GT : u64 = 2
+
+  // ==========================================================================
+  // .bss scratch -- one 128-byte "key" record, used by
+  // sort_options_by_name's insertion-sort shift loop. Not reentrant
+  // (a single in-flight sort at a time, matching Runner's own
+  // single-threaded per-invocation model).
+  // ==========================================================================
+  pub let mut _so_tmp_record : [u64; 16] = uninit @align(8)
+
+  // ==========================================================================
+  // so_name_compare(a_ptr, a_len, b_ptr, b_len) -> u64 (SO_CMP_LT/EQ/GT)
+  //
+  // Signature: (u64, u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI (input):  a_ptr -- first name's byte pointer (not
+  //                 necessarily NUL-terminated; only a_len bytes are
+  //                 defined).
+  //   RSI (input):  a_len -- first name's length.
+  //   RDX (input):  b_ptr -- second name's byte pointer.
+  //   RCX (input):  b_len -- second name's length.
+  //   RAX (output): SO_CMP_LT (0) if a < b, SO_CMP_EQ (1) if a == b,
+  //                 SO_CMP_GT (2) if a > b, lexicographically over
+  //                 the shared prefix with a length tiebreak.
+  //
+  // Register plan (leaf; no nested calls, every register caller-save):
+  //   r10 = min(a_len, b_len), then reused as nothing else
+  //   r9  = scan index
+  //   r11 = address-staging scratch (a_ptr + idx, then b_ptr + idx)
+  //   rax = byte_a load / final return value
+  //   r8  = byte_b load
+  // ==========================================================================
+  pub let so_name_compare : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (a_ptr: u64) (a_len: u64) (b_ptr: u64) (b_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-016 (#34): bounded lexicographic byte compare, the sole real comparator this module implements (sort_options_by_mtime / sort_options_by_size have no field to compare -- see the module doc's honest-gap section). min_len = min(a_len=rsi, b_len=rcx), staged in r10 via a single cmp+cmov-shaped branch (mov r10,rsi; cmp r10,rcx; jbe so_nc_min_ok; mov r10,rcx). Scan loop (so_nc_loop) walks idx=r9 from 0 to min_len, loading byte_a from [a_ptr+idx] and byte_b from [b_ptr+idx] with the #1248 mitigation (xor rax,rax; mov_b rax,[addr]) into rax and r8 respectively, then cmp rax,r8 with jl/jg short-circuiting to so_nc_lt/so_nc_gt on the first differing byte. If every compared byte ties (loop exhausts at idx==min_len), so_nc_tail falls back to a length compare (cmp rsi,rcx; jl/jg) -- ties on the full shared prefix resolve by length, shorter sorts first (SO_CMP_LT), matching strcmp-on-a-bounded-buffer semantics ('ann' < 'annb'). Exactly-equal names (same bytes, same length) return SO_CMP_EQ (1). Leaf function: no CALL instructions, so no push/pop parity or SysV alignment to maintain; rdi/rsi/rdx/rcx are read-only throughout (rsi and rcx are re-read at so_nc_tail after the scan loop, which never writes to them). paideia-as conformance: no test mnemonic; every cmp immediate (0) fits imm32 trivially; byte reads use xor reg,reg; mov_b reg,[reg] with [reg]-only addressing (r11 for a-side, reused for b-side after the a-side load completes); r10/r9/r11/r8 are the only scratch registers, per convention. Labels prefixed so_nc_.",
+      block: {
+        mov r10, rsi;                       // r10 = a_len
+        cmp r10, rcx;
+        jbe so_nc_min_ok;
+        mov r10, rcx;                       // r10 = min(a_len, b_len) = b_len
+
+      so_nc_min_ok:
+        xor r9, r9;                         // idx = 0
+
+      so_nc_loop:
+        cmp r9, r10;
+        jae so_nc_tail;
+
+        mov r11, rdi;
+        add r11, r9;
+        xor rax, rax;
+        mov_b rax, [r11];                   // byte_a  (#1248 mitigation)
+
+        mov r11, rdx;
+        add r11, r9;
+        xor r8, r8;
+        mov_b r8, [r11];                    // byte_b  (#1248 mitigation)
+
+        cmp rax, r8;
+        jl  so_nc_lt;
+        jg  so_nc_gt;
+
+        add r9, 1;
+        jmp so_nc_loop;
+
+      so_nc_tail:
+        // Every compared byte tied -- fall back to a length compare.
+        cmp rsi, rcx;                       // a_len vs b_len
+        jl  so_nc_lt;
+        jg  so_nc_gt;
+
+        mov rax, 1;                         // SO_CMP_EQ
+        ret;
+
+      so_nc_lt:
+        xor rax, rax;                       // SO_CMP_LT
+        ret;
+
+      so_nc_gt:
+        mov rax, 2;                         // SO_CMP_GT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sort_options_by_name(entries_ptr, count, reverse) -> u64
+  //
+  // Signature: (u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI (input):  entries_ptr -- caller-owned array of `count`
+  //                 128-byte (16 u64 lane) PdxFsDirEntry-shaped
+  //                 records, sorted IN PLACE.
+  //   RSI (input):  count -- number of records (0 or 1 is a legal
+  //                 no-op).
+  //   RDX (input):  reverse -- 0 = ascending, non-zero = descending.
+  //   RAX (output): `count`, echoed back (mirrors
+  //                 GroupSort::group_sort_partition's convention).
+  //
+  // Standard in-place insertion sort: for i in 1..count, save
+  // entries[i] into the _so_tmp_record scratch ("the key"), then
+  // shift every preceding out-of-order record one slot right until
+  // the key's correct position is found, and drop the key there. The
+  // "out of order" test is `so_name_compare(entries[j-1], key)`:
+  // ascending mode shifts while the result is SO_CMP_GT (2);
+  // descending mode shifts while the result is SO_CMP_LT (0). Either
+  // way the loop stops (and places the key) on SO_CMP_EQ, so equal
+  // names keep their original relative order -- this insertion sort
+  // is stable.
+  //
+  // Register plan (six callee-save pushes; see module doc's
+  // PAIDEIA-AS CONFORMANCE section for the full byte-accounting):
+  //   rbx = entries_ptr        r12 = count        r13 = reverse
+  //   r14 = outer index i      r15 = inner index j
+  //   rbp = tmp-record name pointer (&_so_tmp_record + 24), computed
+  //         once per outer iteration right after the key is saved
+  // ==========================================================================
+  pub let sort_options_by_name : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (entries_ptr: u64) (count: u64) (reverse: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-016 (#34): in-place stable insertion sort over the name field of `count` 128-byte records at entries_ptr. count <= 1 is a legal no-op (cmp r12,1; jbe son_done). Outer loop (son_outer, i=r14 from 1 to count-1): copies entries[i] (16-lane bulk copy, dst_lane_base=i*16 via shl r9,4) into _so_tmp_record (the 'key'), then computes rbp = &_so_tmp_record + 24 (the key's name pointer) once for the whole inner loop. Inner loop (son_inner, j=r15 initialized to i): while j > 0, computes idx=j-1 and its lane base (r9 = idx*16), loads entries[idx]'s name_len (qword at lane idx*16+2, i.e. [rbx + (idx_lane+2)*8]) into rsi and materializes its name-byte address (rdi = rbx + idx_lane*8 + 24, via the mov/shl/add chain this tree uses everywhere a byte pointer is needed from a lane index -- see rn_ls_recurse_emit_loop in src/runner.pdx for the identical idiom) then calls so_name_compare(entries[idx].name_ptr, entries[idx].name_len, key.name_ptr=rbp, key.name_len=[&_so_tmp_record+16]). Ascending (r13==0): shift (16-lane copy entries[idx] into entries[j]) iff result==SO_CMP_GT (2); anything else places the key at j and ends the inner loop. Descending (r13!=0): shift iff result==SO_CMP_LT (0). After a shift, j decrements and the inner loop repeats; idx's lane base is recomputed fresh each iteration since r9 does not survive the so_name_compare call as anything meaningful (it is caller-save and the call clobbers it). Placing the key (son_place) bulk-copies _so_tmp_record into entries[j] and the outer loop advances (i += 1). Six callee-save pushes (rbx=entries_ptr, r12=count, r13=reverse, r14=i, r15=j, rbp=tmp key name ptr) + sub rsp,8 pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; aligned at every so_name_compare call site. Matched add rsp,8 + 6 pops before every ret (single exit at son_done). paideia-as conformance: no test mnemonic; largest cmp immediate is 16 (lane-copy loop bound) / 2 (SO_CMP_GT); r11 used only for address staging (mov/add chains), never as an `and` destination with a 64-bit immediate; no lea with a plain-register base+scaled-index (every byte address is built via mov/shl/add, matching this tree's lea-is-rip-only convention). Labels prefixed son_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov rbx, rdi;                       // entries_ptr
+        mov r12, rsi;                       // count
+        mov r13, rdx;                       // reverse
+
+        cmp r12, 1;
+        jbe son_done;                       // count 0 or 1: already "sorted"
+
+        mov r14, 1;                         // i = 1
+
+      son_outer:
+        cmp r14, r12;
+        jae son_done;
+
+        // ---- save key = entries[i] into _so_tmp_record ----
+        mov r9, r14;
+        shl r9, 4;                          // src_lane_base = i * 16
+        lea r10, [rip + _so_tmp_record];
+        xor rcx, rcx;
+
+      son_save_loop:
+        cmp rcx, 16;
+        jae son_save_done;
+
+        mov r11, r9;
+        add r11, rcx;
+        mov rax, [rbx + r11 * 8];
+        mov [r10 + rcx * 8], rax;
+
+        add rcx, 1;
+        jmp son_save_loop;
+
+      son_save_done:
+        // tmp_name_ptr (rbp) = &_so_tmp_record + 24 (SO_ENT_OFF_NAME).
+        lea rbp, [rip + _so_tmp_record];
+        add rbp, 24;
+
+        mov r15, r14;                       // j = i
+
+      son_inner:
+        cmp r15, 0;
+        je  son_place;
+
+        // idx = j - 1; lane_base(idx) = idx * 16.
+        mov r9, r15;
+        sub r9, 1;
+        shl r9, 4;
+
+        // a_len = entries[idx].name_len = [rbx + (lane_base+2)*8]
+        mov r10, r9;
+        add r10, 2;
+        mov rsi, [rbx + r10 * 8];
+
+        // a_ptr = rbx + lane_base*8 + 24
+        mov rdi, r9;
+        shl rdi, 3;
+        add rdi, rbx;
+        add rdi, 24;
+
+        // b_ptr / b_len = key's name pointer / length.
+        mov rdx, rbp;
+        lea r11, [rip + _so_tmp_record];
+        mov rcx, [r11 + 16];                // SO_ENT_OFF_NAME_LEN
+
+        call so_name_compare;
+
+        cmp r13, 0;
+        jne son_desc_check;
+
+        // Ascending: shift iff entries[idx] > key.
+        cmp rax, 2;                         // SO_CMP_GT
+        jne son_place;
+        jmp son_shift;
+
+      son_desc_check:
+        // Descending: shift iff entries[idx] < key.
+        cmp rax, 0;                         // SO_CMP_LT
+        jne son_place;
+
+      son_shift:
+        // Recompute idx's lane base (r9 is caller-save; the call above
+        // may have clobbered it) and copy entries[idx] -> entries[j].
+        mov r9, r15;
+        sub r9, 1;
+        shl r9, 4;                          // idx * 16
+
+        mov r8, r15;
+        shl r8, 4;                          // j * 16
+
+        xor rcx, rcx;
+
+      son_shift_loop:
+        cmp rcx, 16;
+        jae son_shift_done;
+
+        mov r11, r9;
+        add r11, rcx;
+        mov rax, [rbx + r11 * 8];
+
+        mov r11, r8;
+        add r11, rcx;
+        mov [rbx + r11 * 8], rax;
+
+        add rcx, 1;
+        jmp son_shift_loop;
+
+      son_shift_done:
+        sub r15, 1;                         // j -= 1
+        jmp son_inner;
+
+      son_place:
+        mov r8, r15;
+        shl r8, 4;                          // j * 16
+        lea r10, [rip + _so_tmp_record];
+        xor rcx, rcx;
+
+      son_place_loop:
+        cmp rcx, 16;
+        jae son_place_done;
+
+        mov rax, [r10 + rcx * 8];
+        mov r11, r8;
+        add r11, rcx;
+        mov [rbx + r11 * 8], rax;
+
+        add rcx, 1;
+        jmp son_place_loop;
+
+      son_place_done:
+        add r14, 1;                         // i += 1
+        jmp son_outer;
+
+      son_done:
+        mov rax, r12;                       // echo count
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sort_options_by_mtime(entries_ptr, count, reverse) -> u64
+  //
+  // Signature: (u64, u64, u64) -> u64 !{} @{}
+  //   RDI: entries_ptr (unused -- see module doc's honest-gap section)
+  //   RSI: count (echoed back in RAX)
+  //   RDX: reverse (unused)
+  //
+  // Honest pass-through identity: the kernel's PdxFsDirEntry record
+  // carries no mtime field, so there is no key to sort by. See the
+  // module doc's "sort_options_by_mtime / sort_options_by_size: THE
+  // HONEST GAP" section for the full rationale and the trip-wire
+  // fixture (tests/sort_options_fixtures.pdx cases 6-7) that pins
+  // this behaviour so a future real implementation shows up as a
+  // diff, not a silent change.
+  //
+  // Leaf; touches no memory at all (never dereferences entries_ptr).
+  // ==========================================================================
+  pub let sort_options_by_mtime : (u64, u64, u64) -> u64 !{} @{} =
+    fn (entries_ptr: u64) (count: u64) (reverse: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-016 (#34): honest pass-through -- PdxFsDirEntry (inode@0, kind@8, name_len@16, name@24; see Runner::RN_ENT_OFF_* in src/runner.pdx) has no mtime field at HEAD, so every pairwise comparison a real mtime sort would run ties, and a stable insertion sort over an all-ties key performs zero swaps regardless of `reverse`. Rather than emit an insertion-sort skeleton whose comparator always returns EQ (dead weight with no behavioural difference from a no-op, and a needless place to hide a future bug), this function is the literal reduction of that skeleton: echo count (rsi) in rax and return, touching neither entries_ptr nor reverse. Leaf; effects {} because no memory is read or written -- entries_ptr is never dereferenced. paideia-as conformance: no test mnemonic; no cmp; no branches. Labels: none needed.",
+      block: {
+        mov rax, rsi;                       // echo count
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sort_options_by_size(entries_ptr, count, reverse) -> u64
+  //
+  // Signature: (u64, u64, u64) -> u64 !{} @{}
+  //
+  // Identical rationale and shape to sort_options_by_mtime -- the
+  // kernel's PdxFsDirEntry record carries no size field either.
+  // Pinned by tests/sort_options_fixtures.pdx cases 8-9.
+  // ==========================================================================
+  pub let sort_options_by_size : (u64, u64, u64) -> u64 !{} @{} =
+    fn (entries_ptr: u64) (count: u64) (reverse: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-016 (#34): honest pass-through, identical rationale to sort_options_by_mtime (see that function's justification and the module doc's honest-gap section) -- PdxFsDirEntry has no size field at HEAD. Echo count (rsi) in rax; entries_ptr and reverse are unused. Leaf, effects {}. paideia-as conformance: no test mnemonic; no cmp; no branches. Labels: none needed.",
+      block: {
+        mov rax, rsi;                       // echo count
+        ret
+      }
+    }
+}

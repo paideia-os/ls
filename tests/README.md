@@ -94,6 +94,18 @@ sub-band sentinel on fail.
   phase (`src/runner.pdx`, `rn_ls_recurse_emit_loop`) that buffers
   candidates and calls this composer issues real syscalls
   (`tty_write`) and is covered by the qemu smoke path, not here.
+- `sort_options_fixtures.pdx` — `ls.ENH-016` (#34). 10 cases across
+  `SortOptions`'s three entry points: 6 for `sort_options_by_name`
+  (empty, single-entry, ascending, descending, a prefix/length
+  tiebreak pin `"ann" < "annb"`, and an already-sorted no-op check),
+  plus 2 each for `sort_options_by_mtime` / `sort_options_by_size`
+  pinning the documented "no mtime/size field in the kernel's
+  PdxFsDirEntry record" gap: both functions are honest pass-through
+  identities, so every one of those 4 cases (reverse=0 and reverse=1,
+  for both functions) asserts the SAME unchanged-order golden.
+  Runner's buffered-listing wiring (`src/runner.pdx`,
+  `rn_ls_gdf_partition`) that calls these comparators is exercised
+  end-to-end by the qemu smoke path, not here.
 - `goldens/` — human-readable copies of each fixture case's
   expected byte sequence. Not read at build/test time (paideia-as
   fixture modules have no filesystem cap); the `.rodata` tables in

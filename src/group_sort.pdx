@@ -27,15 +27,17 @@
 // order preserved.
 //
 // "Within each group, sorted by whatever the existing sort discipline
-// is" (the issue's own phrasing) resolves today to raw readdir order,
-// because ls has no live sort comparator yet -- ls.ENH-016 (#34, `-t`
-// / `-S` / `-r`) is argv-surface-only at HEAD (commit 52e14a7); Runner
-// never buffers or reorders on its own. A stable partition is
-// therefore the complete and honest implementation of the current
-// discipline, and it composes with a future comparator unchanged:
-// whoever wires ENH-016 sorts the buffered entry set (or `kinds_ptr`
-// + a parallel key array) BEFORE calling group_sort_partition, and
-// the two-pass stability preserves that ordering within each group.
+// is" (the issue's own phrasing) is now live: ls.ENH-016 (#38's
+// sibling, #34, `-t` / `-S` / `-r`) wires `Runner::runner_ls` to call
+// SortOptions::sort_options_by_{name,mtime,size} on the buffered
+// `_rn_gdf_buf` record array BEFORE the kind-extraction + partition
+// steps below ever run (see src/runner.pdx's `rn_ls_gdf_partition`
+// label). Because that comparator sorts the buffer in place and this
+// partition is a STABLE two-pass scan, the sort's relative ordering
+// survives unchanged within each of the two groups this function
+// produces -- exactly the composition this module's original design
+// anticipated, landed without any change to `group_sort_partition`
+// itself.
 //
 // =============================================================================
 // NOT IN SCOPE: SYMLINK-TO-DIRECTORY PROMOTION

@@ -64,6 +64,49 @@
 // past depth 1 yet.
 //
 // =============================================================================
+// -t / -S / -r SORT OPTIONS (ls.ENH-016, #34)
+// =============================================================================
+//
+// AS_BIT_T / AS_BIT_S / AS_BIT_R_REV already parse in ArgvSurface
+// (commit 52e14a7); this landing wires the Runner side. The held
+// directory cap is forward-only (same constraint GDF and -R already
+// work under), so any requested sort reuses GDF's buffered-listing
+// machinery (_rn_gdf_buf / _rn_gdf_collect / _rn_gdf_emit_next)
+// rather than inventing a second buffer: `_rn_sort_mode` (computed
+// once at entry, alongside `_rn_gdf_mode`) is OR'd into the "take the
+// buffered path instead of streaming" decision at both the initial
+// dispatch (right before the main loop) and at `rn_ls_continue` (the
+// "advance to the next entry" seam) -- so `ls -t` with neither -R nor
+// --group-directories-first still gets buffered, exactly as the issue
+// asks.
+//
+// The actual sort runs inside `rn_ls_gdf_partition`, BEFORE the
+// existing GDF kind-extraction + `group_sort_partition` step (or, if
+// GDF was not requested, before a trivial identity-permutation fill
+// that keeps `rn_ls_gdf_emit_next`'s order-buffer-driven emission
+// loop uniform across every combination of GDF/sort/neither): if
+// `_rn_sort_mode` is set, flag_bits selects one of
+// SortOptions::sort_options_by_mtime (AS_BIT_T),
+// SortOptions::sort_options_by_size (AS_BIT_S), or
+// SortOptions::sort_options_by_name (neither -- the default
+// lexicographic sort, which is also what bare `-r` alone reverses),
+// passing AS_BIT_R_REV as the `reverse` argument. Running the sort
+// BEFORE the GDF partition matters: `group_sort_partition` is a
+// STABLE two-pass scan, so a buffer sorted first keeps that order
+// within each of the two (directory / non-directory) groups the
+// partition produces -- `ls -t --group-directories-first` groups
+// directories first and orders each group by mtime, matching GNU
+// ls's own "within each group, sorted by whatever the existing sort
+// discipline is" behaviour.
+//
+// SortOptions::sort_options_by_mtime and sort_options_by_size are
+// honest pass-through identities, not real comparators: the kernel's
+// PdxFsDirEntry record (see RN_ENT_OFF_* below) carries no mtime or
+// size field at HEAD, the same gap LongFormat's own `-l` columns
+// already placeholder at 0. See src/sort_options.pdx's module doc for
+// the full rationale and the pinned fixture golden.
+//
+// =============================================================================
 // PRE-OPENED DIR CAP CONVENTION
 // =============================================================================
 //
@@ -189,6 +232,9 @@
 //   color_sgr_prefix       -- ColorPicker (src/color_picker.pdx) -- v1.1.0 ENH-005
 //   color_sgr_suffix       -- ColorPicker (src/color_picker.pdx) -- v1.1.0 ENH-005
 //   group_sort_partition   -- GroupSort (src/group_sort.pdx) -- ls.ENH-020 (#38)
+//   sort_options_by_name   -- SortOptions (src/sort_options.pdx) -- ls.ENH-016 (#34)
+//   sort_options_by_mtime  -- SortOptions (src/sort_options.pdx) -- ls.ENH-016 (#34)
+//   sort_options_by_size   -- SortOptions (src/sort_options.pdx) -- ls.ENH-016 (#34)
 //   recurse_should_descend -- RecurseFilter (src/recurse_filter.pdx) -- ls.ENH-017 (#35)
 //   recurse_header_compose -- RecurseHeader (src/recurse_header.pdx) -- ls.ENH-017 (#35)
 
@@ -234,6 +280,14 @@ module Runner = structure {
   // future real substrate fails loudly rather than silently once a
   // directory outgrows a static buffer).
   pub let RN_GDF_MAX_ENTRIES      : u64 = 64
+  // ls.ENH-016 (#34): -t / -S / -r sort-option masks (AS_BIT_T /
+  // AS_BIT_S / AS_BIT_R_REV). Any one of the three routes the
+  // buffered listing through SortOptions before GDF's own partition
+  // step (or, absent GDF, before a trivial identity order fill) --
+  // see the file-header "-t / -S / -r SORT OPTIONS" section.
+  pub let RN_BIT_T_MASK           : u64 = 0x40
+  pub let RN_BIT_S_MASK           : u64 = 0x80
+  pub let RN_BIT_R_REV_MASK       : u64 = 0x100
   // ls.ENH-017 (#35): --recursive / -R mask (AS_BIT_R_REC, parsed at
   // src/argv_surface.pdx since commit 9fb4b98). Runner buffers every
   // recursion-candidate entry (directory-kind, not "." or "..", per
@@ -361,6 +415,16 @@ module Runner = structure {
   pub let mut _rn_gdf_kinds_buf   : [u64; 64]   = uninit @align(8)
   pub let mut _rn_gdf_order_buf   : [u64; 64]   = uninit @align(8)
 
+  // ls.ENH-016 (#34): non-zero for the whole call when any of
+  // AS_BIT_T / AS_BIT_S / AS_BIT_R_REV was set on flag_bits (computed
+  // once at entry, mirrors _rn_gdf_mode). OR'd alongside _rn_gdf_mode
+  // at every "take the buffered path" decision point so a sort-only
+  // request (no -R, no --group-directories-first) still buffers --
+  // see the file-header "-t / -S / -r SORT OPTIONS" section. Reuses
+  // _rn_gdf_buf / _rn_gdf_count / _rn_gdf_idx / _rn_gdf_order_buf;
+  // no dedicated buffer of its own.
+  pub let mut _rn_sort_mode       : u64 = uninit @align(8)
+
   // ls.ENH-017 (#35): -R (recursive) buffering state. Same shape as
   // the GDF state above, for the same reason: the held dir cap is
   // forward-only, so every recursion candidate has to be captured
@@ -450,6 +514,17 @@ module Runner = structure {
         lea r11, [rip + _rn_gdf_idx];
         mov [r11], r10;
 
+        // ---- ls.ENH-016 (#34): sort mode init --------------------------
+        //
+        // Same "compute once, stash in .bss" rationale as the GDF
+        // block above. RN_BIT_T_MASK | RN_BIT_S_MASK | RN_BIT_R_REV_
+        // MASK = 0x40 | 0x80 | 0x100 = 0x1C0.
+        mov r10, r13;                            // flag_bits copy
+        mov r11, 0x1C0;                          // T | S | R_REV masks
+        and r10, r11;
+        lea r11, [rip + _rn_sort_mode];
+        mov [r11], r10;
+
         // ---- ls.ENH-017 (#35): -R mode + state init -------------------
         //
         // Same "compute once, stash in .bss" rationale as the GDF block
@@ -510,12 +585,18 @@ module Runner = structure {
         // ---- Load LS_DIR_CAP_SLOT into rbx for the loop --------------
         mov rbx, 2;                              // LS_DIR_CAP_SLOT
 
-        // ---- ls.ENH-020 (#38): GDF branches to the collect phase -----
+        // ---- ls.ENH-020 (#38) + ls.ENH-016 (#34): GDF or a requested
+        // sort both branch to the same collect phase --------------------
         lea r11, [rip + _rn_gdf_mode];
         mov r10, [r11];
         cmp r10, 0;
         jne rn_ls_gdf_collect;
-        // Non-GDF: fall through to the unchanged streaming loop.
+        lea r11, [rip + _rn_sort_mode];
+        mov r10, [r11];
+        cmp r10, 0;
+        jne rn_ls_gdf_collect;
+        // Neither GDF nor sort requested: fall through to the
+        // unchanged streaming loop.
 
       rn_ls_loop:
         // ---- pdxfs_dir_readnext(LS_DIR_CAP_SLOT, &_rn_entry_buf) ----
@@ -547,11 +628,17 @@ module Runner = structure {
         //     RN_GDF_MAX_ENTRIES). Reuses _rn_entry_buf as the
         //     pdxfs_dir_readnext scratch target, then bulk-copies it
         //     into the next free _rn_gdf_buf slot.
-        //   rn_ls_gdf_partition    -- extract one kind-nibble per
-        //     buffered record into _rn_gdf_kinds_buf and call
+        //   rn_ls_gdf_partition    -- ls.ENH-016 (#34): first, if
+        //     _rn_sort_mode is set, calls the requested SortOptions
+        //     comparator on _rn_gdf_buf in place. Then, if AS_BIT_GDF
+        //     is set, extracts one kind-nibble per buffered record
+        //     into _rn_gdf_kinds_buf and calls
         //     GroupSort::group_sort_partition to compute a dirs-first,
         //     stable-within-group emission order into
-        //     _rn_gdf_order_buf.
+        //     _rn_gdf_order_buf; otherwise fills _rn_gdf_order_buf
+        //     with the identity permutation (0..count-1) so the
+        //     buffered-mode emission loop below is uniform regardless
+        //     of which of GDF/sort/-R triggered buffering.
         //   rn_ls_gdf_emit_next    -- the buffered-mode replacement for
         //     rn_ls_loop's "get the next entry" step: copies the
         //     buffered record at the next order-buffer index into
@@ -627,14 +714,100 @@ module Runner = structure {
         jmp rn_ls_gdf_collect;
 
       rn_ls_gdf_partition:
-        // Extract one kind-nibble per buffered record into
-        // _rn_gdf_kinds_buf, then call GroupSort::group_sort_partition.
         // r12 (path_ptr) is dead by this point -- the only use of
         // path_ptr was the M1 empty-string gate at function entry --
-        // so it is safe to repurpose here as the buffered count.
+        // so it is safe to repurpose here as the buffered count, for
+        // both the sort step below and the existing GDF partition.
         lea r11, [rip + _rn_gdf_count];
         mov r12, [r11];                          // count
 
+        // ============================================================
+        // ls.ENH-016 (#34): apply the requested sort_options
+        // comparator to the buffered _rn_gdf_buf record array BEFORE
+        // any GDF partition (or the identity-fill fallback) runs --
+        // see the file-header "-t / -S / -r SORT OPTIONS" section for
+        // why the ordering matters. r13 (flag_bits) is untouched
+        // since function entry, so it is safe to read here.
+        // ============================================================
+        lea r11, [rip + _rn_sort_mode];
+        mov r10, [r11];
+        cmp r10, 0;
+        je  rn_ls_sort_done;
+
+        // reverse (rdx, staged ahead of the mode dispatch since none
+        // of the AS_BIT_T / AS_BIT_S checks below touch rdx) =
+        // (flag_bits & AS_BIT_R_REV) != 0.
+        mov rax, r13;
+        mov r10, 0x100;                          // AS_BIT_R_REV
+        and rax, r10;
+        cmp rax, 0;
+        je  rn_ls_sort_no_rev;
+        mov rdx, 1;
+        jmp rn_ls_sort_dispatch;
+
+      rn_ls_sort_no_rev:
+        mov rdx, 0;
+
+      rn_ls_sort_dispatch:
+        // AS_BIT_T takes precedence over AS_BIT_S when both are set
+        // (`ls -tS`, an unspecified combination) -- a fixed, documented
+        // tiebreak rather than the "last flag on the command line
+        // wins" GNU ls uses, which the OR'd flag_bits vocabulary this
+        // argv surface builds cannot distinguish (see ArgvSurface's
+        // own module doc for why the bit-OR shape was chosen).
+        mov rax, r13;
+        mov r10, 0x40;                           // AS_BIT_T
+        and rax, r10;
+        cmp rax, 0;
+        jne rn_ls_sort_call_mtime;
+
+        mov rax, r13;
+        mov r10, 0x80;                           // AS_BIT_S
+        and rax, r10;
+        cmp rax, 0;
+        jne rn_ls_sort_call_size;
+
+        // Neither -t nor -S: default lexicographic sort (also what
+        // bare -r alone reverses).
+        lea r11, [rip + _rn_gdf_buf];
+        mov rdi, r11;
+        mov rsi, r12;                            // count
+        call sort_options_by_name;
+        jmp rn_ls_sort_done;
+
+      rn_ls_sort_call_mtime:
+        lea r11, [rip + _rn_gdf_buf];
+        mov rdi, r11;
+        mov rsi, r12;
+        call sort_options_by_mtime;
+        jmp rn_ls_sort_done;
+
+      rn_ls_sort_call_size:
+        lea r11, [rip + _rn_gdf_buf];
+        mov rdi, r11;
+        mov rsi, r12;
+        call sort_options_by_size;
+
+      rn_ls_sort_done:
+        // ============================================================
+        // ls.ENH-020 (#38): directories-first partition, only when
+        // AS_BIT_GDF was actually requested. This label is reached
+        // only when _rn_gdf_mode or _rn_sort_mode (or both) is set --
+        // see the branch at rn_ls_pre_emit -- so "GDF not requested
+        // here" always means "sort-only" (a bare -R with neither GDF
+        // nor a sort flag never buffers through this path at all; it
+        // uses the unchanged streaming loop plus its own -R side-
+        // buffer). Fill _rn_gdf_order_buf with the identity permutation
+        // in the sort-only case so rn_ls_gdf_emit_next's cursor-driven
+        // read stays uniform across every combination.
+        // ============================================================
+        lea r11, [rip + _rn_gdf_mode];
+        mov r10, [r11];
+        cmp r10, 0;
+        je  rn_ls_order_identity;
+
+        // Extract one kind-nibble per buffered record into
+        // _rn_gdf_kinds_buf, then call GroupSort::group_sort_partition.
         xor rcx, rcx;                             // idx = 0
 
       rn_ls_gdf_kinds_loop:
@@ -663,7 +836,25 @@ module Runner = structure {
         lea r11, [rip + _rn_gdf_order_buf];
         mov rdx, r11;
         call group_sort_partition;
+        jmp rn_ls_order_ready;
 
+      rn_ls_order_identity:
+        // ls.ENH-016 (#34): order_buf[i] = i for i in 0..count -- no
+        // GDF partition requested, so emission order is simply the
+        // (possibly already sort_options-reordered) buffer order.
+        xor rcx, rcx;                             // idx = 0
+
+      rn_ls_order_identity_loop:
+        cmp rcx, r12;
+        jae rn_ls_order_ready;
+
+        lea r11, [rip + _rn_gdf_order_buf];
+        mov [r11 + rcx * 8], rcx;
+
+        add rcx, 1;
+        jmp rn_ls_order_identity_loop;
+
+      rn_ls_order_ready:
         lea r11, [rip + _rn_gdf_idx];
         mov r10, 0;
         mov [r11], r10;
@@ -1206,6 +1397,14 @@ module Runner = structure {
         mov r10, [r11];
         cmp r10, 0;
         jne rn_ls_gdf_emit_next;
+
+        // ls.ENH-016 (#34): a sort-only request (no GDF) still uses
+        // the buffered emission cursor.
+        lea r11, [rip + _rn_sort_mode];
+        mov r10, [r11];
+        cmp r10, 0;
+        jne rn_ls_gdf_emit_next;
+
         jmp rn_ls_loop;
 
       rn_ls_done:

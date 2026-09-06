@@ -9,9 +9,66 @@ and stored under `pkgs.paideia-os/ls/<version>/`.
 
 ## [Unreleased]
 
-Post-1.1.4 items on the Enhancement v1.x wave
+Post-1.1.5 items on the Enhancement v1.x wave
 (`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
 exit-code map, wire body shape, `caps.decl`) changes in this section.
+
+## [1.1.5] -- 2026-09-06 -- `-t`/`-S`/`-r` sort options (ls.ENH-016) <a id="115"></a>
+
+**1.1.5.** `-t`/`-S`/`-r` already parsed (`AS_BIT_T`/`AS_BIT_S`/
+`AS_BIT_R_REV`, commit `52e14a7`) but had no Runner-side behaviour --
+this release lands the comparators and wires them into Runner's
+buffered-listing path (the same one `--group-directories-first`,
+ls.ENH-020 #38, already uses). Default sort stays lexicographic
+ascending by name; `-t` sorts by mtime, `-S` by size, and `-r`
+reverses whichever sort is active (`-tr` = mtime oldest-first, `-Sr`
+= smallest-first).
+
+### Added
+
+- **`SortOptions::sort_options_by_name`** (`src/sort_options.pdx`,
+  new module) -- a real, stable, in-place insertion sort over the
+  buffered records' `name_len`/name-bytes fields, via a bounded
+  lexicographic byte comparator (`so_name_compare`) with a
+  length tiebreak on a shared prefix (`"ann" < "annb"`). `reverse`
+  flips the comparison sense.
+- **`SortOptions::sort_options_by_mtime`** /
+  **`sort_options_by_size`** (same module) -- honest pass-through
+  identity functions, not real comparators: the kernel's
+  `PdxFsDirEntry` record (inode@0, kind@8, name_len@16, name@24) has
+  no mtime or size field at HEAD, the same gap `LongFormat`'s own
+  `-l` columns already placeholder at 0. A stable sort over an
+  all-ties key performs zero swaps, so `-t`/`-tr`/`-S`/`-Sr` all keep
+  the original readdir encounter order today. Pinned as an executable
+  golden (not a silent behaviour) by `tests/sort_options_fixtures.pdx`
+  cases 6-9, so a future kernel record growing real `mtime_ns` /
+  `size_bytes` fields shows up as a diff there.
+- **`Runner::runner_ls`** -- extends the existing GDF buffered-
+  listing path (`_rn_gdf_buf` / `rn_ls_gdf_collect` /
+  `rn_ls_gdf_emit_next`) to also trigger on any of `-t`/`-S`/`-r`
+  (new `_rn_sort_mode` flag, OR'd alongside `_rn_gdf_mode` at both
+  "take the buffered path" decision points) rather than only on
+  `--group-directories-first`. Inside `rn_ls_gdf_partition`, a
+  requested sort now runs on the buffered record array BEFORE any
+  GDF directories-first partition (or, absent GDF, before a trivial
+  identity-order fill) -- `group_sort_partition`'s two-pass stability
+  preserves the sort's order within each of the two groups, so
+  `ls -t --group-directories-first` groups directories first and
+  orders each group by the requested sort, matching GNU ls's own
+  composition of the two options.
+- **`tests/sort_options_fixtures.pdx`** (new, 10 cases) -- see
+  `tests/README.md` for the full case table.
+
+### Known gaps (tracked, not regressions)
+
+- `-t` and `-S` do not yet discriminate by real mtime/size (see
+  above); this needs the kernel's `PdxFsDirEntry` readdir record to
+  grow those fields, tracked alongside `LongFormat`'s own `-l`
+  mtime/size placeholders (`design/enhancement-plan.md` §7).
+- `ls -tS` (both `-t` and `-S` set) resolves `-t` first, a fixed
+  tiebreak rather than GNU ls's "last flag on the command line wins"
+  -- the OR'd `flag_bits` vocabulary this argv surface builds cannot
+  distinguish argument order.
 
 ## [1.1.4] -- 2026-09-05 -- `-R` recursion-header interim landing (ls.ENH-017) <a id="114"></a>
 

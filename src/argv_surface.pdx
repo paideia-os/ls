@@ -122,9 +122,11 @@ module ArgvSurface = structure {
   pub let AS_BIT_JSON   : u64 = 0x8
   pub let AS_BIT_SCHEMA : u64 = 0x10
   pub let AS_BIT_COLOR  : u64 = 0x20
-  // ls.ENH-016 (#34): sort options. Runner-side buffering + comparator
-  // land in a follow-up round; the argv surface recognises them now so
-  // an early adopter can pass the flags without hitting UNSUPPORTED_SHORT.
+  // ls.ENH-016 (#34): sort options. Argv surface recognises the three
+  // flags; Runner-side buffering + comparator dispatch land in
+  // src/runner.pdx's GDF-shaped buffer (reused as the general
+  // "buffered listing" path for either --group-directories-first or
+  // any of -t/-S/-r) + src/sort_options.pdx (the comparators).
   pub let AS_BIT_T      : u64 = 0x40    // -t sort by mtime
   pub let AS_BIT_S      : u64 = 0x80    // -S sort by size
   pub let AS_BIT_R_REV  : u64 = 0x100   // -r reverse sort
@@ -149,7 +151,11 @@ module ArgvSurface = structure {
   pub let AS_BIT_F      : u64 = 0x1000
   // ls.ENH-020 (#38): --group-directories-first. Sort comparator adds
   // a partition step keyed on kind_nibble == 0x4. Argv surface here;
-  // observable behaviour lands with ENH-016's Runner buffering.
+  // observable behaviour lands with Runner's buffered-listing path
+  // (shared with ls.ENH-016 (#34) -t/-S/-r) -- GDF's directories-first
+  // partition runs AFTER any requested sort_options comparator, so a
+  // sorted-then-partitioned buffer keeps the requested order within
+  // each of the two groups.
   pub let AS_BIT_GDF    : u64 = 0x2000
   // ls.ENH-023 (#41) v1.1.0: --color=auto value discriminator.
   // Set alongside AS_BIT_COLOR whenever the parsed --color= value
@@ -363,8 +369,10 @@ module ArgvSurface = structure {
         jmp as_pa_walk_advance;
 
       as_pa_set_t:
-        // ls.ENH-016 (#34): -t sort by mtime. Runner buffering + sort
-        // deferred (issue stays open pending the buffering rework).
+        // ls.ENH-016 (#34): -t sort by mtime. Runner buffers the
+        // listing and calls SortOptions::sort_options_by_mtime; see
+        // src/sort_options.pdx for the documented "no mtime field in
+        // PdxFsDirEntry yet" gap this comparator honestly implements.
         lea r11, [rip + _as_flag_bits];
         mov rax, [r11];
         or  rax, 0x40;                    // AS_BIT_T
@@ -372,7 +380,9 @@ module ArgvSurface = structure {
         jmp as_pa_walk_advance;
 
       as_pa_set_s:
-        // ls.ENH-016 (#34): -S sort by size.
+        // ls.ENH-016 (#34): -S sort by size. Runner calls
+        // SortOptions::sort_options_by_size (same documented gap as
+        // -t -- see src/sort_options.pdx).
         lea r11, [rip + _as_flag_bits];
         mov rax, [r11];
         or  rax, 0x80;                    // AS_BIT_S
@@ -380,7 +390,10 @@ module ArgvSurface = structure {
         jmp as_pa_walk_advance;
 
       as_pa_set_r_rev:
-        // ls.ENH-016 (#34): -r reverse sort.
+        // ls.ENH-016 (#34): -r reverse sort. Runner passes this bit
+        // as the `reverse` argument to whichever SortOptions
+        // comparator -t/-S select, or to sort_options_by_name (the
+        // default lexicographic sort) when neither -t nor -S is set.
         lea r11, [rip + _as_flag_bits];
         mov rax, [r11];
         or  rax, 0x100;                   // AS_BIT_R_REV
@@ -536,11 +549,10 @@ module ArgvSurface = structure {
         //   r=0x72 e=0x65 c=0x63 t=0x74 o=0x6F r=0x72 i=0x69 e=0x65
         //   s=0x73 -=0x2D f=0x66 i=0x69 r=0x72 s=0x73 t=0x74 NUL
         //
-        // ls.ENH-020 (#38): sets AS_BIT_GDF; the sort comparator gains
-        // a directories-first partition step. Comparator-side landing
-        // is deferred with ENH-016; this arm keeps the flag recognised
-        // so `ls --group-directories-first` parses instead of failing
-        // AS_ERR_UNKNOWN_FLAG.
+        // ls.ENH-020 (#38): sets AS_BIT_GDF; Runner's buffered-listing
+        // path gains a directories-first partition step on top of
+        // whatever sort_options comparator ls.ENH-016 (#34) requested
+        // (default: lexicographic by name).
       as_pa_try_gdf:
         xor rax, rax; mov_b rax, [r10 + 1];  cmp rax, 0x72; jne as_pa_unknown_flag;
         xor rax, rax; mov_b rax, [r10 + 2];  cmp rax, 0x6F; jne as_pa_unknown_flag;
