@@ -362,6 +362,22 @@ module SemanticEmit = structure {
       block: {
         push r12;                                // SysV callee-save + alignment
 
+        // POST-XRW-12-01 FIX: caller MUST bind the registry before any
+        // Registry::* consumer. bind_by_name calls registry_resolve
+        // which enforces _registry_bound==1 and returns
+        // SP_REGISTRY_ERR_NOT_BOUND (303) otherwise; bind_by_name's own
+        // fallback only catches 304 (LOOKUP_FAIL), so 303 propagates
+        // as a hard error. registry_bind is idempotent (fast-path on
+        // already-bound), so calling it here every emit-bind is
+        // cheap. Sibling issue filed on libpdx-semantic-pipe to also
+        // fold 303 into the fallback path.
+        call registry_bind;
+        // Non-zero rc from registry_bind means the schema-registry
+        // service is genuinely unreachable AND our fallback path
+        // (spipe_schema_id_from_name) is what we want anyway --
+        // proceed to bind_by_name regardless; its 304 fallback will
+        // catch the LOOKUP_FAIL and produce the right hash.
+
         // Arg marshalling: rdi = fd, rsi = name_ptr, rdx = name_len.
         mov rdi, 3;                              // LS_STDOUT_ENDPOINT_SLOT
         lea r11, [rip + _se_schema_name];
