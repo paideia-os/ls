@@ -1,0 +1,473 @@
+// tests/file_fallback_fixtures.pdx -- ls.ENH-015 (paideia-os/ls#33)
+//
+// FileFallbackFixtures module: byte-exact goldens for
+// Runner::rn_compose_file_entry (src/runner.pdx), the pure record-
+// composition helper backing the file-as-path single-row fallback
+// (`ls file.txt` prints one row instead of failing with
+// LS_ERR_READDIR). Follows the M4 fixture convention documented in
+// tests/README.md.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// rn_compose_file_entry itself is a leaf with no syscalls, so it is
+// directly fixture-testable (unlike runner_ls, which issues real
+// `syscall` instructions and is exercised only by the qemu smoke
+// path). This module is the executable pin for the composer's record
+// shape; the EBADF-vs-genuine-failure discrimination and the
+// hidden-filter bypass live in runner_ls's control flow and are
+// covered by the qemu smoke matrix, not here.
+//
+// Five cases, each diffed as a full 128-byte record against a golden:
+//
+//   idx  input name           name_len   note
+//   -----------------------------------------------------------------
+//    0   "a.txt"               5         plain short name
+//    1   "" (empty)            0         zero-length edge case
+//    2   ".bashrc"             7         dotfile -- pins that the
+//                                        composer does NOT hidden-
+//                                        filter (that decision belongs
+//                                        to rn_ls_file_fallback's jump
+//                                        past hidden_filter_accept,
+//                                        not to this function)
+//    3   104 * 'x', NUL at 104 104       exact-clamp boundary: the
+//                                        real terminator coincides
+//                                        with RN_ENT_NAME_MAX
+//    4   110 * 'y', NUL at 110 104       clamp-BEFORE-real-NUL: proves
+//                                        the 104-byte bound fires
+//                                        before the scan ever reaches
+//                                        the actual terminator
+//
+// Every case pins: the zeroed inode qword at +0, the RN_ENT_KIND_FILE
+// (8) qword at +8, the name_len qword at +16, the name bytes at +24,
+// and zero padding for the remainder of the 104-byte name field.
+//
+// =============================================================================
+// TABLE LAYOUT
+// =============================================================================
+//
+//   _fff_name_offsets  [u64; 5]   -- byte offset into _fff_names_all
+//   _fff_expected_lens [u64; 5]   -- expected rn_compose_file_entry
+//                                    return value per case
+//   _fff_names_all     [u8; 231]  -- packed NUL-terminated input names
+//   _fff_golden_all    [u8; 640]  -- packed expected 128-byte records,
+//                                    5 * 128 bytes, fixed stride (no
+//                                    offsets table needed)
+//   _fff_entry_scratch [u64; 16]  -- 128-byte rn_compose_file_entry
+//                                    destination buffer (@align(8),
+//                                    same shape as Runner::_rn_entry_buf)
+//
+// =============================================================================
+// PUBLIC ENTRY POINTS
+// =============================================================================
+//
+//   file_fallback_fixtures_case_count() -> u64        -- FFF_CASE_COUNT (5)
+//   file_fallback_fixtures_run(case_idx) -> u64        -- 0 pass; err+idx on fail
+//   file_fallback_fixtures_verify_all() -> u64         -- fail-fast walk
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`FileFallbackFixtures`).
+//   - No `test` mnemonic; every zero-check / bound-check uses
+//     `cmp reg, 0` or `cmp reg, imm`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates:
+//     5 (case cap), 128 (record stride / diff-loop bound). The
+//     FFF_ERR_* sentinels are `mov rax, imm64` stores.
+//   - Byte reads (diff loop) use `xor rax, rax; mov_b rax, [ptr]`
+//     staged through r11 so addressing stays [reg]-only, matching
+//     JsonLineFixtures's diff-loop idiom exactly.
+//   - r10 / r11 are scratch.
+//   - Labels prefixed fffr_ / fffva_.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   rn_compose_file_entry -- Runner (src/runner.pdx)
+
+module FileFallbackFixtures = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let FFF_OK                 : u64 = 0
+  pub let FFF_ERR_LEN_MISMATCH   : u64 = 0xFFFFEBF0    // + case_idx (0..4)
+  pub let FFF_ERR_RECORD_MISMATCH: u64 = 0xFFFFEBF6    // + case_idx (0..4)
+  pub let FFF_ERR_BAD_CASE_IDX   : u64 = 0xFFFFEBFF
+
+  pub let FFF_CASE_COUNT         : u64 = 5
+
+  // ==========================================================================
+  // Per-case byte offset into _fff_names_all.
+  //
+  //   case 0 -> 0    ("a.txt\0"          6 bytes)
+  //   case 1 -> 6    ("\0"               1 byte)
+  //   case 2 -> 7    (".bashrc\0"        8 bytes)
+  //   case 3 -> 15   ('x' * 104 + '\0'   105 bytes)
+  //   case 4 -> 120  ('y' * 110 + '\0'   111 bytes)
+  // ==========================================================================
+  pub let _fff_name_offsets : [u64; 5] = [ 0, 6, 7, 15, 120 ]
+
+  // ==========================================================================
+  // Per-case expected rn_compose_file_entry return value (clamped
+  // name_len).
+  // ==========================================================================
+  pub let _fff_expected_lens : [u64; 5] = [ 5, 0, 7, 104, 104 ]
+
+  // ==========================================================================
+  // Packed input names (231 bytes total). Every name is NUL-
+  // terminated within its own segment except where the clamp is
+  // expected to fire strictly before that NUL is ever read (cases 3
+  // and 4 both carry a trailing NUL anyway, for hygiene, even though
+  // rn_compose_file_entry's bound check means it is never touched).
+  // ==========================================================================
+  pub let _fff_names_all : [u8; 231] = [
+      // ---- case 0: "a.txt" (6 bytes incl. NUL) ----
+      0x61, 0x2E, 0x74, 0x78, 0x74, 0x00,
+      // ---- case 1: "" (1 byte: NUL only) ----
+      0x00,
+      // ---- case 2: ".bashrc" (8 bytes incl. NUL) ----
+      0x2E, 0x62, 0x61, 0x73, 0x68, 0x72, 0x63, 0x00,
+      // ---- case 3: 'x' * 104 + NUL (105 bytes) ----
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x00,
+      // ---- case 4: 'y' * 110 + NUL (111 bytes) ----
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x00
+  ]
+
+  // ==========================================================================
+  // Packed expected 128-byte records (640 bytes total; fixed 128-byte
+  // stride per case, so file_fallback_fixtures_run computes the
+  // golden base as &_fff_golden_all + case_idx * 128, no offsets
+  // table needed). Every record: +0 inode=0, +8 kind=8
+  // (RN_ENT_KIND_FILE, stored as a full LE qword), +16 name_len (LE
+  // qword), +24..128 name bytes zero-padded to 104.
+  // ==========================================================================
+  pub let _fff_golden_all : [u8; 640] = [
+      // ---- case 0: inode=0 kind=8 name_len=5 name="a.txt" ----
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x61, 0x2E, 0x74, 0x78, 0x74, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      // ---- case 1: inode=0 kind=8 name_len=0 name="" ----
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      // ---- case 2: inode=0 kind=8 name_len=7 name=".bashrc" ----
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x2E, 0x62, 0x61, 0x73, 0x68, 0x72, 0x63, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      // ---- case 3: inode=0 kind=8 name_len=104 name='x'*104 (exact clamp) ----
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x68, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78,
+      // ---- case 4: inode=0 kind=8 name_len=104 name='y'*104 (clamp before real NUL at 110) ----
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x68, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
+      0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79
+  ]
+
+  // ==========================================================================
+  // .bss destination buffer for rn_compose_file_entry -- 128 bytes,
+  // same shape/alignment as Runner::_rn_entry_buf.
+  // ==========================================================================
+  pub let mut _fff_entry_scratch : [u64; 16] = uninit @align(8)
+
+  // ==========================================================================
+  // file_fallback_fixtures_case_count() -> u64
+  //
+  // Leaf.
+  // ==========================================================================
+  pub let file_fallback_fixtures_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-015 (#33): return FFF_CASE_COUNT (5) for a harness iterating via file_fallback_fixtures_run. Leaf pure function. paideia-as conformance: no test mnemonic; no cmp. Labels prefixed fffcc_.",
+      block: {
+        mov rax, 5;                              // FFF_CASE_COUNT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // file_fallback_fixtures_run(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI: case_idx (0..4)
+  //   RAX: 0 on pass; FFF_ERR_LEN_MISMATCH + case_idx or
+  //        FFF_ERR_RECORD_MISMATCH + case_idx on fail;
+  //        FFF_ERR_BAD_CASE_IDX on out-of-range.
+  //
+  // Sequence:
+  //   (1) Bounds check case_idx < 5.
+  //   (2) expected_len (r12) = _fff_expected_lens[case_idx].
+  //   (3) golden_ptr (r13) = &_fff_golden_all + case_idx * 128 (fixed
+  //       stride -- no offsets table).
+  //   (4) entry_buf_ptr (r14) = &_fff_entry_scratch.
+  //   (5) name_ptr = &_fff_names_all + _fff_name_offsets[case_idx],
+  //       computed inline right before the call (dead after).
+  //   (6) Call rn_compose_file_entry(entry_buf_ptr, name_ptr).
+  //   (7) cmp rax, expected_len; mismatch -> FFF_ERR_LEN_MISMATCH.
+  //   (8) Byte-diff loop over all 128 bytes of the record; first
+  //       mismatch -> FFF_ERR_RECORD_MISMATCH.
+  //
+  // Register plan (five callee-save pushes for pipeline stability
+  // across the rn_compose_file_entry call, mirrors
+  // JsonLineFixtures::json_line_fixtures_run):
+  //   rbx = case_idx (survives)
+  //   r12 = expected_len (survives)
+  //   r13 = golden_ptr (survives)
+  //   r14 = entry_buf_ptr (survives; also passed as the call's rdi)
+  //   r15 = diff-loop index (byte-diff, reused after the one call)
+  //
+  // Alignment: 5 pushes = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48;
+  // 48 % 16 == 0 at the rn_compose_file_entry call site. Matched 5 pops.
+  // ==========================================================================
+  pub let file_fallback_fixtures_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-015 (#33): run one rn_compose_file_entry record-shape case. Bounds-check case_idx < 5 -> FFF_ERR_BAD_CASE_IDX. Load expected_len from _fff_expected_lens[case_idx] into r12. Compute golden_ptr = &_fff_golden_all + case_idx*128 into r13 (shl rax,7 stages the fixed 128-byte stride -- every golden record is the same size, so no offsets table is needed, unlike the variable-length JsonLineFixtures goldens). entry_buf_ptr = &_fff_entry_scratch into r14. Compute name_ptr = &_fff_names_all + _fff_name_offsets[case_idx] directly into rsi right before the call (dead after, no callee-save slot needed). Call rn_compose_file_entry(rdi=r14, rsi=name_ptr). Compare rax to r12 -> FFF_ERR_LEN_MISMATCH + case_idx on mismatch. Byte-diff loop over the full 128-byte record (not just name_len bytes) so the padding zeroing and the kind/name_len qword fields are pinned too, not just the name bytes: r15 = 0..128, stage r11 = r14+r15 for the actual byte (xor rax,rax; mov_b rax,[r11]; mov r10,rax to stash it), then r11 = r13+r15 for the expected byte (xor rax,rax; mov_b rax,[r11]), cmp rax,r10 -> FFF_ERR_RECORD_MISMATCH + case_idx on first drift -- same actual-then-expected-then-compare idiom as JsonLineFixtures::json_line_fixtures_run's diff loop. Five callee-save pushes (rbx=case_idx, r12=expected_len, r13=golden_ptr, r14=entry_buf_ptr, r15=diff index) = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48; aligned at the rn_compose_file_entry call site. paideia-as: no test mnemonic; largest cmp immediate 128 (record size); FFF_ERR_* sentinels via mov rax, imm64 + add rax, rbx. Labels prefixed fffr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                            // case_idx
+
+        // Bounds check.
+        cmp rbx, 5;                              // FFF_CASE_COUNT
+        jae fffr_bad_idx;
+
+        // expected_len -> r12.
+        lea r11, [rip + _fff_expected_lens];
+        mov r12, [r11 + rbx * 8];
+
+        // golden_ptr = &_fff_golden_all + case_idx * 128.
+        mov rax, rbx;
+        shl rax, 7;                              // * 128
+        lea r11, [rip + _fff_golden_all];
+        add r11, rax;
+        mov r13, r11;
+
+        // entry_buf_ptr -> r14.
+        lea r14, [rip + _fff_entry_scratch];
+
+        // ---- Call rn_compose_file_entry(entry_buf_ptr, name_ptr) ---
+        mov rdi, r14;
+
+        // name_ptr = &_fff_names_all + _fff_name_offsets[case_idx].
+        lea r11, [rip + _fff_name_offsets];
+        mov rax, [r11 + rbx * 8];
+        lea r11, [rip + _fff_names_all];
+        add r11, rax;
+        mov rsi, r11;
+
+        call rn_compose_file_entry;
+
+        // Length check.
+        cmp rax, r12;
+        jne fffr_len_fail;
+
+        // Whole-record byte-diff loop (128 bytes).
+        xor r15, r15;
+
+      fffr_diff_loop:
+        cmp r15, 128;
+        jae fffr_ok;
+
+        // Actual byte.
+        mov r11, r14;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];
+        mov r10, rax;                            // r10 = actual byte
+
+        // Expected byte.
+        mov r11, r13;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];                        // rax = expected byte
+
+        cmp rax, r10;
+        jne fffr_record_fail;
+
+        add r15, 1;
+        jmp fffr_diff_loop;
+
+      fffr_ok:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      fffr_len_fail:
+        mov rax, 0xFFFFEBF0;                     // FFF_ERR_LEN_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      fffr_record_fail:
+        mov rax, 0xFFFFEBF6;                     // FFF_ERR_RECORD_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      fffr_bad_idx:
+        mov rax, 0xFFFFEBFF;                     // FFF_ERR_BAD_CASE_IDX
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // file_fallback_fixtures_verify_all() -> u64
+  //
+  // Walk case_idx 0..4; first non-zero return propagates.
+  //
+  // Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24;
+  // entry rsp %16==8; 8+24=32; aligned at file_fallback_fixtures_run
+  // call site.
+  // ==========================================================================
+  pub let file_fallback_fixtures_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-015 (#33): fail-fast walk of all 5 rn_compose_file_entry cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp %16==8; 8+24=32; aligned at file_fallback_fixtures_run call site. Matched add rsp,8 + 2 pops. paideia-as: no test; cmp against 5 fits imm32. Labels prefixed fffva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 5;                              // FFF_CASE_COUNT
+
+      fffva_loop:
+        cmp rbx, r12;
+        jae fffva_ok;
+
+        mov rdi, rbx;
+        call file_fallback_fixtures_run;
+        cmp rax, 0;
+        jne fffva_out;
+
+        add rbx, 1;
+        jmp fffva_loop;
+
+      fffva_ok:
+        xor rax, rax;
+      fffva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

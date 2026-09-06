@@ -59,6 +59,24 @@ sub-band sentinel on fail.
   catalog literal, the `SemanticEmit` schema-name literals, and
   `caps.decl :: declares_output_schemas` must stay lock-step; any
   drift here fails the diff.
+- `group_sort_fixtures.pdx` — `ls.ENH-020` (#38). 7 boundary cases
+  for `GroupSort::group_sort_partition`'s stable directories-first
+  two-pass partition, including the "symlinks are not promoted"
+  pin (case 4).
+- `file_fallback_fixtures.pdx` — `ls.ENH-015` (#33). 5 byte-exact
+  cases for `Runner::rn_compose_file_entry`, the record-composition
+  helper behind the file-as-path single-row fallback (`ls file.txt`
+  prints one row instead of failing). Each case diffs the full
+  128-byte synthetic record (not just the name bytes) against a
+  golden, pinning the zeroed inode, the hardcoded `RN_ENT_KIND_FILE`
+  kind, the clamped `name_len`, and the zero-padded name field. Two
+  cases pin the `RN_ENT_NAME_MAX` (104-byte) clamp boundary: one
+  where a real terminator coincides with the clamp, one where the
+  clamp fires strictly before the string's actual NUL. The EBADF-
+  vs-genuine-failure discrimination and the hidden-filter bypass
+  that call this helper live in `runner_ls`'s control flow (which
+  issues real syscalls) and are not fixture-testable here; they are
+  covered by the qemu smoke path instead.
 - `goldens/` — human-readable copies of each fixture case's
   expected byte sequence. Not read at build/test time (paideia-as
   fixture modules have no filesystem cap); the `.rodata` tables in

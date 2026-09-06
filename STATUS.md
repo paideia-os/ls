@@ -107,6 +107,8 @@ semantic-pipe substrate).
 | ENH-007 (#26)   | --json emits one JSON object per row over the wire record      | WIRED  |
 | ENH-022 (#40)   | symlink target rendering in -l (placeholder pending readlink)  | WIRED  |
 | ENH-023 (#41)   | --color=auto discriminates on stdout KIND (probe today = off)  | WIRED  |
+| ENH-020 (#38)   | --group-directories-first buffers + partitions dirs-first      | WIRED  |
+| ENH-015 (#33)   | file-as-path single-row fallback (interim, kind hardcoded)     | WIRED  |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.

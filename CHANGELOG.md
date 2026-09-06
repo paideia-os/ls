@@ -9,9 +9,70 @@ and stored under `pkgs.paideia-os/ls/<version>/`.
 
 ## [Unreleased]
 
-Post-1.1.2 items on the Enhancement v1.x wave
+Post-1.1.3 items on the Enhancement v1.x wave
 (`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
 exit-code map, wire body shape, `caps.decl`) changes in this section.
+
+## [1.1.3] -- 2026-09-05 -- file-as-path single-row fallback (ls.ENH-015) <a id="113"></a>
+
+**1.1.3.** `ls <path>` unconditionally assumed `<path>` resolved to a
+directory and called `sys_pdxfs_dir_readnext` in a loop; a `<path>`
+that resolved to a regular file surfaced `LS_ERR_READDIR` (exit 4)
+instead of the single-row GNU `ls` behaviour. This release lands the
+interim fall-through the issue text scopes for while
+paideia-os/ls#29 (real argument-to-cap path resolution) is still
+open: "a shell that already narrows to a file cap gets correct
+behaviour."
+
+### Added
+
+- **`Runner::rn_compose_file_entry`** (`src/runner.pdx`, new pure
+  helper) -- composes a synthetic 128-byte `PdxFsDirEntry`-shaped
+  record from a raw NUL-terminated name: zeroes the record, stores
+  the new `RN_ENT_KIND_FILE` (8) placeholder at the kind offset,
+  computes `name_len` via a `RN_ENT_NAME_MAX` (104)-bounded strnlen,
+  and copies the name bytes in. No syscalls, no callee-save
+  registers, directly fixture-testable.
+- **`Runner::runner_ls`** `rn_ls_file_fallback` path. `sys_pdxfs_
+  dir_readnext` returns `-EBADF` for two substrate conditions the
+  kernel body cannot itself distinguish (an unpopulated
+  `LS_DIR_CAP_SLOT` and a live cap whose mode nibble is not DIR); a
+  non-null `path_ptr` is used as the second signal that picks the
+  latter, so a bare `ls` with an unwired cap keeps failing exactly as
+  before (the M3 boot-smoke fingerprint is unaffected) while `ls
+  file.txt` against an already-narrowed file cap now renders one row.
+  The fallback composes the record via `rn_compose_file_entry` and
+  jumps into a new shared label, `rn_ls_render_dispatch`, positioned
+  AFTER the `hidden_filter_accept` check so an explicit path argument
+  is never dot-filtered (POSIX semantics) while still reusing every
+  existing renderer (`-l`, `--json`, `--color`, `-F`) with no
+  duplicated format-flag switch. A new `_rn_single_file_mode` flag
+  makes `rn_ls_continue` terminate after the one synthetic entry
+  instead of calling `pdxfs_dir_readnext` again (which would re-hit
+  the same `-EBADF` and loop forever).
+- **`tests/file_fallback_fixtures.pdx`** (new, 5 cases) -- byte-exact
+  128-byte record diffs for `rn_compose_file_entry`: a plain short
+  name, an empty name, a dotfile (pinning that the composer itself
+  does not hidden-filter), and two `RN_ENT_NAME_MAX` clamp-boundary
+  cases (one where the real terminator coincides with the clamp, one
+  where the clamp fires strictly before the string's actual NUL).
+
+### Known gaps (tracked, not regressions)
+
+- **Symlinks are not distinguishable.** tmpfs mints only
+  `VNODE_TYPE_REG=1` / `VNODE_TYPE_DIR=2` at HEAD -- there is no
+  symlink vnode type in this filesystem yet -- and no cap-kind-query
+  trampoline is exposed to userspace to tell a file cap from a
+  hypothetical future symlink cap apart. `RN_ENT_KIND_FILE` is
+  therefore a hardcoded placeholder (same discipline as the owner/
+  mtime/mode_bits placeholders elsewhere in this file); `-L`
+  (dereference) and "print the symlink line without following" are
+  both out of scope until a symlink vnode type and a stat/cap-kind
+  primitive exist.
+- **The standalone `ls file.txt` case (no shell pre-narrowing) and
+  `ls does-not-exist` -> exit 3** from the issue's fingerprint section
+  both require real argument-to-path resolution and stay blocked on
+  paideia-os/ls#29, exactly as #33 itself scopes.
 
 ## [1.1.2] -- 2026-09-05 -- `--group-directories-first` (ls.ENH-020) <a id="112"></a>
 

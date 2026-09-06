@@ -215,6 +215,16 @@ module Runner = structure {
   pub let RN_ENT_NAME_MAX         : u64 = 104
   pub let RN_ENT_SIZE             : u64 = 128
 
+  // ls.ENH-015 (#33): kind-nibble placeholder used by
+  // rn_compose_file_entry for the file-as-path single-row fallback.
+  // Hardcoded (not read from any cap) because tmpfs mints only
+  // VNODE_TYPE_REG=1 / VNODE_TYPE_DIR=2 at HEAD (no symlink vnode
+  // type exists yet -- src/kernel/core/fs/tmpfs/vops.pdx) and no
+  // cap-kind-query trampoline is exposed to userspace to tell a file
+  // cap from a future symlink cap apart. See rn_ls_file_fallback for
+  // the full rationale.
+  pub let RN_ENT_KIND_FILE        : u64 = 8
+
   // Pre-opened directory cap slot (see file header).
   pub let LS_DIR_CAP_SLOT         : u64 = 2
 
@@ -284,6 +294,14 @@ module Runner = structure {
   pub let mut _rn_gdf_kinds_buf   : [u64; 64]   = uninit @align(8)
   pub let mut _rn_gdf_order_buf   : [u64; 64]   = uninit @align(8)
 
+  // ls.ENH-015 (#33): non-zero once rn_ls_file_fallback has composed
+  // and dispatched the single synthetic entry for a non-directory cap.
+  // rn_ls_continue checks this BEFORE the GDF check so the loop
+  // terminates after exactly one entry instead of calling
+  // pdxfs_dir_readnext again (which would re-hit the same -EBADF and
+  // spin forever on a file cap).
+  pub let mut _rn_single_file_mode : u64 = uninit @align(8)
+
   // ==========================================================================
   // runner_ls(path_ptr, flag_bits) -> u64
   //
@@ -337,6 +355,12 @@ module Runner = structure {
         mov r10, 0;
         mov [r11], r10;
         lea r11, [rip + _rn_gdf_idx];
+        mov [r11], r10;
+
+        // ls.ENH-015 (#33): clear the single-file-fallback flag every
+        // call -- only rn_ls_file_fallback ever sets it.
+        lea r11, [rip + _rn_single_file_mode];
+        mov r10, 0;
         mov [r11], r10;
 
         // ---- Path arg gate (empty-string reject preserved from M1) --
@@ -595,6 +619,15 @@ module Runner = structure {
         cmp rax, 0;
         je  rn_ls_hidden;                        // filtered out
 
+      rn_ls_render_dispatch:
+        // ls.ENH-015 (#33): shared re-entry point for the file-as-
+        // path fallback (rn_ls_file_fallback jumps directly here,
+        // BYPASSING the hidden_filter_accept call above -- an explicit
+        // path argument is never dot-filtered under POSIX ls
+        // semantics, only directory-walk entries are). Requires r14 =
+        // name_len and rbp = name_ptr already loaded, exactly as the
+        // fall-through from a real directory entry leaves them.
+        //
         // ---- v1.1.0: Renderer dispatch ------------------------------
         //
         // Priority: AS_BIT_JSON > AS_BIT_L > default. JSON wins over
@@ -983,6 +1016,15 @@ module Runner = structure {
         // r13 (flag_bits) is untouched by either predecessor, so this
         // check is safe to run unconditionally.
       rn_ls_continue:
+        // ls.ENH-015 (#33): single-file mode wins over GDF mode --
+        // checked first because one synthetic entry is the entire
+        // "listing"; terminate immediately rather than calling
+        // pdxfs_dir_readnext again (same cap would re-hit -EBADF).
+        lea r11, [rip + _rn_single_file_mode];
+        mov r10, [r11];
+        cmp r10, 0;
+        jne rn_ls_done;
+
         lea r11, [rip + _rn_gdf_mode];
         mov r10, [r11];
         cmp r10, 0;
@@ -1007,22 +1049,70 @@ module Runner = structure {
         jmp rn_ls_epilogue;
 
       rn_ls_readdir_fail:
-        // ls.ENH-015 (#33): when the cap at LS_DIR_CAP_SLOT is a
-        // regular file rather than a directory, sys_pdxfs_dir_readnext
-        // returns -EBADF here (0xFFFFFFFFFFFFFFF7 -- kind mismatch on
-        // the dir-mode gate). The POSIX fall-through would compose one
-        // entry-shaped record from the file cap's row (via a
-        // pdxfs_file_stat_by_slot trampoline that does not yet exist in
-        // PdxfsShim) and emit a single line + one PdxFsDirEntry record.
-        // Blocked by #29 (path-resolve) for the argument-driven cap
-        // narrowing that must precede the file/dir discrimination;
-        // land the discrimination + single-entry emit as follow-up to
-        // #29. Today: continue to surface LS_ERR_READDIR so the current
-        // exit vocabulary stays honest.
+        // ls.ENH-015 (#33): sys_pdxfs_dir_readnext returns -EBADF
+        // (0xFFFFFFFFFFFFFFF7) for TWO distinct substrate conditions
+        // that the kernel body cannot itself tell apart (see
+        // paideia-os src/kernel/core/syscall/handlers/
+        // sys_pdxfs_dir_readnext.pdx §DIR-MODE GATE): (a) LS_DIR_CAP_SLOT
+        // was never populated (the M3 "shell hasn't wired a cap yet"
+        // case this exit code was originally designed to surface), and
+        // (b) LS_DIR_CAP_SLOT holds a live cap whose mode nibble is
+        // NOT DIR -- i.e. a regular-file cap the shell already
+        // narrowed to the argument path. rax still holds the raw
+        // -errno here (comparisons do not clobber it).
+        //
+        // A non-null path_ptr (r12) is used as the second signal that
+        // disambiguates (b) from (a): a bare `ls` invocation with no
+        // argument never has anything to name a synthetic row with,
+        // so that shape keeps the pre-existing LS_ERR_READDIR
+        // behaviour unconditionally (protects the M3 boot-smoke
+        // "cap slot never wired" fingerprint from regressing). This is
+        // an interim heuristic, not a real cap/argument correspondence
+        // check (paideia-os/ls#29 tracks the real fix + the standalone
+        // `ls file.txt`-with-no-pre-narrowed-cap case); it is exactly
+        // the scope #33 calls out as landable before #29 closes: "a
+        // shell that already narrows to a file cap gets correct
+        // behaviour."
+        mov r10, 0xFFFFFFFFFFFFFFF7;              // -EBADF
+        cmp rax, r10;
+        jne rn_ls_readdir_fail_real;
+        cmp r12, 0;                               // path_ptr
+        je  rn_ls_readdir_fail_real;
+        jmp rn_ls_file_fallback;
+
+      rn_ls_readdir_fail_real:
         mov rdi, 4;
         call ls_note;
         mov rax, 0xFFFFEB22;                     // LS_ERR_READDIR
         jmp rn_ls_epilogue;
+
+      rn_ls_file_fallback:
+        // ls.ENH-015 (#33): compose one PdxFsDirEntry-shaped record
+        // from path_ptr via the pure rn_compose_file_entry helper, then
+        // fall into the SAME render dispatch a real directory entry
+        // uses (rn_ls_render_dispatch) -- no duplicated format-flag
+        // switch. See RN_ENT_KIND_FILE's comment for why kind is a
+        // hardcoded FILE placeholder rather than a real stat result
+        // (no symlink vnode type exists in tmpfs yet, and no cap-kind-
+        // query trampoline is exposed to userspace to distinguish one
+        // from a regular file); `-L` / real symlink-vs-file rendering
+        // for this row is therefore not representable today and is
+        // out of scope until both land.
+        lea r11, [rip + _rn_entry_buf];
+        mov rdi, r11;                              // entry_buf_va
+        mov rsi, r12;                              // name_ptr = path_ptr
+        call rn_compose_file_entry;
+        mov r14, rax;                              // name_len for dispatch
+
+        lea r11, [rip + _rn_single_file_mode];
+        mov r10, 1;
+        mov [r11], r10;
+
+        lea r11, [rip + _rn_entry_buf];
+        add r11, 24;                               // RN_ENT_OFF_NAME
+        mov rbp, r11;                              // name_ptr for dispatch
+
+        jmp rn_ls_render_dispatch;
 
       rn_ls_tty_fail:
         mov rdi, 4;
@@ -1064,6 +1154,123 @@ module Runner = structure {
         pop r13;
         pop r12;
         pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rn_compose_file_entry(entry_buf_va, name_ptr) -> name_len
+  //
+  // ls.ENH-015 (#33): pure record-composition helper for the file-as-
+  // path fallback (rn_ls_file_fallback above). Writes a synthetic
+  // 128-byte PdxFsDirEntry-shaped record at entry_buf_va so it can be
+  // rendered by the SAME per-entry dispatch (rn_ls_render_dispatch)
+  // that renders a real pdxfs_dir_readnext result -- this function
+  // owns none of the format-flag logic, only the record shape.
+  //
+  // Signature: (u64, u64) -> u64 !{mem} @{}
+  //   RDI (input):  entry_buf_va -- caller-owned 128-byte buffer
+  //                                 (same shape/size as _rn_entry_buf).
+  //   RSI (input):  name_ptr     -- NUL-terminated name source
+  //                                 (path_ptr from argv; not read past
+  //                                 RN_ENT_NAME_MAX bytes even if
+  //                                 unterminated within that window).
+  //   RAX (output): name_len, clamped to [0, RN_ENT_NAME_MAX=104].
+  //
+  // Record fields written:
+  //   +0  (inode)         -- 0 placeholder. No cap-to-inode lookup is
+  //                          reachable from a held KIND_PDXFS_FILE cap
+  //                          without a stat trampoline this repo does
+  //                          not have (same placeholder discipline as
+  //                          owner/mtime/mode_bits elsewhere in this
+  //                          file, pending sys_pdxfs_stat_by_inode
+  //                          integration).
+  //   +8  (kind, low nibble) -- RN_ENT_KIND_FILE (8) unconditionally.
+  //                          See RN_ENT_KIND_FILE's own comment: tmpfs
+  //                          has no symlink vnode type at HEAD and no
+  //                          cap-kind-query trampoline exists, so a
+  //                          real file cap and a hypothetical future
+  //                          symlink cap are indistinguishable here.
+  //   +16 (name_len)       -- strnlen(name_ptr, RN_ENT_NAME_MAX).
+  //   +24 (name, 104 B)    -- name bytes, zero-padded past name_len
+  //                          (the whole 128-byte record is zeroed
+  //                          first, so padding is implicit).
+  //
+  // Register plan (leaf; no nested calls, so no callee-save / stack
+  // discipline to preserve -- every register below is caller-save):
+  //   rdi = entry_buf_va (input, read-only throughout)
+  //   rsi = name_ptr     (input, read-only throughout)
+  //   r10 = scratch address / zero-fill value
+  //   r9  = scratch address / RN_ENT_KIND_FILE literal
+  //   r8  = scratch address (byte-copy loop src)
+  //   rcx = name_len accumulator (also the return value staging reg)
+  //   rax = byte-load scratch (xor+mov_b #1248 mitigation) / return
+  // ==========================================================================
+  pub let rn_compose_file_entry : (u64, u64) -> u64 !{mem} @{} =
+    fn (entry_buf_va: u64) (name_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-015 (#33): compose a synthetic 128-byte PdxFsDirEntry-shaped record from a raw NUL-terminated name so Runner::runner_ls's rn_ls_file_fallback can render a non-directory LS_DIR_CAP_SLOT cap through the existing per-entry dispatch instead of a duplicate format switch. Body: (1) zero all 16 u64 lanes of entry_buf_va via a lane-indexed store loop (rcfe_zero_loop) -- this makes every field past name_len implicitly zero-padded and the inode field a stable 0 placeholder. (2) store RN_ENT_KIND_FILE (8) as a full qword at +8 (matches the existing RN_ENT_OFF_KIND read-and-mask-low-nibble convention used throughout Runner). (3) strnlen(name_ptr, 104) via rcfe_strlen_loop: byte-scan with the #1248 mitigation (xor rax, rax; mov_b rax, [addr]) bounded at RN_ENT_NAME_MAX (104) so a name longer than the record's name field is clamped rather than overrun -- the bound check runs BEFORE the byte load each iteration, so byte index 104 of an unterminated name is never read. (4) store the clamped length (rcx) as a qword at +16. (5) rcfe_copy_loop byte-copies rcx bytes from name_ptr to entry_buf_va+24 (RN_ENT_OFF_NAME), same #1248-mitigated load + mov_b store idiom used by rn_ls_copy_head elsewhere in this file. (6) return rcx (clamped name_len) in rax. Leaf function: no CALL instructions, so no push/pop parity or SysV pre-call alignment to maintain -- every register used (rax, rcx, r8, r9, r10) is caller-save and none of rdi/rsi is ever overwritten, so both inputs stay valid for the whole body. paideia-as conformance: no test mnemonic, every zero-check is cmp reg, 0; every cmp immediate (16, 104) fits imm32; no and with a 64-bit immediate; byte reads use xor rax, rax; mov_b rax, [reg] with [reg]-only addressing (no [reg+reg]); scaled-index stores ([r10 + rcx * 8]) match the existing GDF copy-loop idiom in runner_ls. Labels prefixed rcfe_.",
+      block: {
+        // ---- (1) Zero the 128-byte record (16 u64 lanes) ----------
+        mov r10, rdi;                              // dst base
+        xor rax, rax;                               // zero value
+        mov rcx, 0;                                 // lane idx
+
+      rcfe_zero_loop:
+        cmp rcx, 16;
+        jae rcfe_zero_done;
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        jmp rcfe_zero_loop;
+
+      rcfe_zero_done:
+        // ---- (2) kind nibble at +8 = RN_ENT_KIND_FILE (8) ----------
+        mov r10, rdi;
+        mov r9, 8;                                  // RN_ENT_KIND_FILE
+        mov [r10 + 8], r9;
+
+        // ---- (3) name_len = strnlen(name_ptr, RN_ENT_NAME_MAX=104) -
+        mov r10, rsi;                               // name_ptr copy for scan
+        xor rcx, rcx;                                // len accumulator
+
+      rcfe_strlen_loop:
+        mov r9, 104;                                 // RN_ENT_NAME_MAX
+        cmp rcx, r9;
+        jae rcfe_strlen_done;
+        xor rax, rax;
+        mov r8, r10;
+        add r8, rcx;
+        mov_b rax, [r8];                             // #1248 mitigation
+        cmp rax, 0;
+        je  rcfe_strlen_done;
+        add rcx, 1;
+        jmp rcfe_strlen_loop;
+
+      rcfe_strlen_done:
+        // ---- (4) store name_len at +16 -----------------------------
+        mov r10, rdi;
+        mov [r10 + 16], rcx;
+
+        // ---- (5) copy rcx bytes from name_ptr to entry_buf_va+24 ---
+        xor r9, r9;                                  // idx = 0
+
+      rcfe_copy_loop:
+        cmp r9, rcx;
+        jae rcfe_copy_done;
+        mov r8, rsi;
+        add r8, r9;
+        xor rax, rax;
+        mov_b rax, [r8];                             // #1248 mitigation
+        mov r10, rdi;
+        add r10, 24;                                 // RN_ENT_OFF_NAME
+        add r10, r9;
+        mov_b [r10], rax;
+        add r9, 1;
+        jmp rcfe_copy_loop;
+
+      rcfe_copy_done:
+        // ---- (6) return clamped name_len ---------------------------
+        mov rax, rcx;
         ret
       }
     }
