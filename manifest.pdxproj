@@ -20,7 +20,7 @@
 # a new PAIDEIA_AS_VER KV record.
 
 name        = ls
-version     = 1.1.9
+version     = 1.1.10
 kind        = tool
 entry       = Dispatch::ls_dispatch
 output      = build-out/ls
@@ -90,7 +90,9 @@ deps:
   - libpdx-semantic-pipe @ ^1.0   # M3-001 PdxFsDirEntry@0.1 schema bind + emit;
                                   # ls.ENH-010 (#27) adds Schema::spipe_schema_
                                   # id_from_name (library's Enhancement v2.0
-                                  # wave, additive/backward-compatible with 1.0.0)
+                                  # wave, additive/backward-compatible with 1.0.0);
+                                  # ls.R90-XREPO.012.M4-002 (#30) moves the
+                                  # stdout bind onto Registry::bind_by_name
   - libpdx-audit @ ^1.0           # M3-003 DirListRecord begin/commit
 
 # --- Test list (order-insensitive; every fixture lives at tests/). ------

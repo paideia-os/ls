@@ -9,9 +9,68 @@ and stored under `pkgs.paideia-os/ls/<version>/`.
 
 ## [Unreleased]
 
-Post-1.1.8 items on the Enhancement v1.x wave
+Post-1.1.10 items on the Enhancement v1.x wave
 (`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
 exit-code map, wire body shape, `caps.decl`) changes in this section.
+
+## [1.1.10] -- 2026-09-06 -- stdout schema bind onto `Registry::bind_by_name` (R90-XREPO.012.M4-002) <a id="1110"></a>
+
+**1.1.10.** `SemanticEmit::sem_emit_bind_stdout` no longer pairs a
+locally-derived schema hash with a raw `Binding::bind` call. It now
+calls `libpdx-semantic-pipe`'s newly-live `Registry::bind_by_name(fd,
+name_ptr, name_len)` directly, which resolves `PdxFsDirEntry@0.1`
+against a live `svc.schema-registry` when one is reachable and falls
+back in-library to the same deterministic pre-BLAKE3 fold otherwise,
+then binds with whichever id it derives. ls never sees or stores that
+value for the bind path anymore -- the schema ls's stdout endpoint is
+bound to is now byte-for-byte whatever a fresh, independent
+`bind_by_name` call for the same name produces, proving the
+end-to-end name-to-bind path this issue's fingerprint calls for,
+rather than agreeing with a golden only because ls computed the same
+fold twice.
+
+### Changed
+
+- **`SemanticEmit::sem_emit_bind_stdout`** (`src/semantic_emit.pdx`)
+  -- calls `Registry::bind_by_name(LS_STDOUT_ENDPOINT_SLOT,
+  &_se_schema_name, 17)` in place of the prior
+  `spipe_schema_id_from_name` + `Binding::libpdx_semantic_pipe_bind`
+  pairing. Register plan unchanged (one `r12` alignment push; 3
+  register args, well under the 6-arg unsafe-lambda ceiling); return
+  fold unchanged (`0` -> `SE_OK`, anything else -> `SE_ERR_BIND`
+  0xFFFFEB24).
+- **`SemanticEmit::sem_emit_reset`** -- unchanged in behavior. It
+  still imprints `_se_pdxfsdirentry_hash` via
+  `spipe_schema_id_from_name` directly, but that imprint is no longer
+  in the bind's dependency chain -- it now exists solely as
+  `tests/schema_golden.pdx`'s diagnostic hook (the golden fixture
+  needs a stable, inspectable copy of the interim fold to diff
+  against, independent of whatever `bind_by_name` does internally).
+- **`Runner::runner_ls`** doc comments -- updated to describe the new
+  bind mechanism and to stop citing this issue as a still-open blocker
+  for the separate `PdxLsSummaryRecord@0.1` second-endpoint-bind
+  follow-up (`ls.ENH-021`, #39): that follow-up is unaffected by this
+  landing and remains its own, not-yet-started piece of work.
+
+### Not in scope (honest boundary)
+
+- `bind_by_name`'s own registry-daemon path
+  (`paideia-os/libpdx-semantic-pipe#23`) is still open upstream at the
+  time of this landing -- `registry_resolve` still returns
+  `SP_REGISTRY_ERR_LOOKUP_FAIL` (304) absent a live `svc.schema-
+  registry`, and `bind_by_name` falls back to the interim fold in that
+  case (its own documented, non-strict-policy behavior). This is
+  `bind_by_name`'s existing, honest, in-library fallback, not a gap
+  this issue introduces or hides -- ls's own bind result is identical
+  either way, which is exactly what makes delegating to `bind_by_name`
+  safe today.
+- No new schema, no wire-shape change: the 144-byte `PdxFsDirEntry@0.1`
+  wire body (`sem_emit_entry` / `sem_emit_wire_compose`) is untouched.
+- The real `BLAKE3("PdxFsDirEntry@0.1")` upgrade remains PENDING
+  BLAKE3 -- it lands as a body-only change inside
+  `spipe_schema_id_from_name` in `libpdx-semantic-pipe` when
+  `libpdx-schema-registry` / the paideia-as BLAKE3 intrinsic ships;
+  neither call site in this repo changes shape when it does.
 
 ## [1.1.9] -- 2026-09-06 -- centralize the owner-row honest gap (ls.ENH-008) <a id="119"></a>
 

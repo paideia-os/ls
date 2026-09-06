@@ -12,10 +12,20 @@
 //
 //   sem_emit_bind_stdout() -> u64
 //     Idempotent bind of ls's stdout endpoint slot to the PdxFsDirEntry
-//     schema. Delegates to libpdx-semantic-pipe::Binding::libpdx_
-//     semantic_pipe_bind(fd = LS_STDOUT_ENDPOINT_SLOT, hash_ptr =
-//     &_se_pdxfsdirentry_hash). Returns 0 on success, LS_ERR_EMIT_BIND
-//     (0xFFFFEB24) on refusal.
+//     schema. ls.R90-XREPO.012.M4-002 (#30): delegates to libpdx-
+//     semantic-pipe::Registry::bind_by_name(fd = LS_STDOUT_ENDPOINT_
+//     SLOT, name_ptr = &_se_schema_name, name_len = 17) -- the
+//     schema-registry-aware entry point that resolves the name against
+//     a live svc.schema-registry when one is reachable and falls back
+//     to the same deterministic pre-BLAKE3 fold ls used to run inline
+//     (spipe_schema_id_from_name) when it is not, all inside a single
+//     call. This retires ls's own hand-paired reset-then-bind sequence
+//     as the mechanism the actual bind depends on -- the hash ls binds
+//     with is now byte-for-byte whatever a fresh bind_by_name call for
+//     the same name independently produces, proving the end-to-end
+//     path rather than agreeing only by construction with ls's own
+//     local copy. Returns 0 on success, LS_ERR_EMIT_BIND (0xFFFFEB24)
+//     on refusal.
 //
 //   sem_emit_entry(kernel_entry_ptr) -> u64
 //     Emit ONE PdxFsDirEntry record over the pre-bound stdout endpoint.
@@ -61,26 +71,45 @@
 // sees a valid prefix.
 //
 // =============================================================================
-// SCHEMA HASH (ls.ENH-010, paideia-os/ls#27)
+// SCHEMA HASH (ls.ENH-010, paideia-os/ls#27; migrated ls.R90-XREPO.
+// 012.M4-002, paideia-os/ls#30)
 // =============================================================================
 //
 // libpdx-semantic-pipe::Binding requires a non-zero 32-byte hash
 // (SP_ERR_NULL_HASH refuses schema_id == 0 -- see binding.pdx §40).
-// _se_pdxfsdirentry_hash is imprinted by sem_emit_reset via
-// libpdx-semantic-pipe::Schema::spipe_schema_id_from_name("PdxFsDir
-// Entry@0.1", 17) -- the deterministic, pre-BLAKE3 fold that shipped
-// in libpdx-semantic-pipe's Enhancement v2.0 wave (ENH-001, #11).
-// This is NOT a cryptographic hash (no collision resistance
-// guarantee) but it IS the same value any other adopter of
-// libpdx-semantic-pipe computes for the same schema name -- byte-
-// identical to that library's own `_wg_hash0` golden in tests/wire_
-// golden.pdx -- so ls interoperates with an independently-built
+// Two independent call sites derive that hash today, deliberately not
+// unified into one:
+//
+//   - sem_emit_bind_stdout (the actual bind path, #30): calls
+//     libpdx-semantic-pipe::Registry::bind_by_name(fd, &_se_schema_
+//     name, 17) directly. bind_by_name resolves the name against a
+//     live svc.schema-registry when reachable, else falls back
+//     in-library to the same deterministic pre-BLAKE3 fold
+//     (Schema::spipe_schema_id_from_name) that shipped in libpdx-
+//     semantic-pipe's Enhancement v2.0 wave (ENH-001, #11), and binds
+//     with whichever id it derives. ls never sees or stores this
+//     value -- it is entirely internal to the library call.
+//   - sem_emit_reset (diagnostic/golden, #27): imprints
+//     _se_pdxfsdirentry_hash via a direct call to
+//     libpdx-semantic-pipe::Schema::spipe_schema_id_from_name
+//     ("PdxFsDirEntry@0.1", 17) so tests/schema_golden.pdx has a
+//     stable, inspectable copy of the interim fold to diff against a
+//     golden. It is no longer in the bind's dependency chain -- kept
+//     as the fixture's own hook, not as a hidden second source of
+//     truth for the wire bind.
+//
+// Neither call site is a cryptographic hash (no collision resistance
+// guarantee) at HEAD, but the interim fold IS the same value any other
+// adopter of libpdx-semantic-pipe computes for the same schema name --
+// byte-identical to that library's own `_wg_hash0` golden in tests/
+// wire_golden.pdx -- so ls interoperates with an independently-built
 // consumer today rather than agreeing only with its own placeholder
-// (the M3-001 stub's actual defect: every stub-imprinting adopter
-// picked a different constant). The BLAKE3("PdxFsDirEntry@0.1")
-// upgrade lands as a body-only change inside spipe_schema_id_from_
-// name when libpdx-schema-registry / the paideia-as BLAKE3 intrinsic
-// ships; this call site does not change.
+// (the pre-#27 M3-001 stub's actual defect: every stub-imprinting
+// adopter picked a different constant). PENDING BLAKE3: the real
+// BLAKE3("PdxFsDirEntry@0.1") upgrade lands as a body-only change
+// inside spipe_schema_id_from_name when libpdx-schema-registry / the
+// paideia-as BLAKE3 intrinsic ships; neither call site above changes
+// shape when it does.
 //
 // =============================================================================
 // STDOUT ENDPOINT SLOT
@@ -113,11 +142,10 @@
 //   - sem_emit_reset: non-leaf (calls spipe_schema_id_from_name).
 //     One callee-save push (r12, alignment-only -- not read after the
 //     call) -> rsp % 16 == 0 at the nested call site.
-//   - sem_emit_bind_stdout: non-leaf (calls libpdx_semantic_pipe_bind).
-//     Two callee-save pushes (r12 = flag_bits sink unused here / kept
-//     for symmetry with the M3-002 extension that needs r13 for the
-//     owner_row) + `sub rsp, 8` pad -> rsp % 16 == 0 at every nested
-//     call site.
+//   - sem_emit_bind_stdout: non-leaf (calls bind_by_name, ls.
+//     R90-XREPO.012.M4-002 #30). One callee-save push (r12,
+//     alignment-only) -> entry rsp % 16 == 8; +8 -> rsp % 16 == 0 at
+//     the nested call site.
 //   - sem_emit_entry: non-leaf (calls owner_col_owner_row_from_entry
 //     + send_record). Three callee-save pushes (r12 = kernel_entry_ptr
 //     survivor, r13 = copy cursor / wire base, r14 = unused padding)
@@ -131,10 +159,14 @@
 // =============================================================================
 //
 // Called:
-//   libpdx_semantic_pipe_bind      -- libpdx-semantic-pipe::Binding
+//   bind_by_name                   -- libpdx-semantic-pipe::Registry
+//                                     (ls.R90-XREPO.012.M4-002, #30)
 //   send_record                    -- libpdx-semantic-pipe::Send
 //   spipe_schema_id_from_name      -- libpdx-semantic-pipe::Schema
-//                                     (ls.ENH-010, #27)
+//                                     (ls.ENH-010, #27; sem_emit_reset's
+//                                     diagnostic imprint only -- the
+//                                     bind path no longer calls this
+//                                     directly, see #30)
 //   owner_col_owner_row_from_entry -- OwnerCol (src/owner_col.pdx)
 //                                     -- ls.ENH-008, #28
 //
@@ -207,7 +239,12 @@ module SemanticEmit = structure {
   // the Runner summary-accumulator rework; today only the name string
   // ships so a follow-up round has a stable literal to imprint.
   //
-  // Awaiting #30 (schema registry migration off placeholder hash).
+  // ls.R90-XREPO.012.M4-002 (#30) migrated sem_emit_bind_stdout's
+  // PdxFsDirEntry@0.1 bind onto Registry::bind_by_name (see file
+  // header §Schema Hash); that migration does not, by itself, stand
+  // up a second bind slot for this summary schema -- a live bind of
+  // this name remains its own follow-up when the summary record's
+  // send wiring lands.
   //
   // ls.ENH-021 (#39) deferred -- retire this comment when the summary
   // record ships. v1.1.1 (debugger finding 2): this literal is inert
@@ -292,14 +329,27 @@ module SemanticEmit = structure {
   // Signature: () -> u64 !{mem, sysreg} @{cap}
   //   RAX (output): 0 on success; SE_ERR_BIND (0xFFFFEB24) on refusal.
   //
-  // Idempotent: libpdx-semantic-pipe::Binding::libpdx_semantic_pipe_
-  // bind returns SP_OK (0) when the fd is already bound to the same
-  // hash and SP_ERR_ALREADY_BOUND (3) when bound to a DIFFERENT hash;
-  // for ls's fixed-hash bind, the second-call return is SP_OK.
+  // ls.R90-XREPO.012.M4-002 (#30): migrated off the hand-paired
+  // "derive a hash locally, then bind with it" sequence onto
+  // libpdx-semantic-pipe::Registry::bind_by_name(fd, name_ptr,
+  // name_len) -- the schema-registry-aware entry point that resolves
+  // PdxFsDirEntry@0.1 against a live svc.schema-registry when one is
+  // reachable, or falls back in-library to the same deterministic
+  // pre-BLAKE3 fold (spipe_schema_id_from_name) otherwise, and binds
+  // with whichever id it derives. ls no longer computes or holds the
+  // hash used for this bind at all -- the value bound is whatever a
+  // fresh, independent bind_by_name call for the same name produces,
+  // which is the literal fingerprint #30 asks for.
+  //
+  // Idempotent: bind_by_name's inner libpdx_semantic_pipe_bind call
+  // returns SP_OK (0) when the fd is already bound to the same hash
+  // and SP_ERR_ALREADY_BOUND (3) when bound to a DIFFERENT hash; for
+  // ls's fixed-name bind, the second-call return is SP_OK.
   //
   // Register plan (non-leaf, one callee-save push for alignment):
   //   rdi = fd (LS_STDOUT_ENDPOINT_SLOT constant)
-  //   rsi = hash_ptr (LEA _se_pdxfsdirentry_hash)
+  //   rsi = name_ptr (LEA _se_schema_name)
+  //   rdx = name_len (17, literal)
   //   rax = call return / SE_ERR_BIND on refusal
   //   r11 = LEA scratch
   //   r12 = alignment pad (SysV callee-save discipline; unused here
@@ -308,16 +358,17 @@ module SemanticEmit = structure {
   pub let sem_emit_bind_stdout : () -> u64 !{mem, sysreg} @{cap} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap},
-      justification: "ls.M3-001 (#8): idempotent bind of LS_STDOUT_ENDPOINT_SLOT (3) to the PdxFsDirEntry@0.1 schema. Calls libpdx-semantic-pipe::Binding::libpdx_semantic_pipe_bind(fd, hash_ptr). Return 0 (SP_OK) is treated as success; every other return (SP_ERR_INVALID_FD 1, SP_ERR_NULL_HASH 2, SP_ERR_ALREADY_BOUND 3, SP_ERR_TABLE_FULL 4) collapses to SE_ERR_BIND (0xFFFFEB24). ALREADY_BOUND would only fire if some other module previously bound the same slot to a DIFFERENT hash -- ls owns its stdout slot, so this cannot happen in a well-formed process; treating it as an error is defence-in-depth. Single r12 push for SysV alignment across the nested call: entry rsp % 16 == 8; one push -> rsp % 16 == 0 for libpdx_semantic_pipe_bind's SysV call site. Matched pop before every ret. Immediates 3 (endpoint slot) and 0 (SP_OK compare) fit imm32 trivially; SE_ERR_BIND stages via r11 (does not fit sign-extended imm32). paideia-as conformance: no test mnemonic; no cmp reg, imm > 0x7FFFFFFF. r11 for LEA + sentinel staging. Effects {mem, sysreg} @{cap} match libpdx_semantic_pipe_bind's effects (which is a pure .bss write today but is documented for the M3 registry-lookup extension that will syscall into svc.schema-registry). Labels prefixed sebs_.",
+      justification: "ls.M3-001 (#8), migrated ls.R90-XREPO.012.M4-002 (#30): idempotent bind of LS_STDOUT_ENDPOINT_SLOT (3) to the PdxFsDirEntry@0.1 schema, now via libpdx-semantic-pipe::Registry::bind_by_name(fd, name_ptr=&_se_schema_name, name_len=17) rather than ls's own prior two-step spipe_schema_id_from_name + libpdx_semantic_pipe_bind pairing (that pairing remains, unchanged, inside sem_emit_reset for the schema_golden.pdx diagnostic fixture -- see file header §Schema Hash). bind_by_name resolves the name against svc.schema-registry when reachable and otherwise falls back to the identical interim fold, so this call site proves the real end-to-end name-to-bind path rather than agreeing with a golden only by ls computing the same fold twice. Return 0 (SP_OK, bind_by_name's own propagated rc) is treated as success; every other return (bind_by_name's registry-resolve codes 300..304, or libpdx_semantic_pipe_bind's SP_ERR_INVALID_FD 1 / SP_ERR_NULL_HASH 2 / SP_ERR_ALREADY_BOUND 3 / SP_ERR_TABLE_FULL 4) collapses to SE_ERR_BIND (0xFFFFEB24) -- ls's tool-level error taxonomy does not distinguish a registry-resolve failure from a bind-table failure; both mean 'stdout schema emission is not available this run'. ALREADY_BOUND would only fire if some other module previously bound the same slot to a DIFFERENT hash -- ls owns its stdout slot, so this cannot happen in a well-formed process; treating it as an error is defence-in-depth. Single r12 push for SysV alignment across the nested call: entry rsp % 16 == 8; one push -> rsp % 16 == 0 for bind_by_name's SysV call site (3 args, all register-passed, well under paideia-as's 6-arg unsafe-lambda ceiling). Matched pop before every ret. Immediates 3 (endpoint slot), 17 (name_len), and 0 (SP_OK compare) fit imm32 trivially; SE_ERR_BIND stages via r11 (does not fit sign-extended imm32). paideia-as conformance: no test mnemonic; no cmp reg, imm > 0x7FFFFFFF. r11 for LEA + sentinel staging. Effects {mem, sysreg} @{cap} match bind_by_name's own declared effects (mem for its scratch writes, sysreg for the registry-resolve IPC round trip, cap because it consumes ls's KIND_IPC_ENDPOINT). Labels prefixed sebs_.",
       block: {
         push r12;                                // SysV callee-save + alignment
 
-        // Arg marshalling: rdi = fd, rsi = &hash.
+        // Arg marshalling: rdi = fd, rsi = name_ptr, rdx = name_len.
         mov rdi, 3;                              // LS_STDOUT_ENDPOINT_SLOT
-        lea r11, [rip + _se_pdxfsdirentry_hash];
-        mov rsi, r11;                            // hash_ptr
+        lea r11, [rip + _se_schema_name];
+        mov rsi, r11;                            // name_ptr
+        mov rdx, 17;                             // name_len ("PdxFsDirEntry@0.1")
 
-        call libpdx_semantic_pipe_bind;
+        call bind_by_name;
 
         // Return: SP_OK (0) -> SE_OK (0), anything else -> SE_ERR_BIND.
         cmp rax, 0;
