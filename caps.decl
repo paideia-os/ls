@@ -1,57 +1,96 @@
 # ls — caps.decl
 #
-# Wave: R50 (Wave 2)
-# Doc:  design/tooling/r49-r50-plan.md §4.4 and §5.4 in the paideia-os
-#       repo. This file is the invariant-I6 (capability handoff visible
-#       + refusable) manifest the shell validates at exec: ls receives
-#       exactly the caps below and no more.
+# Format: R90-XREPO.013.M1-001 line-oriented caps.decl grammar
+# (paideia-os design/architecture/caps-decl-format.md, whose own §3.3
+# worked example is this tool: "ls: read files + directory entries +
+# resolve schemas"). Adopted at R90-XREPO.013.M4-001 (this repo's
+# issue #31), replacing the R50-vintage prose "requires:" /
+# "declares_output_schemas:" declaration this file used to carry (see
+# git history for the superseded freeform text). Mirrors the same
+# adoption pass landed for the volume trio: mkfs.pdxfs (#23,
+# b6dff27db5), mount.pdxfs (#20), umount.pdxfs (#20).
 #
-# The four caps below are the minimum surface for the tool to (1)
-# identify who invoked it (KIND_USER — used at M3 to stamp the
-# DirListRecord audit tail and, at M2, to resolve the owner column for
-# --long), (2) read entries from a specific directory path only
-# (KIND_PDXFS_FILE narrowed to the argument path — no ambient authority
-# on the rest of the filesystem), (3) render text to the invoker's
-# terminal (KIND_TTY narrowed to write — no read, no tcsetattr), and
-# (4) participate in the semantic-pipe layer for the M3 PdxFsDirEntry[]
-# emission (KIND_IPC_ENDPOINT). The endpoint requirement is declared
-# at M1 so consumers can inspect the manifest early; the wire binding
-# lands with ls.M3-001 per r49-r50-plan.md §5.4.
-#
-# Cap narrowing note. Per r49-r50-plan.md §4.4 ("the tool's cap
-# request narrows to exactly the argument path (never ambient-
-# authority)"), the KIND_PDXFS_FILE(read, <path>) below is a template.
-# The shell's exec-time cap_manifest_verify (libpdx-cap M2-001) binds
-# the concrete argument path when it hands ls its narrowed cap; the
-# template here is the shape the shell has to satisfy.
-#
-# Missing caps in the received set → exit 4 (cap denied per I4 in
-# design/tooling/plan.md §4.2). Extra caps → the shell's cap_manifest_
-# verify refuses at the shell side; ls never sees them.
-requires:
-  - KIND_USER
-  - KIND_TTY(write)
-  - KIND_PDXFS_FILE(read, <arg-path>)
-  - KIND_IPC_ENDPOINT
+# `!KIND_FOO <mask>` = mandatory: exec fails -EACCES if the parent's
+# cap-set does not hold at least this mask. ` KIND_FOO <mask>` (no
+# `!`) = optional: narrowed to at most this mask, dropped to zero if
+# the parent held none. See the format doc §3.1 / §4 for the full
+# narrowing semantics. Grammar is strict: every non-comment,
+# non-blank line must be a decl-line or the whole file is refused
+# (§3) — the notes below stay in `#` comments for exactly that
+# reason.
 
-# Declared output schemas — the semantic-pipe record ls emits on
-# stdout. Declared at M1 so consumers can inspect the manifest; the
-# actual wire binding + emission lands at ls.M3-001 per r49-r50-plan.md
-# §5.4 (one PdxFsDirEntry per file, owner field a KIND_USER capability
-# reference rather than a text uid — D2 literal at the schema level).
+!KIND_USER               0x001   # invoker attribution (audit) + owner column resolution
+!KIND_TTY                0x002   # write rendered output (text/--json/--color) to the invoking terminal
+!KIND_PDXFS_FILE         0x001   # READ_BYTES (directory + file content read)
+ KIND_IPC_ENDPOINT       0x001   # semantic-pipe stdout (--schema/--json framing), deferred
+
+# Notes (carried forward from the R50 prose decl):
 #
-# INVARIANT (v1.1.1 debugger finding 2). This list is the AUTHORITATIVE
-# source for every declared output schema. Two mirrors must stay in
-# lock-step with it, or a `ls --schema` consumer preloads a decoder
+# - KIND_USER, KIND_TTY, and KIND_PDXFS_FILE are mandatory: ls cannot
+#   attribute the audit-first invariant (D3, r49-r50-plan.md §1),
+#   cannot render any output, and cannot read the target directory
+#   without them respectively.
+# - KIND_USER's R_USER_READ (0x001) covers both invoker attribution
+#   at audit_begin (src/audit_shim.pdx) and the `-l` owner column,
+#   which hand-decodes a per-entry KIND_USER wire-form cap via
+#   libpdx-cap::cap_unpack (src/owner_col.pdx) rather than issuing a
+#   query op — R_USER_INVOKE (0x008) is not exercised and is not
+#   declared.
+# - KIND_TTY's R_TTY_WRITE (0x002) is the only right ls's tty_write
+#   trampoline (src/tty_write.pdx) exercises; it is presently a plain
+#   sys_write (sysno 1), with the real `cap_invoke(_ls_tty_slot,
+#   TTY_OP_WRITE, ...)` wire deferred to R49.M1 per kind_tty.pdx §17.
+#   The declared right is unchanged by that deferral — it is ls's
+#   authored upper bound on TTY authority, not a statement that the
+#   wire is live today.
+# - KIND_PDXFS_FILE's R_PDXFS_FILE_READ (0x001 / PFF_OP_READ_BYTES)
+#   is the only right declared: the readdir loop that will drive it is
+#   still unwired (src/ls.pdx: "unused until readdir lands"). The
+#   caps-decl-format.md §3.3 example for this exact tool declares the
+#   identical mask. R_PDXFS_FILE_INVOKE (0x008), which `-l`'s
+#   mode/len/mtime columns will eventually need for a direct per-field
+#   query (src/long_format.pdx), is deliberately NOT reserved here —
+#   unlike the volume trio's deferred-optional rights, this one has no
+#   landed call site yet to point to; adding it is a follow-up decl
+#   amendment once the readdir/query wiring lands, not a rights-narrow
+#   of authority already declared.
+# - The shell's exec-time cap_manifest_verify (libpdx-cap M2-001)
+#   separately narrows the concrete KIND_PDXFS_FILE target to the
+#   ls argument path (no ambient authority on the rest of the
+#   filesystem) per r49-r50-plan.md §4.4. That per-argument narrowing
+#   is a distinct mechanism from — and composes with — the kind+rights
+#   narrow this file governs; this format has no path-template syntax
+#   of its own.
+# - KIND_IPC_ENDPOINT is optional and unbound: semantic_emit.pdx notes
+#   the cap slot is populated by shell.M2 InitCap and consumed by
+#   sys_ipc_send, but ls's default and `-l` render paths still write
+#   through KIND_TTY only; --schema/--json compose their bytes and
+#   also write through tty_write today. Declared early, per the M1-001
+#   format doc's non-goals (§7), so the eventual wire bind is a
+#   rights-narrow rather than a decl amendment.
+#
+# INVARIANT (v1.1.1 debugger finding 2, carried forward from the R50
+# decl). The list below is the AUTHORITATIVE source for every declared
+# semantic-pipe output schema ls emits on stdout. Two mirrors must stay
+# in lock-step with it, or a `ls --schema` consumer preloads a decoder
 # for a schema id no record ever arrives against:
 #   1. src/schema_dump.pdx :: _sd_catalog_bytes -- one catalog line
-#      per schema name here, LF-terminated. `_sd_catalog_len` is the
+#      per schema name below, LF-terminated. `_sd_catalog_len` is the
 #      byte total.
 #   2. src/semantic_emit.pdx :: _se_schema_name (and any future
-#      per-schema name literal) -- one literal per schema this file
-#      declares. spipe_schema_id_from_name hashes over the bytes.
+#      per-schema name literal) -- one literal per schema declared
+#      below. spipe_schema_id_from_name hashes over the bytes.
 # Adding, removing, or renaming a schema is a three-file edit landing
 # in one commit. tests/schema_dump_fixtures.pdx pins the catalog bytes
 # byte-for-byte; a mismatch there is the tripwire.
-declares_output_schemas:
-  - PdxFsDirEntry@0.1
+#
+# declares_output_schemas (kept as this comment block, not a decl-line
+# — the strict line grammar above has no list syntax of its own; every
+# `caps.decl :: declares_output_schemas` cross-reference in src/ and
+# tests/ means this list):
+#   - PdxFsDirEntry@0.1
+#
+# See also:
+#   design/architecture/caps-decl-format.md  — format spec (paideia-os), §3.3 is this tool's own worked example
+#   src/kernel/core/cap/reconcile.pdx        — kernel substrate (paideia-os)
+#   design/tooling/r49-r50-plan.md §4.4/§5.4 — this tool's authoring wave (paideia-os)
