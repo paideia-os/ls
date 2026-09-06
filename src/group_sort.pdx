@@ -1,0 +1,179 @@
+// src/group_sort.pdx -- ls.ENH-020 (paideia-os/ls#38)
+//
+// GroupSort module: the `--group-directories-first` partition
+// primitive. `ArgvSurface::AS_BIT_GDF` (0x2000) already parses at HEAD
+// (commit 36d5995) -- this module supplies the comparator half so
+// Runner can actually reorder a buffered listing instead of merely
+// accepting the flag.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// One entry point:
+//
+//   group_sort_partition(kinds_ptr, count, order_ptr) -> u64
+//
+// A stable two-pass partition. `kinds_ptr` is a caller-owned array of
+// `count` u64 values, each the low-nibble kind code Runner already
+// extracts from a buffered PdxFsDirEntry record's kind qword (offset
+// 8, `& 0xF`; 0x4 = directory per src/runner.pdx RN_ENT_OFF_KIND).
+// `order_ptr` is a caller-owned output array of `count` u64 indices:
+// pass 1 walks `kinds_ptr[0..count)` and appends every index whose
+// kind == GS_KIND_DIR, in encounter order; pass 2 rescans the same
+// range and appends every remaining index, in encounter order. The
+// result is a permutation of `0..count-1` with all directory indices
+// first and, within each of the two groups, the original readdir
+// order preserved.
+//
+// "Within each group, sorted by whatever the existing sort discipline
+// is" (the issue's own phrasing) resolves today to raw readdir order,
+// because ls has no live sort comparator yet -- ls.ENH-016 (#34, `-t`
+// / `-S` / `-r`) is argv-surface-only at HEAD (commit 52e14a7); Runner
+// never buffers or reorders on its own. A stable partition is
+// therefore the complete and honest implementation of the current
+// discipline, and it composes with a future comparator unchanged:
+// whoever wires ENH-016 sorts the buffered entry set (or `kinds_ptr`
+// + a parallel key array) BEFORE calling group_sort_partition, and
+// the two-pass stability preserves that ordering within each group.
+//
+// =============================================================================
+// NOT IN SCOPE: SYMLINK-TO-DIRECTORY PROMOTION
+// =============================================================================
+//
+// GNU ls groups a symlink whose target is a directory alongside real
+// directories. Doing that here would require the *target's* type,
+// which needs a stat-follow syscall; `PdxfsShim` (src/pdxfs_shim.pdx)
+// exposes only `pdxfs_open_dir` and `pdxfs_dir_readnext` -- no
+// stat-by-name / lstat-follow trampoline exists in this tree today.
+// `group_sort_partition` trusts the caller's kind codes verbatim, so a
+// symlink (kind 0xA) lands in the non-directory partition. This is a
+// known, honest gap -- not a silent behavioural claim -- tracked as a
+// follow-up once a stat-follow primitive lands (see src/runner.pdx's
+// GDF collect-phase comment for the caller-side note).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`GroupSort`), no directory prefix.
+//   - No `test` mnemonic; every branch uses `cmp reg, reg` or
+//     `cmp reg, imm` with imm <= 4 (GS_KIND_DIR).
+//   - No byte reads/writes -- every element is a full u64 lane.
+//   - Array addressing is `[base + index * 8]` with a register base
+//     held directly in a callee-save register (r12 / r14) -- mirrors
+//     the precedent at src/ls.pdx `ls_note` / `ls_reset` (base in r10,
+//     index in the input register, no extra staging needed) and
+//     src/ls.pdx L185 (`mov [r10 + rcx * 8], rax` -- store form of the
+//     same addressing mode).
+//   - r10 is the scan index; r11 unused (both paideia-as reserved
+//     scratch).
+//   - LEAF-shaped: no nested calls, but four callee-save pushes
+//     (r12, r13, r14, r15) are kept for pipeline-stability parity with
+//     the rest of this codebase's non-trivial loops (see Render's
+//     render_dec_u64 precedent, which keeps four pushes despite also
+//     being callable as a leaf).
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called by:
+//   runner_ls -- Runner (src/runner.pdx), GDF collect phase, when
+//                AS_BIT_GDF is set on flag_bits.
+
+module GroupSort = structure {
+
+  // ==========================================================================
+  // Kind-code constant (mirrors Runner::RN_ENT_OFF_KIND's low-nibble
+  // decode; see src/runner.pdx §RN_ENT_OFF_KIND / the kernel
+  // PdxFsDirEntry record's kind qword).
+  // ==========================================================================
+  pub let GS_KIND_DIR : u64 = 4
+
+  // ==========================================================================
+  // group_sort_partition(kinds_ptr, count, order_ptr) -> u64
+  //
+  // Signature: (u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI (input):  kinds_ptr -- caller-owned array of `count` u64
+  //                 kind codes, one per directory entry.
+  //   RSI (input):  count     -- number of entries (0 is a legal
+  //                 no-op; both pass loops fall through immediately).
+  //   RDX (input):  order_ptr -- caller-owned output array of `count`
+  //                 u64 slots. Written left-to-right across both
+  //                 passes; never read.
+  //   RAX (output): `count`, echoed back for a caller convenience
+  //                 check. This function cannot fail on well-formed
+  //                 input.
+  //
+  // Register plan (four callee-save pushes; no nested calls):
+  //   r12 = kinds_ptr  (base for the [r12 + r10*8] loads, both passes)
+  //   r13 = count      (loop bound, both passes)
+  //   r14 = order_ptr  (base for the [r14 + r15*8] stores, both passes)
+  //   r15 = write_cursor (shared across both passes)
+  //   r10 = scan index (idx; reset to 0 at the start of each pass)
+  //   rax = loaded kind code / return value
+  // ==========================================================================
+  pub let group_sort_partition : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (kinds_ptr: u64) (count: u64) (order_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-020 (#38): stable two-pass directories-first partition. Pass 1 scans kinds_ptr[0..count) (base r12, index r10) and appends every index whose kind == GS_KIND_DIR (4) to order_ptr[write_cursor++] (base r14, index r15) in encounter order; pass 2 rescans the identical range and appends every remaining index (kind != GS_KIND_DIR) the same way. The result in order_ptr is a permutation of 0..count-1 with every directory index first and, within each of the two groups, the original readdir order preserved -- correct for the sort discipline as it stands today (no -t/-S/-r comparator is wired anywhere in this tree yet; ls.ENH-016 (#34) is argv-surface-only at HEAD) and forward-compatible with a future comparator without changes here (a caller that later sorts the buffered entries, or kinds_ptr/order_ptr together, before calling this function gets that ordering preserved by the same two-pass stability). count == 0 is a legal no-op: both `cmp r10, r13; jae ...` guards fire on the first iteration. group_sort_partition deliberately does NOT attempt symlink-to-directory promotion -- it trusts the caller's kind codes verbatim, so a symlink (kind 0xA) is grouped with the non-directory partition; promoting it needs a stat-follow syscall PdxfsShim does not expose today (see the module doc comment and src/runner.pdx's GDF collect-phase comment for the tracked follow-up). Four callee-save pushes (r12=kinds_ptr, r13=count, r14=order_ptr, r15=write_cursor) = 32 bytes; this function makes no nested calls so no SysV call-site alignment constraint applies, but matched push/pop parity is kept per house style (mirrors Render::render_dec_u64, which keeps four pushes despite also being leaf-shaped). paideia-as conformance: no test mnemonic; every branch is cmp reg,reg (bound checks) or cmp reg,imm with imm <= 4 (GS_KIND_DIR); array addressing uses the `[base + index*8]` form proven at src/ls.pdx (`mov [r10 + rcx*8], rax` in ls_reset; `mov rax, [r10 + rdi*8]` in ls_note/ls_stat) with the base held directly in a callee-save register -- no extra r11 staging needed since the base is already a plain register value, not a rip-relative symbol. r10 is the scan index (paideia-as reserved scratch); r11 is unused. Labels prefixed gs_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                          // kinds_ptr
+        mov r13, rsi;                          // count
+        mov r14, rdx;                          // order_ptr
+
+        xor r15, r15;                          // write_cursor = 0
+
+        // ---- Pass 1: directories (kind == GS_KIND_DIR) ----------------
+        xor r10, r10;                          // idx = 0
+
+      gs_pass1_head:
+        cmp r10, r13;
+        jae gs_pass2_init;
+
+        mov rax, [r12 + r10 * 8];              // kinds_ptr[idx]
+        cmp rax, 4;                            // GS_KIND_DIR
+        jne gs_pass1_next;
+
+        mov [r14 + r15 * 8], r10;              // order_ptr[write_cursor] = idx
+        add r15, 1;
+
+      gs_pass1_next:
+        add r10, 1;
+        jmp gs_pass1_head;
+
+        // ---- Pass 2: everything else -----------------------------------
+      gs_pass2_init:
+        xor r10, r10;                          // idx = 0 (rescan)
+
+      gs_pass2_head:
+        cmp r10, r13;
+        jae gs_done;
+
+        mov rax, [r12 + r10 * 8];              // kinds_ptr[idx]
+        cmp rax, 4;                            // GS_KIND_DIR
+        je  gs_pass2_next;                     // already placed in pass 1
+
+        mov [r14 + r15 * 8], r10;              // order_ptr[write_cursor] = idx
+        add r15, 1;
+
+      gs_pass2_next:
+        add r10, 1;
+        jmp gs_pass2_head;
+
+      gs_done:
+        mov rax, r13;                          // echo count
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}

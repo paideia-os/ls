@@ -20,7 +20,7 @@
 # a new PAIDEIA_AS_VER KV record.
 
 name        = ls
-version     = 1.1.1
+version     = 1.1.2
 kind        = tool
 entry       = Dispatch::ls_dispatch
 output      = build-out/ls
@@ -59,6 +59,7 @@ sources:
   - src/exit_map.pdx              # M4-003 0xFFFFEBxx -> I4 exit-code map
   - src/schema_dump.pdx           # v1.1.0 ENH-006 (#19) --schema catalog emit
   - src/json_line.pdx             # v1.1.0 ENH-007 (#26) --json line renderer
+  - src/group_sort.pdx            # 1.1.2 ENH-020 (#38) --group-directories-first partition
 
 # --- Library dependencies -----------------------------------------------
 # ls consumes four libraries at 1.0.1+ (ls.ENH-013, #22: the phantom
@@ -88,6 +89,7 @@ tests:
   - tests/human_size_fixtures.pdx   # 1.0.1 ENH-003 6 human_size_render cases
   - tests/json_line_fixtures.pdx    # 1.1.1 finding 3: 7 json_line_render cases
   - tests/schema_dump_fixtures.pdx  # 1.1.1 finding 3: 1 catalog byte-diff
+  - tests/group_sort_fixtures.pdx   # 1.1.2 ENH-020 (#38) 7 group_sort_partition cases
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49/R50 tool observes and every M1
@@ -112,7 +114,7 @@ compliance:
 # 1.0 tag freezes those, and a re-sign at R32 rewrites the mirror
 # copy only (source tree unchanged).
 release:
-  manifest_pdxsig = pkgs.paideia-os/ls/1.1.1/manifest.pdxsig
-  changelog_entry = CHANGELOG.md#111
+  manifest_pdxsig = pkgs.paideia-os/ls/1.1.2/manifest.pdxsig
+  changelog_entry = CHANGELOG.md#112
   pdxdoc          = doc/ls.pdxdoc
-  mirror_target   = pkgs.paideia-os/ls/1.1.1/
+  mirror_target   = pkgs.paideia-os/ls/1.1.2/

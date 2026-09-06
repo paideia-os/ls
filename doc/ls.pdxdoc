@@ -17,7 +17,8 @@ by field name rather than by column-slicing text.
 
 !section synopsis
 
-  ls [-l] [-a] [-h] [--json] [--schema] [--color=<v>] [<path>]
+  ls [-l] [-a] [-h] [--json] [--schema] [--color=<v>]
+     [--group-directories-first] [<path>]
 
 `<path>` defaults to `.` when omitted. Positionals beyond `[0]` are
 ignored at 1.0 (multi-path listing lands at 1.1). Unknown flags
@@ -45,6 +46,20 @@ return exit 2.
                   color-off today because fd 1 has no cap-slot
                   binding on the M3 compat shim -- the probe lands
                   when the R49.M1 KIND_TTY write wire ships]
+  --group-directories-first
+                  Directories before non-directories, each group
+                  internally in the same order the current sort
+                  discipline would otherwise produce (today: raw
+                  readdir order -- no -t/-S/-r comparator exists in
+                  this tree yet). [live at 1.1.2] A symlink whose
+                  target is a directory is grouped with non-
+                  directories, not with directories -- resolving the
+                  target's type needs a stat-follow syscall this
+                  tool does not have. A directory with more than 64
+                  entries refuses (exit 4) rather than silently
+                  emitting a partial grouping; unreachable today
+                  since the kernel readnext primitive is still a
+                  fixed small stub.
 
 At 1.1.0 the read loop honours `-a`, `-l`, `-h`, `--json`, and
 `--color=` directly (per the wiring-wave items ENH-002/005/007 in

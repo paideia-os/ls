@@ -154,6 +154,7 @@
 //   color_pick             -- ColorPicker (src/color_picker.pdx) -- v1.1.0 ENH-005
 //   color_sgr_prefix       -- ColorPicker (src/color_picker.pdx) -- v1.1.0 ENH-005
 //   color_sgr_suffix       -- ColorPicker (src/color_picker.pdx) -- v1.1.0 ENH-005
+//   group_sort_partition   -- GroupSort (src/group_sort.pdx) -- ls.ENH-020 (#38)
 
 module Runner = structure {
 
@@ -184,6 +185,19 @@ module Runner = structure {
   pub let RN_BIT_COLOR_AUTO_MASK  : u64 = 0x4000
   // ls.ENH-019 (#37): -F type-indicator suffix mask (AS_BIT_F).
   pub let RN_BIT_F_MASK           : u64 = 0x1000
+  // ls.ENH-020 (#38): --group-directories-first mask (AS_BIT_GDF).
+  // Runner buffers the whole directory when this bit is set (the held
+  // dir cap has no rewind primitive -- see the GDF collect-phase
+  // comment below) and reorders emission through
+  // GroupSort::group_sort_partition.
+  pub let RN_BIT_GDF_MASK         : u64 = 0x2000
+  // ls.ENH-020 (#38): static cap on the GDF buffer. See the
+  // collect-phase comment for the overflow policy rationale (today's
+  // kernel readnext is a fixed small stub -- design/enhancement-plan.md
+  // §1.1 -- so this bound is unreachable at HEAD; it exists so a
+  // future real substrate fails loudly rather than silently once a
+  // directory outgrows a static buffer).
+  pub let RN_GDF_MAX_ENTRIES      : u64 = 64
   // ls.ENH-019 (#37): kind-nibble offset inside the 128-byte kernel
   // PdxFsDirEntry record. See paideia-os
   // src/kernel/core/cap/pdxfs_dir_iter.pdx §1 (inode@0, kind@8,
@@ -248,6 +262,28 @@ module Runner = structure {
   pub let mut _rn_sgr_prefix_scratch : [u64; 1]  = uninit @align(8)
   pub let mut _rn_sgr_suffix_scratch : [u64; 1]  = uninit @align(8)
 
+  // ls.ENH-020 (#38): GDF (--group-directories-first) buffering state.
+  //
+  // _rn_gdf_mode  -- non-zero for the whole call when AS_BIT_GDF was
+  //                  set on flag_bits (computed once at entry).
+  // _rn_gdf_count -- entries buffered into _rn_gdf_buf so far (collect
+  //                  phase) / total buffered (emit phase).
+  // _rn_gdf_idx   -- emission cursor into _rn_gdf_order_buf (emit phase).
+  // _rn_gdf_buf   -- up to RN_GDF_MAX_ENTRIES (64) 128-byte
+  //                  PdxFsDirEntry records, packed (64*16 = 1024 u64
+  //                  lanes = 8192 bytes).
+  // _rn_gdf_kinds_buf  -- one low-nibble kind code per buffered entry
+  //                       (GroupSort::group_sort_partition's input).
+  // _rn_gdf_order_buf  -- GroupSort::group_sort_partition's output: a
+  //                       permutation of 0.._rn_gdf_count-1, dirs
+  //                       first, stable within each group.
+  pub let mut _rn_gdf_mode        : u64 = uninit @align(8)
+  pub let mut _rn_gdf_count       : u64 = uninit @align(8)
+  pub let mut _rn_gdf_idx         : u64 = uninit @align(8)
+  pub let mut _rn_gdf_buf         : [u64; 1024] = uninit @align(8)
+  pub let mut _rn_gdf_kinds_buf   : [u64; 64]   = uninit @align(8)
+  pub let mut _rn_gdf_order_buf   : [u64; 64]   = uninit @align(8)
+
   // ==========================================================================
   // runner_ls(path_ptr, flag_bits) -> u64
   //
@@ -283,6 +319,26 @@ module Runner = structure {
         mov rdi, 2;                              // RN_STAT_RUNS
         call ls_note;
 
+        // ---- ls.ENH-020 (#38): GDF mode + collect-state init ----------
+        //
+        // Compute AS_BIT_GDF membership once and stash it in .bss --
+        // every callee-save register is already committed for the
+        // rest of this function (see the file-header register plan),
+        // so there is no free register to carry a mode flag across
+        // the whole body. Zero the buffered-entry bookkeeping
+        // unconditionally; only the GDF path reads it, but a clean
+        // start costs nothing on the non-GDF path.
+        mov r10, r13;                            // flag_bits copy
+        mov r11, 0x2000;                         // RN_BIT_GDF_MASK
+        and r10, r11;
+        lea r11, [rip + _rn_gdf_mode];
+        mov [r11], r10;
+        lea r11, [rip + _rn_gdf_count];
+        mov r10, 0;
+        mov [r11], r10;
+        lea r11, [rip + _rn_gdf_idx];
+        mov [r11], r10;
+
         // ---- Path arg gate (empty-string reject preserved from M1) --
         cmp r12, 0;
         je  rn_ls_audit_open;                    // null path -> proceed
@@ -315,6 +371,13 @@ module Runner = structure {
         // ---- Load LS_DIR_CAP_SLOT into rbx for the loop --------------
         mov rbx, 2;                              // LS_DIR_CAP_SLOT
 
+        // ---- ls.ENH-020 (#38): GDF branches to the collect phase -----
+        lea r11, [rip + _rn_gdf_mode];
+        mov r10, [r11];
+        cmp r10, 0;
+        jne rn_ls_gdf_collect;
+        // Non-GDF: fall through to the unchanged streaming loop.
+
       rn_ls_loop:
         // ---- pdxfs_dir_readnext(LS_DIR_CAP_SLOT, &_rn_entry_buf) ----
         mov rdi, rbx;                            // dir_cap_slot
@@ -330,6 +393,188 @@ module Runner = structure {
 
         // Any other value -> negative-errno; propagate as LS_ERR_READDIR.
         jmp rn_ls_readdir_fail;
+
+        // ==============================================================
+        // ls.ENH-020 (#38): GDF (--group-directories-first) phases.
+        //
+        // The held KIND_PDXFS_FILE dir cap is forward-only -- no
+        // rewind/reopen primitive exists in PdxfsShim (src/pdxfs_shim.pdx
+        // exposes only pdxfs_open_dir and pdxfs_dir_readnext) -- so
+        // grouping directories ahead of files requires buffering every
+        // entry before any of them is rendered or emitted. Three phases:
+        //
+        //   rn_ls_gdf_collect      -- drain the directory into
+        //     _rn_gdf_buf (one 128-byte record per slot, up to
+        //     RN_GDF_MAX_ENTRIES). Reuses _rn_entry_buf as the
+        //     pdxfs_dir_readnext scratch target, then bulk-copies it
+        //     into the next free _rn_gdf_buf slot.
+        //   rn_ls_gdf_partition    -- extract one kind-nibble per
+        //     buffered record into _rn_gdf_kinds_buf and call
+        //     GroupSort::group_sort_partition to compute a dirs-first,
+        //     stable-within-group emission order into
+        //     _rn_gdf_order_buf.
+        //   rn_ls_gdf_emit_next    -- the buffered-mode replacement for
+        //     rn_ls_loop's "get the next entry" step: copies the
+        //     buffered record at the next order-buffer index into
+        //     _rn_entry_buf, advances the cursor, then falls into the
+        //     UNCHANGED per-entry body at rn_ls_have_entry. Every
+        //     "continue" edge in that body now runs through
+        //     rn_ls_continue (above), which redirects here instead of
+        //     rn_ls_loop when GDF mode is on.
+        //
+        // Overflow (more than RN_GDF_MAX_ENTRIES entries): refuses via
+        // the existing rn_ls_readdir_fail path (LS_ERR_READDIR). This
+        // is a real, documented substrate-resource-limit refusal, not
+        // a silent truncation of the grouped listing -- consistent
+        // with this tool's D3 audit-first / no-silent-wrong-output
+        // discipline. Today's kernel readnext is a fixed small stub
+        // (design/enhancement-plan.md §1.1), so this bound is
+        // unreachable at HEAD.
+        //
+        // Symlink-to-directory promotion is NOT implemented. GNU ls
+        // groups a symlink whose target is a directory alongside real
+        // directories; doing that here needs the target's type, which
+        // needs a stat-follow syscall PdxfsShim does not expose. A
+        // symlink entry (kind 0xA) is buffered and partitioned like
+        // any other non-directory entry -- see GroupSort's module doc
+        // comment (src/group_sort.pdx) for the full rationale and the
+        // tracked follow-up.
+        // ==============================================================
+      rn_ls_gdf_collect:
+        mov rdi, rbx;                            // LS_DIR_CAP_SLOT
+        lea r11, [rip + _rn_entry_buf];
+        mov rsi, r11;
+        call pdxfs_dir_readnext;
+
+        cmp rax, 1;                              // RN_READNEXT_ENTRY
+        je  rn_ls_gdf_have_raw;
+        cmp rax, 0;                              // RN_READNEXT_EOD
+        je  rn_ls_gdf_partition;
+
+        jmp rn_ls_readdir_fail;
+
+      rn_ls_gdf_have_raw:
+        // Overflow guard -- reject before writing past _rn_gdf_buf.
+        lea r11, [rip + _rn_gdf_count];
+        mov r14, [r11];                          // current count
+        cmp r14, 64;                             // RN_GDF_MAX_ENTRIES
+        jae rn_ls_readdir_fail;
+
+        // dst_lane_base = count * 16 (16 u64 lanes per 128-byte record)
+        mov r9, r14;
+        shl r9, 4;
+
+        lea r15, [rip + _rn_entry_buf];          // src base
+        lea r8,  [rip + _rn_gdf_buf];             // dst table base
+
+        xor rcx, rcx;                             // lane idx = 0
+
+      rn_ls_gdf_copy_loop:
+        cmp rcx, 16;
+        jae rn_ls_gdf_copy_done;
+
+        mov rax, [r15 + rcx * 8];
+        mov r10, r9;
+        add r10, rcx;                             // absolute dst lane index
+        mov [r8 + r10 * 8], rax;
+
+        add rcx, 1;
+        jmp rn_ls_gdf_copy_loop;
+
+      rn_ls_gdf_copy_done:
+        add r14, 1;
+        lea r11, [rip + _rn_gdf_count];
+        mov [r11], r14;
+        jmp rn_ls_gdf_collect;
+
+      rn_ls_gdf_partition:
+        // Extract one kind-nibble per buffered record into
+        // _rn_gdf_kinds_buf, then call GroupSort::group_sort_partition.
+        // r12 (path_ptr) is dead by this point -- the only use of
+        // path_ptr was the M1 empty-string gate at function entry --
+        // so it is safe to repurpose here as the buffered count.
+        lea r11, [rip + _rn_gdf_count];
+        mov r12, [r11];                          // count
+
+        xor rcx, rcx;                             // idx = 0
+
+      rn_ls_gdf_kinds_loop:
+        cmp rcx, r12;
+        jae rn_ls_gdf_kinds_done;
+
+        mov r9, rcx;
+        shl r9, 4;                                // idx * 16
+        add r9, 1;                                // + kind-lane offset
+                                                   // (RN_ENT_OFF_KIND byte
+                                                   // 8 = lane 1)
+        lea r11, [rip + _rn_gdf_buf];
+        mov rax, [r11 + r9 * 8];
+        and rax, 0xF;                             // low nibble -- kind code
+
+        lea r11, [rip + _rn_gdf_kinds_buf];
+        mov [r11 + rcx * 8], rax;
+
+        add rcx, 1;
+        jmp rn_ls_gdf_kinds_loop;
+
+      rn_ls_gdf_kinds_done:
+        lea r11, [rip + _rn_gdf_kinds_buf];
+        mov rdi, r11;
+        mov rsi, r12;                             // count
+        lea r11, [rip + _rn_gdf_order_buf];
+        mov rdx, r11;
+        call group_sort_partition;
+
+        lea r11, [rip + _rn_gdf_idx];
+        mov r10, 0;
+        mov [r11], r10;
+        jmp rn_ls_gdf_emit_next;
+
+      rn_ls_gdf_emit_next:
+        lea r11, [rip + _rn_gdf_idx];
+        mov r10, [r11];                           // emit cursor
+        lea r11, [rip + _rn_gdf_count];
+        mov r9, [r11];                            // total buffered
+        cmp r10, r9;
+        jae rn_ls_done;                           // all buffered entries emitted
+
+        // idx = _rn_gdf_order_buf[cursor]
+        lea r11, [rip + _rn_gdf_order_buf];
+        mov rax, [r11 + r10 * 8];                 // original buffer index
+
+        // Copy the 128-byte record at _rn_gdf_buf[idx] into
+        // _rn_entry_buf so the UNCHANGED per-entry body below sees it
+        // exactly like a live pdxfs_dir_readnext result.
+        mov r9, rax;
+        shl r9, 4;                                // idx * 16 (src lane base)
+
+        lea r15, [rip + _rn_gdf_buf];             // src table base
+        lea r8,  [rip + _rn_entry_buf];            // dst base
+
+        xor rcx, rcx;                              // lane idx = 0
+
+      rn_ls_gdf_emit_copy_loop:
+        cmp rcx, 16;
+        jae rn_ls_gdf_emit_copy_done;
+
+        mov r11, r9;
+        add r11, rcx;                              // absolute src lane index
+        mov rax, [r15 + r11 * 8];
+        mov [r8 + rcx * 8], rax;
+
+        add rcx, 1;
+        jmp rn_ls_gdf_emit_copy_loop;
+
+      rn_ls_gdf_emit_copy_done:
+        // Advance the cursor BEFORE falling into the shared per-entry
+        // body -- rn_ls_continue routes every "next entry" edge back
+        // here, so the cursor must already point at the next slot.
+        lea r11, [rip + _rn_gdf_idx];
+        mov r10, [r11];
+        add r10, 1;
+        mov [r11], r10;
+
+        jmp rn_ls_have_entry;
 
       rn_ls_have_entry:
         // ---- Load name_len (offset 16) and name_ptr (offset 24) ------
@@ -723,12 +968,25 @@ module Runner = structure {
         mov rdi, 3;                              // RN_STAT_ENTRIES
         call ls_note;
 
-        jmp rn_ls_loop;
+        jmp rn_ls_continue;
 
       rn_ls_hidden:
         // ---- Hidden: bump LS_ST_HIDDEN + continue --------------------
         mov rdi, 5;                              // RN_STAT_HIDDEN
         call ls_note;
+        jmp rn_ls_continue;
+
+        // ls.ENH-020 (#38): shared continuation dispatcher. Both
+        // "advance to the next entry" sites above used to jump
+        // straight to rn_ls_loop (call pdxfs_dir_readnext again); GDF
+        // mode instead needs to advance the buffered emission cursor.
+        // r13 (flag_bits) is untouched by either predecessor, so this
+        // check is safe to run unconditionally.
+      rn_ls_continue:
+        lea r11, [rip + _rn_gdf_mode];
+        mov r10, [r11];
+        cmp r10, 0;
+        jne rn_ls_gdf_emit_next;
         jmp rn_ls_loop;
 
       rn_ls_done:

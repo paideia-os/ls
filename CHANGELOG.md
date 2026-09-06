@@ -9,9 +9,65 @@ and stored under `pkgs.paideia-os/ls/<version>/`.
 
 ## [Unreleased]
 
-Post-1.1.1 items on the Enhancement v1.x wave
+Post-1.1.2 items on the Enhancement v1.x wave
 (`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
 exit-code map, wire body shape, `caps.decl`) changes in this section.
+
+## [1.1.2] -- 2026-09-05 -- `--group-directories-first` (ls.ENH-020) <a id="112"></a>
+
+**1.1.2.** `ArgvSurface::AS_BIT_GDF` parsed since commit `36d5995`
+(argv-surface-only landing, Refs #38) but the read loop never buffered
+or reordered anything -- `ls --group-directories-first` was byte-
+identical to bare `ls`. This release wires the comparator half.
+
+### Added
+
+- **`GroupSort::group_sort_partition`** (`src/group_sort.pdx`, new
+  module) -- a stable two-pass directories-first partition over a
+  caller-supplied array of kind codes. Pass 1 collects directory
+  indices in encounter order; pass 2 collects everything else in
+  encounter order. This is the complete implementation of "each group
+  sorted by whatever the existing sort discipline is" as that
+  discipline stands today: ls has no live `-t`/`-S`/`-r` comparator
+  anywhere in this tree yet (`ls.ENH-016`, #34, is argv-surface-only,
+  same as ENH-020 was before this release), so within-group order is
+  raw readdir order, preserved. The two-pass stability composes with
+  a future real comparator unchanged.
+- **`Runner::runner_ls`** (`src/runner.pdx`) GDF collect/partition/
+  emit phases. The held `KIND_PDXFS_FILE` directory cap has no
+  rewind primitive, so grouping requires buffering: when `AS_BIT_GDF`
+  is set, the read loop now drains the whole directory into a static
+  64-entry buffer (`_rn_gdf_buf`, `RN_GDF_MAX_ENTRIES`), extracts one
+  kind-nibble per entry, calls `group_sort_partition`, then replays
+  the buffered records through the **unchanged** per-entry render/
+  emit body (`rn_ls_have_entry` onward -- every `-l`/`--json`/
+  `--color`/`-F` rendering path is untouched) in the computed order.
+  Non-GDF listings take the exact byte-for-byte same streaming path
+  as before (zero behavioural change; verified by inspection, no
+  existing fixture touches Runner's control flow).
+- **`tests/group_sort_fixtures.pdx`** -- 7 cases for
+  `group_sort_partition`: empty, all-dirs, all-files, mixed, mixed
+  with symlinks, single dir, single file. The symlink case is the
+  executable pin for the documented no-promotion gap below.
+
+### Known limitation
+
+- **Symlink-to-directory promotion is not implemented.** GNU ls
+  groups a symlink whose target is a directory alongside real
+  directories; that needs the target's type, which needs a
+  stat-follow syscall `PdxfsShim` does not expose (it has only
+  `pdxfs_open_dir` + `pdxfs_dir_readnext`). A symlink entry (kind
+  `0xA`) is grouped with the non-directory partition today. Documented
+  in `src/group_sort.pdx`'s module comment and pinned by
+  `tests/group_sort_fixtures.pdx` case 4; tracked as a follow-up once
+  a stat-follow trampoline lands.
+- **`RN_GDF_MAX_ENTRIES` = 64 static cap.** A directory with more
+  entries than that refuses with the existing `LS_ERR_READDIR`
+  sentinel rather than silently truncating the grouped listing.
+  Unreachable at HEAD -- `sys_pdxfs_dir_readnext` is still a fixed
+  small stub (`design/enhancement-plan.md` §1.1) -- but a real
+  substrate will need a dynamic buffer once this tool has an
+  allocator primitive to lean on.
 
 ## [1.1.1] -- 2026-09-03 -- JSON escape + schema catalog correctness (post-1.1.0 debugger findings) <a id="111"></a>
 
