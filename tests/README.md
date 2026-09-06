@@ -77,6 +77,23 @@ sub-band sentinel on fail.
   that call this helper live in `runner_ls`'s control flow (which
   issues real syscalls) and are not fixture-testable here; they are
   covered by the qemu smoke path instead.
+- `recurse_filter_fixtures.pdx` — `ls.ENH-017` (#35). 8 cases for
+  `RecurseFilter::recurse_should_descend`, the `-R` recursion-
+  candidacy predicate: an ordinary directory name, `.`, `..`, a
+  hidden directory (`.git`, a valid candidate -- `-a` gating is
+  Runner's job, not this predicate's), a regular file, a symlink
+  (never followed by default), a name starting with `..` but not
+  equal to it (`..x`), and a defensive null-name-pointer case.
+- `recurse_header_fixtures.pdx` — `ls.ENH-017` (#35). 5 byte-exact
+  cases for `RecurseHeader::recurse_header_compose`, the `-R`
+  recursion-block header composer (`\n<path>/<name>:\n`): the default
+  `.` path, an explicit path, an undersized `dst_cap` (overflow),
+  a caller-supplied `name_len` past `RH_NAME_MAX` (104, silently
+  clamped), and a `path_ptr` with no NUL within `RH_PATH_MAX` (200,
+  clamped by the scan bound rather than a terminator). Runner's -R
+  phase (`src/runner.pdx`, `rn_ls_recurse_emit_loop`) that buffers
+  candidates and calls this composer issues real syscalls
+  (`tty_write`) and is covered by the qemu smoke path, not here.
 - `goldens/` — human-readable copies of each fixture case's
   expected byte sequence. Not read at build/test time (paideia-as
   fixture modules have no filesystem cap); the `.rodata` tables in

@@ -1,0 +1,452 @@
+// tests/recurse_header_fixtures.pdx -- ls.ENH-017 (paideia-os/ls#35)
+//
+// RecurseHeaderFixtures module: byte-exact goldens for
+// RecurseHeader::recurse_header_compose (src/recurse_header.pdx), the
+// `-R` recursion-block header composer (`\n<path>/<name>:\n`).
+// Follows the M4 fixture convention documented in tests/README.md.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// recurse_header_compose is a leaf with no syscalls, so it is
+// directly fixture-testable (unlike runner_ls, which issues real
+// `syscall` instructions and is exercised only by the qemu smoke
+// path). This module pins the exact byte layout Runner's -R phase
+// (src/runner.pdx, rn_ls_recurse_emit_loop) depends on, plus the two
+// clamp boundaries (path scan bound, name_len bound) and the
+// overflow contract.
+//
+// Five cases:
+//
+//   idx  path              name       name_len  dst_cap  expect
+//   -----------------------------------------------------------------
+//    0   (null -> ".")     "subdir"   6         256      "\n./subdir:\n" (11 B)
+//    1   "/tmp/tree"       "a"        1         256      "\n/tmp/tree/a:\n" (14 B)
+//    2   (null -> ".")     "subdir"   6         5        RH_ERR_OVERFLOW
+//                                                        (needs 11, has 5)
+//    3   (null -> ".")     110*'z'    110       200      109 B, name clamped
+//                                                        to RH_NAME_MAX (104)
+//                                                        -- pins that a
+//                                                        caller-supplied
+//                                                        name_len past the
+//                                                        bound is silently
+//                                                        clamped, not
+//                                                        overrun
+//    4   210*'p' (no NUL)  "x"        1         250      205 B, path clamped
+//                                                        to RH_PATH_MAX
+//                                                        (200) -- pins the
+//                                                        "no NUL found
+//                                                        within the scan
+//                                                        bound" clamp path,
+//                                                        distinct from
+//                                                        case 3's caller-
+//                                                        supplied-length
+//                                                        clamp
+//
+// =============================================================================
+// TABLE LAYOUT
+// =============================================================================
+//
+//   _rhf_path_is_null    [u64; 5]  -- 1 => pass path_ptr = 0 literally
+//   _rhf_path_offsets    [u64; 5]  -- byte offset into _rhf_paths_all
+//                                     (ignored when is_null == 1)
+//   _rhf_name_offsets    [u64; 5]  -- byte offset into _rhf_names_all
+//   _rhf_name_lens       [u64; 5]  -- name_len argument per case
+//   _rhf_dst_caps        [u64; 5]  -- dst_cap argument per case
+//   _rhf_expected_lens   [u64; 5]  -- expected return; RH_ERR_OVERFLOW
+//                                     (0xFFFF...F) => byte-diff skipped
+//   _rhf_golden_offsets  [u64; 5]  -- byte offset into _rhf_golden_all
+//                                     (ignored for the overflow case)
+//   _rhf_paths_all       [u8; 220] -- packed path inputs
+//   _rhf_names_all       [u8; 121] -- packed name inputs
+//   _rhf_golden_all      [u8; 339] -- packed expected outputs
+//   _rhf_scratch         [u64; 32] -- 256-byte compose dst (@align(8))
+//
+// =============================================================================
+// PUBLIC ENTRY POINTS
+// =============================================================================
+//
+//   recurse_header_fixtures_case_count() -> u64        -- RHF_CASE_COUNT (5)
+//   recurse_header_fixtures_run(case_idx) -> u64       -- 0 pass; err+idx on fail
+//   recurse_header_fixtures_verify_all() -> u64        -- fail-fast walk
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`RecurseHeaderFixtures`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates:
+//     5 (case cap), 250 (dst_cap), 220/121/339 (table sizes). The
+//     0xFFFFFFFFFFFFFFFF overflow marker and the RHF_ERR_* sentinels
+//     are `mov rax, imm64` / `mov r11, imm64` stores, never compares.
+//   - Byte reads (diff loop) use `xor rax, rax; mov_b rax, [ptr]` per
+//     #1248, staged through r11 so addressing stays [reg]-only.
+//   - r10 / r11 are scratch.
+//   - Labels prefixed rhf_ / rhfva_.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   recurse_header_compose -- RecurseHeader (src/recurse_header.pdx)
+
+module RecurseHeaderFixtures = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let RHF_OK                : u64 = 0
+  pub let RHF_ERR_LEN_MISMATCH  : u64 = 0xFFFFEBB0    // + case_idx (0..4)
+  pub let RHF_ERR_BYTE_MISMATCH : u64 = 0xFFFFEBC0    // + case_idx (0..4)
+  pub let RHF_ERR_BAD_CASE_IDX  : u64 = 0xFFFFEBCF
+
+  pub let RHF_CASE_COUNT        : u64 = 5
+
+  // ==========================================================================
+  // Per-case scalar inputs / expectations.
+  // ==========================================================================
+  pub let _rhf_path_is_null   : [u64; 5] = [ 1, 0, 1, 1,   0 ]
+  pub let _rhf_path_offsets   : [u64; 5] = [ 0, 0, 0, 0,   10 ]
+  pub let _rhf_name_offsets   : [u64; 5] = [ 0, 7, 0, 9,   119 ]
+  pub let _rhf_name_lens      : [u64; 5] = [ 6, 1, 6, 110, 1 ]
+  pub let _rhf_dst_caps       : [u64; 5] = [ 256, 256, 5, 200, 250 ]
+  // Case 2 expects RH_ERR_OVERFLOW (0xFFFFFFFFFFFFFFFF); every other
+  // case expects its composed byte count.
+  pub let _rhf_expected_lens  : [u64; 5] = [ 11, 14, 0xFFFFFFFFFFFFFFFF, 109, 205 ]
+  pub let _rhf_golden_offsets : [u64; 5] = [ 0, 11, 25, 25, 134 ]
+
+  // ==========================================================================
+  // Packed path inputs (220 bytes). Case 1's "/tmp/tree" is NUL-
+  // terminated at byte 9 (10 bytes total) -- the ordinary scan-to-NUL
+  // path. Case 4's 210 bytes of 'p' carry NO NUL anywhere in the
+  // range recurse_header_compose can reach (its scan is bounded at
+  // RH_PATH_MAX = 200, strictly less than 210) -- this is the "clamp
+  // because the bound fired first, not because a NUL was found"
+  // path, distinct from case 1's ordinary termination.
+  // ==========================================================================
+  pub let _rhf_paths_all : [u8; 220] = [
+      0x2F, 0x74, 0x6D, 0x70, 0x2F, 0x74, 0x72, 0x65,
+      0x65, 0x00, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70
+  ]
+
+  // ==========================================================================
+  // Packed name inputs (121 bytes). Case 3's 110 bytes of 'z' carry
+  // no NUL -- irrelevant here, since name_len is caller-supplied and
+  // authoritative (recurse_header_compose never scans for a name
+  // terminator, only path_ptr's default-"." branch does).
+  // ==========================================================================
+  pub let _rhf_names_all : [u8; 121] = [
+      0x73, 0x75, 0x62, 0x64, 0x69, 0x72, 0x00, 0x61,
+      0x00, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x78,
+      0x00
+  ]
+
+  // ==========================================================================
+  // Packed expected outputs (339 bytes: 11 + 14 + 109 + 205; case 2's
+  // overflow expectation contributes no bytes, so its golden_offset
+  // slot (25) is a placeholder shared with case 3's own start).
+  // ==========================================================================
+  pub let _rhf_golden_all : [u8; 339] = [
+      0x0A, 0x2E, 0x2F, 0x73, 0x75, 0x62, 0x64, 0x69,
+      0x72, 0x3A, 0x0A, 0x0A, 0x2F, 0x74, 0x6D, 0x70,
+      0x2F, 0x74, 0x72, 0x65, 0x65, 0x2F, 0x61, 0x3A,
+      0x0A, 0x0A, 0x2E, 0x2F, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A, 0x7A,
+      0x7A, 0x7A, 0x7A, 0x7A, 0x3A, 0x0A, 0x0A, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70,
+      0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x2F,
+      0x78, 0x3A, 0x0A
+  ]
+
+  // ==========================================================================
+  // .bss destination buffer for recurse_header_compose -- 256 bytes,
+  // same shape/alignment as Runner::_rn_line_buf (the real call site).
+  // ==========================================================================
+  pub let mut _rhf_scratch : [u64; 32] = uninit @align(8)
+
+  // ==========================================================================
+  // recurse_header_fixtures_case_count() -> u64
+  //
+  // Leaf.
+  // ==========================================================================
+  pub let recurse_header_fixtures_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-017 (#35): return RHF_CASE_COUNT (5) for a harness iterating via recurse_header_fixtures_run. Leaf pure function. paideia-as conformance: no test mnemonic; no cmp. Labels prefixed rhfcc_.",
+      block: {
+        mov rax, 5;                              // RHF_CASE_COUNT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // recurse_header_fixtures_run(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI: case_idx (0..4)
+  //   RAX: 0 on pass; RHF_ERR_LEN_MISMATCH + case_idx or
+  //        RHF_ERR_BYTE_MISMATCH + case_idx on fail;
+  //        RHF_ERR_BAD_CASE_IDX on out-of-range.
+  //
+  // Register plan (five callee-save pushes for pipeline stability
+  // across the recurse_header_compose call, mirrors JsonLineFixtures::
+  // json_line_fixtures_run):
+  //   rbx = case_idx (survives)
+  //   r12 = expected_len (survives; doubles as the overflow marker)
+  //   r13 = golden_ptr (survives; unused when r12 is the overflow marker)
+  //   r14 = dst_ptr = &_rhf_scratch (survives; also passed as rcx)
+  //   r15 = diff-loop index (reused after the one call)
+  //
+  // Alignment: 5 pushes = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48;
+  // 48 % 16 == 0 at the recurse_header_compose call site.
+  // ==========================================================================
+  pub let recurse_header_fixtures_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-017 (#35): run one recurse_header_compose case. Bounds-check case_idx < 5 -> RHF_ERR_BAD_CASE_IDX. Load expected_len from _rhf_expected_lens[case_idx] into r12 (either a real byte count or the RH_ERR_OVERFLOW sentinel 0xFFFFFFFFFFFFFFFF). Compute golden_ptr = &_rhf_golden_all + _rhf_golden_offsets[case_idx] into r13 (ignored on the overflow path). dst_ptr = &_rhf_scratch into r14. Marshal the five call args: rdi = 0 when _rhf_path_is_null[case_idx] != 0, else &_rhf_paths_all + _rhf_path_offsets[case_idx]; rsi = &_rhf_names_all + _rhf_name_offsets[case_idx]; rdx = _rhf_name_lens[case_idx]; rcx = r14 (dst_ptr); r8 = _rhf_dst_caps[case_idx]. Call recurse_header_compose. Compare rax to r12 -> RHF_ERR_LEN_MISMATCH + case_idx on drift (this single compare also validates the overflow-expected case, since RH_ERR_OVERFLOW is exactly what a correctly-refusing call returns). If r12 IS the overflow sentinel, the length check alone already proves correctness -- dst was never touched on that path (recurse_header_compose's own two-pass contract), so the byte-diff is skipped. Otherwise byte-diff r12 bytes of _rhf_scratch against the golden (actual-then-expected-then-compare idiom, #1248-mitigated loads staged through r11) -> RHF_ERR_BYTE_MISMATCH + case_idx on first drift. Five callee-save pushes (rbx=case_idx, r12=expected_len, r13=golden_ptr, r14=dst_ptr, r15=diff index) = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48; aligned at the recurse_header_compose call site. paideia-as: no test mnemonic; largest cmp immediate 5 (case cap); sentinels via mov rax, imm64 + add rax, rbx. Labels prefixed rhf_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                            // case_idx
+
+        cmp rbx, 5;                               // RHF_CASE_COUNT
+        jae rhf_bad_idx;
+
+        lea r11, [rip + _rhf_expected_lens];
+        mov r12, [r11 + rbx * 8];                 // expected_len
+
+        lea r11, [rip + _rhf_golden_offsets];
+        mov rax, [r11 + rbx * 8];
+        lea r11, [rip + _rhf_golden_all];
+        add r11, rax;
+        mov r13, r11;                              // golden_ptr
+
+        lea r14, [rip + _rhf_scratch];             // dst_ptr
+
+        // ---- path_ptr (rdi) ----
+        lea r11, [rip + _rhf_path_is_null];
+        mov rax, [r11 + rbx * 8];
+        cmp rax, 0;
+        jne rhf_path_from_table;
+        xor rdi, rdi;                              // literal 0
+        jmp rhf_path_done;
+
+      rhf_path_from_table:
+        lea r11, [rip + _rhf_path_offsets];
+        mov rax, [r11 + rbx * 8];
+        lea r11, [rip + _rhf_paths_all];
+        add r11, rax;
+        mov rdi, r11;
+
+      rhf_path_done:
+        // ---- name_ptr (rsi) ----
+        lea r11, [rip + _rhf_name_offsets];
+        mov rax, [r11 + rbx * 8];
+        lea r11, [rip + _rhf_names_all];
+        add r11, rax;
+        mov rsi, r11;
+
+        // ---- name_len (rdx) ----
+        lea r11, [rip + _rhf_name_lens];
+        mov rdx, [r11 + rbx * 8];
+
+        // ---- dst_ptr (rcx) / dst_cap (r8) ----
+        mov rcx, r14;
+        lea r11, [rip + _rhf_dst_caps];
+        mov r8, [r11 + rbx * 8];
+
+        call recurse_header_compose;
+
+        cmp rax, r12;
+        jne rhf_len_fail;
+
+        // Overflow-expected case: length check already proved it.
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp r12, r11;
+        je  rhf_ok;
+
+        // Byte-diff loop over r12 bytes.
+        xor r15, r15;
+
+      rhf_diff_loop:
+        cmp r15, r12;
+        jae rhf_ok;
+
+        mov r11, r14;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];                          // actual byte
+        mov r10, rax;
+
+        mov r11, r13;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];                          // expected byte
+
+        cmp rax, r10;
+        jne rhf_byte_fail;
+
+        add r15, 1;
+        jmp rhf_diff_loop;
+
+      rhf_ok:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rhf_len_fail:
+        mov rax, 0xFFFFEBB0;                      // RHF_ERR_LEN_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rhf_byte_fail:
+        mov rax, 0xFFFFEBC0;                      // RHF_ERR_BYTE_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rhf_bad_idx:
+        mov rax, 0xFFFFEBCF;                      // RHF_ERR_BAD_CASE_IDX
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // recurse_header_fixtures_verify_all() -> u64
+  //
+  // Fail-fast walk of all 5 cases. Two callee-save pushes (rbx=idx,
+  // r12=cap) + sub rsp,8 pad = 24; entry rsp % 16 == 8; 8 + 24 = 32;
+  // aligned at recurse_header_fixtures_run's call site.
+  // ==========================================================================
+  pub let recurse_header_fixtures_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-017 (#35): fail-fast walk of all 5 recurse_header_compose cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp % 16 == 8; 8 + 24 = 32; aligned at recurse_header_fixtures_run's call site. Matched add rsp,8 + 2 pops. paideia-as: no test; cmp against 5 fits imm32. Labels prefixed rhfva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 5;                               // RHF_CASE_COUNT
+
+      rhfva_loop:
+        cmp rbx, r12;
+        jae rhfva_ok;
+
+        mov rdi, rbx;
+        call recurse_header_fixtures_run;
+        cmp rax, 0;
+        jne rhfva_out;
+
+        add rbx, 1;
+        jmp rhfva_loop;
+
+      rhfva_ok:
+        xor rax, rax;
+      rhfva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

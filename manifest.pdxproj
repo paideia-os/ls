@@ -20,7 +20,7 @@
 # a new PAIDEIA_AS_VER KV record.
 
 name        = ls
-version     = 1.1.3
+version     = 1.1.4
 kind        = tool
 entry       = Dispatch::ls_dispatch
 output      = build-out/ls
@@ -60,6 +60,8 @@ sources:
   - src/schema_dump.pdx           # v1.1.0 ENH-006 (#19) --schema catalog emit
   - src/json_line.pdx             # v1.1.0 ENH-007 (#26) --json line renderer
   - src/group_sort.pdx            # 1.1.2 ENH-020 (#38) --group-directories-first partition
+  - src/recurse_filter.pdx        # 1.1.4 ENH-017 (#35) -R recursion-candidacy predicate
+  - src/recurse_header.pdx        # 1.1.4 ENH-017 (#35) -R "<path>/<name>:" header composer
 
 # --- Library dependencies -----------------------------------------------
 # ls consumes four libraries at 1.0.1+ (ls.ENH-013, #22: the phantom
@@ -91,6 +93,8 @@ tests:
   - tests/schema_dump_fixtures.pdx  # 1.1.1 finding 3: 1 catalog byte-diff
   - tests/group_sort_fixtures.pdx   # 1.1.2 ENH-020 (#38) 7 group_sort_partition cases
   - tests/file_fallback_fixtures.pdx # 1.1.3 ENH-015 (#33) 5 rn_compose_file_entry cases
+  - tests/recurse_filter_fixtures.pdx # 1.1.4 ENH-017 (#35) 8 recurse_should_descend cases
+  - tests/recurse_header_fixtures.pdx # 1.1.4 ENH-017 (#35) 5 recurse_header_compose cases
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49/R50 tool observes and every M1
@@ -115,7 +119,7 @@ compliance:
 # 1.0 tag freezes those, and a re-sign at R32 rewrites the mirror
 # copy only (source tree unchanged).
 release:
-  manifest_pdxsig = pkgs.paideia-os/ls/1.1.3/manifest.pdxsig
-  changelog_entry = CHANGELOG.md#113
+  manifest_pdxsig = pkgs.paideia-os/ls/1.1.4/manifest.pdxsig
+  changelog_entry = CHANGELOG.md#114
   pdxdoc          = doc/ls.pdxdoc
-  mirror_target   = pkgs.paideia-os/ls/1.1.3/
+  mirror_target   = pkgs.paideia-os/ls/1.1.4/

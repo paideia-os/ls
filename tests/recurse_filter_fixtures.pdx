@@ -1,0 +1,275 @@
+// tests/recurse_filter_fixtures.pdx -- ls.ENH-017 (paideia-os/ls#35)
+//
+// RecurseFilterFixtures module: byte-exact goldens for
+// RecurseFilter::recurse_should_descend (src/recurse_filter.pdx), the
+// `-R` recursion-candidacy predicate. Follows the M4 fixture
+// convention documented in tests/README.md.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// recurse_should_descend is a leaf with no syscalls, so it is
+// directly fixture-testable (unlike runner_ls, which issues real
+// `syscall` instructions and is exercised only by the qemu smoke
+// path). This module pins the exact policy the eventual real -R
+// descent controller depends on: which entries are legal recursion
+// targets. It does NOT exercise Runner's buffering or header-
+// emission phases (src/runner.pdx) -- those consume this predicate's
+// result but are not unit-testable in isolation for the same reason
+// runner_ls itself is not (real pdxfs_dir_readnext syscalls).
+//
+// Eight cases:
+//
+//   idx  kind_nibble  name        expected  note
+//   -----------------------------------------------------------------
+//    0   4 (dir)      "subdir"    1         ordinary directory name
+//    1   4 (dir)      "."         0         never re-enter self
+//    2   4 (dir)      ".."        0         never re-enter parent
+//    3   4 (dir)      ".git"      1         hidden dir IS a candidate
+//                                           -- Runner's upstream
+//                                           hidden_filter_accept gate
+//                                           is what excludes it
+//                                           unless -a is given, not
+//                                           this predicate
+//    4   8 (file)     "file.txt"  0         not a directory
+//    5   0xA (symlink)"link"      0         never follow a symlink
+//                                           into a directory by
+//                                           default (no -L in this
+//                                           tree)
+//    6   4 (dir)      "..x"       1         starts with ".." but is
+//                                           NOT exactly ".." --
+//                                           pins the byte-2 check
+//                                           does not over-match
+//    7   4 (dir)      (null ptr)  0         defensive null-name reject
+//
+// =============================================================================
+// TABLE LAYOUT
+// =============================================================================
+//
+//   _rff_kinds         [u64; 8]  -- kind_nibble per case
+//   _rff_expected       [u64; 8]  -- expected recurse_should_descend
+//                                    return value per case
+//   _rff_name_offsets  [u64; 8]  -- byte offset into _rff_names_all;
+//                                   case 7's slot is unused (name_ptr
+//                                   is passed as a literal 0 instead
+//                                   of an offset lookup)
+//   _rff_names_all      [u8; 35]  -- packed NUL-terminated input names
+//
+// =============================================================================
+// PUBLIC ENTRY POINTS
+// =============================================================================
+//
+//   recurse_filter_fixtures_case_count() -> u64        -- RFF_CASE_COUNT (8)
+//   recurse_filter_fixtures_run(case_idx) -> u64        -- 0 pass; err+idx on fail
+//   recurse_filter_fixtures_verify_all() -> u64         -- fail-fast walk
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`RecurseFilterFixtures`).
+//   - No `test` mnemonic; every zero-check / bound-check uses
+//     `cmp reg, 0` or `cmp reg, imm`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates:
+//     8 (case cap), 7 (null-name case index). The RFF_ERR_* sentinels
+//     are `mov rax, imm64` stores.
+//   - r10 / r11 are scratch.
+//   - Labels prefixed rff_ / rffva_.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   recurse_should_descend -- RecurseFilter (src/recurse_filter.pdx)
+
+module RecurseFilterFixtures = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let RFF_OK               : u64 = 0
+  pub let RFF_ERR_MISMATCH     : u64 = 0xFFFFEBA0    // + case_idx (0..7)
+  pub let RFF_ERR_BAD_CASE_IDX : u64 = 0xFFFFEBAF
+
+  pub let RFF_CASE_COUNT       : u64 = 8
+
+  // ==========================================================================
+  // Per-case kind_nibble and expected return value.
+  // ==========================================================================
+  pub let _rff_kinds    : [u64; 8] = [ 4, 4, 4, 4, 8, 10, 4, 4 ]
+  pub let _rff_expected : [u64; 8] = [ 1, 0, 0, 1, 0, 0,  1, 0 ]
+
+  // ==========================================================================
+  // Per-case byte offset into _rff_names_all. Case 7's slot (index 7)
+  // is a placeholder, never read -- recurse_filter_fixtures_run
+  // special-cases case_idx == 7 to pass a literal null name_ptr
+  // instead of looking up an offset.
+  //
+  //   case 0 -> 0    ("subdir\0"    7 bytes)
+  //   case 1 -> 7    (".\0"         2 bytes)
+  //   case 2 -> 9    ("..\0"        3 bytes)
+  //   case 3 -> 12   (".git\0"      5 bytes)
+  //   case 4 -> 17   ("file.txt\0"  9 bytes)
+  //   case 5 -> 26   ("link\0"      5 bytes)
+  //   case 6 -> 31   ("..x\0"       4 bytes)
+  //   case 7 -> 0    (unused)
+  // ==========================================================================
+  pub let _rff_name_offsets : [u64; 8] = [ 0, 7, 9, 12, 17, 26, 31, 0 ]
+
+  // ==========================================================================
+  // Packed input names (35 bytes total).
+  // ==========================================================================
+  pub let _rff_names_all : [u8; 35] = [
+      // ---- case 0: "subdir" (7 bytes incl. NUL) ----
+      0x73, 0x75, 0x62, 0x64, 0x69, 0x72, 0x00,
+      // ---- case 1: "." (2 bytes incl. NUL) ----
+      0x2E, 0x00,
+      // ---- case 2: ".." (3 bytes incl. NUL) ----
+      0x2E, 0x2E, 0x00,
+      // ---- case 3: ".git" (5 bytes incl. NUL) ----
+      0x2E, 0x67, 0x69, 0x74, 0x00,
+      // ---- case 4: "file.txt" (9 bytes incl. NUL) ----
+      0x66, 0x69, 0x6C, 0x65, 0x2E, 0x74, 0x78, 0x74, 0x00,
+      // ---- case 5: "link" (5 bytes incl. NUL) ----
+      0x6C, 0x69, 0x6E, 0x6B, 0x00,
+      // ---- case 6: "..x" (4 bytes incl. NUL) ----
+      0x2E, 0x2E, 0x78, 0x00
+  ]
+
+  // ==========================================================================
+  // recurse_filter_fixtures_case_count() -> u64
+  //
+  // Leaf.
+  // ==========================================================================
+  pub let recurse_filter_fixtures_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-017 (#35): return RFF_CASE_COUNT (8) for a harness iterating via recurse_filter_fixtures_run. Leaf pure function. paideia-as conformance: no test mnemonic; no cmp. Labels prefixed rffcc_.",
+      block: {
+        mov rax, 8;                              // RFF_CASE_COUNT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // recurse_filter_fixtures_run(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI: case_idx (0..7)
+  //   RAX: 0 on pass; RFF_ERR_MISMATCH + case_idx on fail;
+  //        RFF_ERR_BAD_CASE_IDX on out-of-range.
+  //
+  // Register plan (three callee-save pushes for parity across the
+  // recurse_should_descend call; odd push count so entry rsp % 16 ==
+  // 8 lands on 0 mod 16 at the call site with no extra pad: 3 * 8 =
+  // 24; 8 + 24 = 32; 32 % 16 == 0):
+  //   rbx = case_idx (survives)
+  //   r12 = kind_nibble (survives; also passed as the call's rdi)
+  //   r13 = expected (survives, compared against the call's return)
+  // ==========================================================================
+  pub let recurse_filter_fixtures_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-017 (#35): run one recurse_should_descend case. Bounds-check case_idx < 8 -> RFF_ERR_BAD_CASE_IDX. Load kind_nibble from _rff_kinds[case_idx] into r12 and expected from _rff_expected[case_idx] into r13. case_idx == 7 is the null-name-ptr case: rsi is set to a literal 0 instead of an offset lookup (the offsets table's slot 7 is a documented placeholder, never read). Every other case computes name_ptr = &_rff_names_all + _rff_name_offsets[case_idx] directly into rsi. Call recurse_should_descend(rdi=r12, rsi=name_ptr); compare rax to r13 -> RFF_ERR_MISMATCH + case_idx on drift. Three callee-save pushes (rbx=case_idx, r12=kind_nibble, r13=expected) = 24 bytes; entry rsp % 16 == 8; 8 + 24 = 32; 32 % 16 == 0 at the recurse_should_descend call site -- odd push count needs no extra alignment pad. paideia-as: no test mnemonic; largest cmp immediate 8 (case cap); RFF_ERR_* sentinels via mov rax, imm64 + add rax, rbx. Labels prefixed rff_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                            // case_idx
+
+        cmp rbx, 8;                               // RFF_CASE_COUNT
+        jae rff_bad_idx;
+
+        lea r11, [rip + _rff_kinds];
+        mov r12, [r11 + rbx * 8];                 // kind_nibble
+
+        lea r11, [rip + _rff_expected];
+        mov r13, [r11 + rbx * 8];                 // expected
+
+        cmp rbx, 7;                                // null-name case
+        je  rff_null_name;
+
+        lea r11, [rip + _rff_name_offsets];
+        mov rax, [r11 + rbx * 8];
+        lea r11, [rip + _rff_names_all];
+        add r11, rax;
+        mov rsi, r11;                              // name_ptr
+        jmp rff_call;
+
+      rff_null_name:
+        xor rsi, rsi;
+
+      rff_call:
+        mov rdi, r12;                              // kind_nibble
+        call recurse_should_descend;
+
+        cmp rax, r13;
+        jne rff_mismatch;
+
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rff_mismatch:
+        mov rax, 0xFFFFEBA0;                      // RFF_ERR_MISMATCH
+        add rax, rbx;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rff_bad_idx:
+        mov rax, 0xFFFFEBAF;                      // RFF_ERR_BAD_CASE_IDX
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // recurse_filter_fixtures_verify_all() -> u64
+  //
+  // Fail-fast walk of all 8 cases. Two callee-save pushes (rbx=idx,
+  // r12=cap) + sub rsp,8 pad = 24; entry rsp % 16 == 8; 8 + 24 = 32;
+  // aligned at recurse_filter_fixtures_run's call site.
+  // ==========================================================================
+  pub let recurse_filter_fixtures_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-017 (#35): fail-fast walk of all 8 recurse_should_descend cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp % 16 == 8; 8 + 24 = 32; aligned at recurse_filter_fixtures_run's call site. Matched add rsp,8 + 2 pops. paideia-as: no test; cmp against 8 fits imm32. Labels prefixed rffva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 8;                               // RFF_CASE_COUNT
+
+      rffva_loop:
+        cmp rbx, r12;
+        jae rffva_ok;
+
+        mov rdi, rbx;
+        call recurse_filter_fixtures_run;
+        cmp rax, 0;
+        jne rffva_out;
+
+        add rbx, 1;
+        jmp rffva_loop;
+
+      rffva_ok:
+        xor rax, rax;
+      rffva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

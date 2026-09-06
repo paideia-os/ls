@@ -1,0 +1,227 @@
+// src/recurse_header.pdx -- ls.ENH-017 (paideia-os/ls#35)
+//
+// RecurseHeader module: composes the GNU-`ls`-shaped recursion-block
+// header line (`\n<path>/<name>:\n`) that Runner's `-R` phase
+// (src/runner.pdx) writes once per recursion candidate.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// One entry point:
+//
+//   recurse_header_compose(path_ptr, name_ptr, name_len, dst_ptr, dst_cap)
+//     -> bytes_written | RH_ERR_OVERFLOW
+//
+// Byte layout written to dst_ptr (matches GNU `ls -R`'s own header
+// shape verbatim, including the literal "./" prefix a bare `ls -R`
+// with no argument emits for its subdirectories):
+//
+//   '\n'  path bytes  '/'  name bytes  ':'  '\n'
+//
+// `path_ptr == 0` selects the single-byte default `.` (the display
+// convention this repo already uses for "no explicit argument" --
+// see src/runner.pdx's file header on the M3 path-argument gate).
+// A non-zero `path_ptr` is a NUL-terminated string of unknown length;
+// it is copied up to RH_PATH_MAX (200) bytes, matching the "clamp,
+// do not scan unbounded" discipline `rn_compose_file_entry` already
+// uses for name fields (src/runner.pdx). `name_len` is caller-
+// supplied (the kernel `PdxFsDirEntry` record's own name_len field)
+// and is independently re-clamped at RH_NAME_MAX (104, mirroring
+// Runner::RN_ENT_NAME_MAX) as a defensive belt-and-braces bound.
+//
+// Two-pass composition (mirrors Render::render_dec_u64's own two-
+// pass discipline): pass 1 computes the total byte count and refuses
+// with dst untouched if it exceeds dst_cap; pass 2 writes every byte.
+// This is the same "no partial write on overflow" contract every
+// renderer in this repo (Render, LongFormat, JsonLine) already keeps.
+//
+// =============================================================================
+// WHAT THIS FUNCTION DOES NOT DO
+// =============================================================================
+//
+// It composes ONE header line for ONE already-identified recursion
+// candidate. It does not open, read, or otherwise touch the named
+// subdirectory -- no kernel primitive exists for a held read-only
+// tool to mint a capability for a named child of an already-held
+// directory cap (`PdxfsShim::pdxfs_open_dir` mints only from a
+// KIND_MEMORY parent carrying RIGHT_MINT, which `ls` never holds;
+// see src/pdxfs_shim.pdx's own module doc). Runner's -R phase calls
+// this once per buffered candidate and writes the header alone; the
+// absence of any listing after it is the honest, visible signal that
+// descent is not wired yet, not a claim that the subdirectory is
+// empty. See src/runner.pdx's -R phase comment and paideia-os/ls#29
+// for the tracked blocker.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`RecurseHeader`), no directory
+//     prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates:
+//     200 (RH_PATH_MAX), 104 (RH_NAME_MAX). RH_ERR_OVERFLOW is a
+//     `mov rax, imm64` emission, never a compare.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` per #1248; byte
+//     writes use `mov_b [dst], reg`.
+//   - r10 / r11 are scratch. No `and reg, imm64`; no `neg` / `cqo` /
+//     `idiv` (this function does no arithmetic division).
+//   - LEAF function, no nested calls: every input (path_ptr, name_ptr,
+//     name_len, dst_ptr, dst_cap) lives in a caller-save register for
+//     the whole body, so no callee-save push/pop or SysV call-site
+//     alignment applies.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called by:
+//   runner_ls -- Runner (src/runner.pdx), -R header-emission phase.
+
+module RecurseHeader = structure {
+
+  // ==========================================================================
+  // Bounds + return codes.
+  // ==========================================================================
+  pub let RH_PATH_MAX     : u64 = 200
+  pub let RH_NAME_MAX     : u64 = 104   // mirrors Runner::RN_ENT_NAME_MAX
+  pub let RH_ERR_OVERFLOW : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
+  // recurse_header_compose(path_ptr, name_ptr, name_len, dst_ptr, dst_cap)
+  //   -> bytes_written | RH_ERR_OVERFLOW
+  //
+  // Signature: (u64, u64, u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI (input): path_ptr  -- NUL-terminated path, or 0 for the "."
+  //                             default (see file header).
+  //   RSI (input): name_ptr  -- entry name bytes (need not be NUL-
+  //                             terminated; name_len is authoritative).
+  //   RDX (input): name_len  -- byte count at name_ptr, clamped
+  //                             internally to RH_NAME_MAX.
+  //   RCX (input): dst_ptr   -- caller-owned destination buffer.
+  //   R8  (input): dst_cap   -- destination buffer capacity in bytes.
+  //   RAX (output): total bytes written, or RH_ERR_OVERFLOW (dst
+  //                 left untouched).
+  //
+  // Register plan (leaf, five caller-save inputs, no push/pop needed):
+  //   rdi = path_ptr        (read-only during pass 1's scan; consumed
+  //                          as a byte-copy source cursor in pass 2 --
+  //                          safe because it is never read again after)
+  //   rsi = name_ptr        (consumed as a byte-copy source cursor in
+  //                          pass 2, same rationale)
+  //   rdx = name_len -> clamped in place -> consumed as a countdown
+  //                     in pass 2's name-copy loop
+  //   rcx = dst_ptr -> becomes the write cursor in pass 2 (advances
+  //                    byte-by-byte; the original value is never
+  //                    needed again once pass 2 starts writing at it)
+  //   r8  = dst_cap (kept for the pass-1/pass-2 boundary bound check)
+  //   r9  = path_len (computed in pass 1, consumed as a countdown in
+  //                   pass 2's path-copy loop)
+  //   r10 = total_len, stashed here across pass 2 so it survives the
+  //         write cursor/countdown churn in rcx/rdx/r9/rax and is
+  //         still available for the final `mov rax, r10` return
+  //   r11 = scratch address (path-scan byte address in pass 1)
+  //   rax = byte-load / byte-store scratch (pass 2); total_len
+  //         accumulator (end of pass 1); return value
+  // ==========================================================================
+  pub let recurse_header_compose : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (path_ptr: u64) (name_ptr: u64) (name_len: u64) (dst_ptr: u64) (dst_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-017 (#35): two-pass composition of the '\\n<path>/<name>:\\n' recursion-block header GNU ls -R prints ahead of each subdirectory's listing. Pass 1: if path_ptr == 0, path_len = 1 (the literal '.' placeholder is written directly in pass 2, no scan needed); else scan path_ptr byte-by-byte up to RH_PATH_MAX (200) looking for a NUL terminator, clamping path_len at the bound if none is found within it (same 'clamp, do not overrun' discipline Runner::rn_compose_file_entry already uses for name fields) -- the #1248-mitigated byte load (xor rax, rax; mov_b rax, [r11]) runs inside this bounded loop. name_len is independently clamped at RH_NAME_MAX (104) via a single compare (mirrors the exact clamp idiom at runner.pdx's rn_ls_copy_head site: 'cmp rcx, r10; jbe ok; mov rcx, r10'). total_len = path_len + name_len_clamped + 4 (the four fixed bytes: leading LF, '/', ':', trailing LF); if total_len > dst_cap, return RH_ERR_OVERFLOW with dst untouched, matching Render::render_dec_u64's overflow contract (no partial write on a buffer a caller might recycle). Pass 2 stashes total_len in r10 (r9/rdx/rcx/rax all get reused for the write) and writes in order: '\\n' (0x0A) at the cursor; then either the literal '.' (0x2E) when path_ptr == 0, or path_len bytes copied from path_ptr (destructive cursor advance on rdi + countdown on r9 -- safe because path_ptr is never read again after this pass and no callee-save register is needed to preserve it); then '/' (0x2F); then name_len_clamped bytes copied from name_ptr the same way (destructive advance on rsi, countdown on rdx); then ':' (0x3A) and a trailing '\\n' (0x0A). Every byte read during the two copy loops uses the #1248 mitigation; every byte write uses mov_b [dst], reg per the Render/LongFormat precedent. This function issues NO calls (no CALL instruction anywhere in the body), so every input register is caller-save for the whole body and no callee-save push/pop or SysV call-site alignment applies -- consistent with rn_compose_file_entry's identical 'leaf, no nested calls, every register caller-save' shape in src/runner.pdx. paideia-as conformance: no test mnemonic; every cmp immediate (0, 200, 104, 4, 0x0A, 0x2E, 0x2F, 0x3A) fits imm32 trivially; RH_ERR_OVERFLOW (0xFFFFFFFFFFFFFFFF) is a mov rax, imm64 emission, never a compare, mirroring Render::RENDER_ERR_OVERFLOW's own precedent; no and with a 64-bit immediate; no neg/cqo/idiv (no arithmetic division anywhere in this function); r10 and r11 are the only long-lived scratch registers beyond the five named inputs, matching the paideia-as-reserved-scratch convention. Labels prefixed rh_.",
+      block: {
+        // ================================================================
+        // Pass 1: compute path_len (r9) and clamp name_len (rdx).
+        // ================================================================
+        cmp rdi, 0;
+        je  rh_path_default;
+
+        xor r11, r11;                          // scan idx (bytes examined)
+
+      rh_path_scan:
+        cmp r11, 200;                          // RH_PATH_MAX
+        jae rh_path_scan_done;
+        mov r10, rdi;
+        add r10, r11;
+        xor rax, rax;
+        mov_b rax, [r10];                      // #1248 mitigation
+        cmp rax, 0;
+        je  rh_path_scan_done;
+        add r11, 1;
+        jmp rh_path_scan;
+
+      rh_path_scan_done:
+        mov r9, r11;                           // path_len (scanned or clamped)
+        jmp rh_name_clamp;
+
+      rh_path_default:
+        mov r9, 1;                             // path_len for the '.' placeholder
+
+      rh_name_clamp:
+        cmp rdx, 104;                          // RH_NAME_MAX
+        jbe rh_total_len;
+        mov rdx, 104;                          // clamp
+
+      rh_total_len:
+        // total_len = path_len + name_len_clamped + 4
+        mov rax, r9;
+        add rax, rdx;
+        add rax, 4;
+        cmp rax, r8;                           // dst_cap
+        ja  rh_overflow;
+
+        mov r10, rax;                          // stash total_len for the return
+
+        // ================================================================
+        // Pass 2: write '\n' path '/' name ':' '\n' at the cursor (rcx).
+        // ================================================================
+        mov_b [rcx], 0x0A;                     // leading '\n'
+        add rcx, 1;
+
+        cmp rdi, 0;
+        je  rh_write_path_dot;
+
+      rh_write_path_copy:
+        cmp r9, 0;
+        je  rh_write_slash;
+        xor rax, rax;
+        mov_b rax, [rdi];                      // #1248 mitigation
+        mov_b [rcx], rax;
+        add rdi, 1;
+        add rcx, 1;
+        sub r9, 1;
+        jmp rh_write_path_copy;
+
+      rh_write_path_dot:
+        mov_b [rcx], 0x2E;                     // '.'
+        add rcx, 1;
+
+      rh_write_slash:
+        mov_b [rcx], 0x2F;                     // '/'
+        add rcx, 1;
+
+      rh_write_name_copy:
+        cmp rdx, 0;
+        je  rh_write_tail;
+        xor rax, rax;
+        mov_b rax, [rsi];                      // #1248 mitigation
+        mov_b [rcx], rax;
+        add rsi, 1;
+        add rcx, 1;
+        sub rdx, 1;
+        jmp rh_write_name_copy;
+
+      rh_write_tail:
+        mov_b [rcx], 0x3A;                     // ':'
+        add rcx, 1;
+        mov_b [rcx], 0x0A;                     // trailing '\n'
+
+        mov rax, r10;                          // return total_len
+        ret;
+
+      rh_overflow:
+        mov rax, 0xFFFFFFFFFFFFFFFF;           // RH_ERR_OVERFLOW
+        ret
+      }
+    }
+}

@@ -17,7 +17,7 @@ by field name rather than by column-slicing text.
 
 !section synopsis
 
-  ls [-l] [-a] [-h] [--json] [--schema] [--color=<v>]
+  ls [-l] [-a] [-h] [-R] [--json] [--schema] [--color=<v>]
      [--group-directories-first] [<path>]
 
 `<path>` defaults to `.` when omitted. Positionals beyond `[0]` are
@@ -47,6 +47,18 @@ real argument-to-cap correspondence is tracked separately]
                   mtime placeholder columns until the kernel readnext
                   record grows the missing fields]
   -a              Include dot-prefix (hidden) entries. [live]
+  -R              Recursive: after the directory listing, print one
+                  "<path>/<name>:" header per subdirectory found
+                  (encounter order). [live at 1.1.4, INTERIM: no
+                  listing follows a header. No capability exists for
+                  a held read-only tool to mint a cap for a named
+                  child of an already-held directory cap, so a header
+                  is printed but that subdirectory is never entered.
+                  The absent listing is the honest signal that
+                  descent is not wired, not a claim the directory is
+                  empty -- see paideia-os/ls#29. `.` and `..` are
+                  never listed as headers; a symlink is never
+                  followed (no `-L`)]
   -h              Render sizes as base-2 K/M/G/T/P/E.
                   [live at 1.1.0 via -l's size column]
   --json          Emit each row as one JSON object on stdout.

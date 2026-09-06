@@ -9,9 +9,74 @@ and stored under `pkgs.paideia-os/ls/<version>/`.
 
 ## [Unreleased]
 
-Post-1.1.3 items on the Enhancement v1.x wave
+Post-1.1.4 items on the Enhancement v1.x wave
 (`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
 exit-code map, wire body shape, `caps.decl`) changes in this section.
+
+## [1.1.4] -- 2026-09-05 -- `-R` recursion-header interim landing (ls.ENH-017) <a id="114"></a>
+
+**1.1.4.** `-R` already parsed (`AS_BIT_R_REC`, commit `9fb4b98`) but
+had no Runner-side behaviour at all -- `ls -R` and bare `ls` produced
+byte-identical output. This release lands a real, observable,
+fixture-tested piece of `-R`'s behaviour: after the primary listing,
+`ls -R` now prints one `"<path>/<name>:"` header per subdirectory it
+found, in encounter order. It does **not** land full recursive
+descent -- no listing follows a header. That gap is architectural,
+not a shortcut: `PdxfsShim::pdxfs_open_dir` mints a directory cap
+only from a `KIND_MEMORY` parent carrying `RIGHT_MINT`, which a
+read-only tool like `ls` never holds, and no kernel
+`pdxfs_dir_open_at`-shaped trampoline (open a named child of an
+already-held directory cap) exists anywhere in paideia-os at HEAD.
+Real descent additionally needs paideia-os/ls#29 (path-argument-to-
+cap resolution) so a recursion step even knows what path string to
+hand the shell for the child. Both gaps are unresolved and out of
+scope for a single-repo `ls` change; issue #35 stays open, tracking
+them, rather than being closed on a partial landing.
+
+### Added
+
+- **`RecurseFilter::recurse_should_descend`** (`src/recurse_filter.pdx`,
+  new module) -- the `-R` recursion-candidacy predicate: a directory-
+  kind entry (kind nibble `0x4`) that is not exactly `.` or `..` is a
+  candidate; everything else (files, symlinks -- `-L` is not
+  implemented anywhere in this tree, so a symlink is never followed
+  into a directory -- and the two dot-entries) is not. Pure leaf, no
+  syscalls, 8 fixture cases.
+- **`RecurseHeader::recurse_header_compose`** (`src/recurse_header.pdx`,
+  new module) -- composes the GNU-`ls`-shaped
+  `'\n<path>/<name>:\n'` header byte-for-byte, defaulting `path` to
+  `.` when no argument path was given (matching bare `ls -R`'s own
+  convention). Two-pass (compute-then-write, no partial output on
+  overflow, matching `Render::render_dec_u64`'s contract), with an
+  independent clamp on both the path scan (`RH_PATH_MAX` 200) and the
+  caller-supplied `name_len` (`RH_NAME_MAX` 104). Pure leaf, no
+  syscalls, 5 byte-exact fixture cases.
+- **`Runner::runner_ls`** two new phases, both gated on
+  `AS_BIT_R_REC`: (1) per-entry, right where every other render
+  decision already happens, a qualifying directory-kind entry is
+  bulk-copied into a new 64-entry buffer (`_rn_r_buf`, identical
+  shape to the existing `--group-directories-first` buffer, and
+  subject to the same loud-refusal-on-overflow policy, unreachable at
+  HEAD for the same "kernel readnext is a fixed small stub" reason);
+  (2) once the primary listing is fully emitted, a second loop walks
+  that buffer and writes each header via `tty_write`. `path_ptr` is
+  stashed in a dedicated `.bss` cell (`_rn_r_path_ptr`) at function
+  entry, before `--group-directories-first`'s own partition phase
+  permanently repurposes the register that used to carry it -- a real
+  bug this landing would otherwise have introduced silently under
+  `ls -R --group-directories-first` together.
+- **`tests/recurse_filter_fixtures.pdx`** (new, 8 cases) and
+  **`tests/recurse_header_fixtures.pdx`** (new, 5 cases) -- see
+  `tests/README.md` for the full case tables.
+
+### Known gaps (tracked, not regressions)
+
+- No listing follows a recursion-block header (paideia-os/ls#29 +
+  the missing kernel `pdxfs_dir_open_at` trampoline; see above).
+- `RN_R_MAX_DEPTH` (16) is a reserved constant for the real descent
+  controller's future call-depth guard; nothing branches on it today
+  because nothing recurses past depth 1 (the immediate children of
+  the single directory cap `ls` holds).
 
 ## [1.1.3] -- 2026-09-05 -- file-as-path single-row fallback (ls.ENH-015) <a id="113"></a>
 

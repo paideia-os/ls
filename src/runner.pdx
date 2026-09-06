@@ -30,6 +30,40 @@
 //   LS_ERR_AUDIT       (0xFFFFEB26)  libpdx-audit audit_begin refused (M3-003)
 //
 // =============================================================================
+// -R RECURSIVE LISTING (ls.ENH-017, #35)
+// =============================================================================
+//
+// When AS_BIT_R_REC is set, runner_ls buffers every recursion-
+// candidate entry it encounters (directory-kind, excluding "." and
+// ".."; RecurseFilter::recurse_should_descend is the exact predicate)
+// during the single pass it already makes over the held directory
+// cap -- the same "forward-only cap, buffer during the one pass"
+// constraint GDF (ls.ENH-020) already works under. Once the primary
+// listing is fully emitted, a second phase (ahead of rn_ls_done's
+// success return) walks that buffer in encounter order and writes
+// one "<path>/<name>:" header line per candidate via RecurseHeader::
+// recurse_header_compose.
+//
+// This is a REAL, observable, testable change to `ls -R`'s output --
+// it is not merely an inert argv-recognised bit -- but it is also
+// NOT full recursive descent. No header is followed by that
+// subdirectory's own listing, because no capability exists for a
+// held read-only tool to mint a cap for a named child of an already-
+// held directory cap: `PdxfsShim::pdxfs_open_dir` mints only from a
+// KIND_MEMORY parent carrying RIGHT_MINT (ls never holds one), and
+// no kernel `pdxfs_dir_open_at`-shaped trampoline (open-by-name
+// against an already-held directory cap) exists at HEAD. Real
+// descent additionally needs paideia-os/ls#29 (path-argument-to-cap
+// resolution) so a recursion step even knows what path string to
+// hand the shell/kernel for the child. Both gaps are tracked, not
+// silently worked around -- the absent listing after each header is
+// the honest signal, matching this repo's "no silent wrong output"
+// discipline (see paideia-os/ls#29's own framing). RN_R_MAX_DEPTH
+// (16) is a reserved constant for the real controller's future call-
+// depth guard; nothing branches on it today because nothing recurses
+// past depth 1 yet.
+//
+// =============================================================================
 // PRE-OPENED DIR CAP CONVENTION
 // =============================================================================
 //
@@ -155,6 +189,8 @@
 //   color_sgr_prefix       -- ColorPicker (src/color_picker.pdx) -- v1.1.0 ENH-005
 //   color_sgr_suffix       -- ColorPicker (src/color_picker.pdx) -- v1.1.0 ENH-005
 //   group_sort_partition   -- GroupSort (src/group_sort.pdx) -- ls.ENH-020 (#38)
+//   recurse_should_descend -- RecurseFilter (src/recurse_filter.pdx) -- ls.ENH-017 (#35)
+//   recurse_header_compose -- RecurseHeader (src/recurse_header.pdx) -- ls.ENH-017 (#35)
 
 module Runner = structure {
 
@@ -198,6 +234,37 @@ module Runner = structure {
   // future real substrate fails loudly rather than silently once a
   // directory outgrows a static buffer).
   pub let RN_GDF_MAX_ENTRIES      : u64 = 64
+  // ls.ENH-017 (#35): --recursive / -R mask (AS_BIT_R_REC, parsed at
+  // src/argv_surface.pdx since commit 9fb4b98). Runner buffers every
+  // recursion-candidate entry (directory-kind, not "." or "..", per
+  // RecurseFilter::recurse_should_descend) alongside the GDF-style
+  // machinery this bit shares its shape with, then walks the buffer
+  // once the primary listing is done and writes one "<path>/<name>:"
+  // header per candidate via RecurseHeader::recurse_header_compose.
+  // See the -R phase comment ahead of runner_ls's rn_ls_done label for
+  // the full scope, and RecurseHeader's own module doc for exactly why
+  // no listing follows each header (paideia-os/ls#29 + the still-
+  // missing pdxfs_dir_open_at kernel primitive).
+  pub let RN_BIT_R_MASK           : u64 = 0x200
+  // Static cap on the -R candidate buffer, mirroring RN_GDF_MAX_
+  // ENTRIES's own rationale verbatim: today's kernel readnext is a
+  // fixed small stub (design/enhancement-plan.md §1.1), so this bound
+  // is unreachable at HEAD; it exists so a future real substrate fails
+  // loudly (LS_ERR_READDIR, the same refusal GDF's overflow uses) at
+  // the same seam rather than silently truncating the header list.
+  pub let RN_R_MAX_ENTRIES        : u64 = 64
+  // Reserved call-depth bound for the eventual REAL multi-level
+  // descent controller (once paideia-os/ls#29 and a kernel
+  // pdxfs_dir_open_at-shaped trampoline exist and Runner can actually
+  // recurse into a named child instead of only detecting it). Not
+  // wired into any branch today -- the current -R phase only ever
+  // reaches depth 1 (the immediate children of the single directory
+  // cap ls holds), because no capability exists to go deeper. Landed
+  // now, alongside AS_BIT_R_REC's own precedent of shipping a named
+  // constant ahead of the logic that will consume it, so the real
+  // controller's depth guard does not have to invent a bound under
+  // review pressure later.
+  pub let RN_R_MAX_DEPTH          : u64 = 16
   // ls.ENH-019 (#37): kind-nibble offset inside the 128-byte kernel
   // PdxFsDirEntry record. See paideia-os
   // src/kernel/core/cap/pdxfs_dir_iter.pdx §1 (inode@0, kind@8,
@@ -294,6 +361,32 @@ module Runner = structure {
   pub let mut _rn_gdf_kinds_buf   : [u64; 64]   = uninit @align(8)
   pub let mut _rn_gdf_order_buf   : [u64; 64]   = uninit @align(8)
 
+  // ls.ENH-017 (#35): -R (recursive) buffering state. Same shape as
+  // the GDF state above, for the same reason: the held dir cap is
+  // forward-only, so every recursion candidate has to be captured
+  // during the single pass over the directory and replayed afterward.
+  //
+  // _rn_r_mode     -- non-zero for the whole call when AS_BIT_R_REC
+  //                   was set (computed once at entry, mirrors
+  //                   _rn_gdf_mode).
+  // _rn_r_path_ptr -- path_ptr stashed at entry, BEFORE the GDF
+  //                   partition phase permanently repurposes r12 as a
+  //                   scratch count (see rn_ls_gdf_partition's own
+  //                   comment) -- r12 is therefore not a reliable
+  //                   carrier of path_ptr by the time the -R header
+  //                   phase runs at rn_ls_done, regardless of whether
+  //                   GDF mode was also requested.
+  // _rn_r_count    -- entries buffered into _rn_r_buf so far.
+  // _rn_r_idx      -- header-emission cursor (rn_ls_done's -R phase).
+  // _rn_r_buf      -- up to RN_R_MAX_ENTRIES (64) 128-byte
+  //                   PdxFsDirEntry records, packed identically to
+  //                   _rn_gdf_buf (64*16 = 1024 u64 lanes).
+  pub let mut _rn_r_mode          : u64 = uninit @align(8)
+  pub let mut _rn_r_path_ptr      : u64 = uninit @align(8)
+  pub let mut _rn_r_count         : u64 = uninit @align(8)
+  pub let mut _rn_r_idx           : u64 = uninit @align(8)
+  pub let mut _rn_r_buf           : [u64; 1024] = uninit @align(8)
+
   // ls.ENH-015 (#33): non-zero once rn_ls_file_fallback has composed
   // and dispatched the single synthetic entry for a non-directory cap.
   // rn_ls_continue checks this BEFORE the GDF check so the loop
@@ -319,7 +412,7 @@ module Runner = structure {
   pub let runner_ls : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
     fn (path_ptr: u64) (flag_bits: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap},
-      justification: "ls.M3-001 (#8) + ls.M3-003 (#10): Runner flips from LS_RUN_STUB to a real iteration body, wrapped in a libpdx-audit DirListRecord frame (D3 audit-first). Uses pdxfs_dir_readnext (sysno 72) against a pre-handed KIND_PDXFS_FILE(read, <arg-path>) at LS_DIR_CAP_SLOT (2, per caps.decl order). Bumps LS_ST_RUNS on entry unconditionally so the counter records every ATTEMPT. Argument gates preserve the M1 shape: null path_ptr resolves through the read loop with the pre-handed cap (informational path; shell narrowed the cap already); non-null path_ptr with byte0 == 0 refuses with LS_ERR_BAD_PATH. M3-003 audit-open: audit_ls_begin(path_ptr, flag_bits) called AFTER the path gate and BEFORE sem_emit_reset -- this is the boundary the D3 invariant pins (no user-visible byte until the audit frame is open). Refusal returns LS_ERR_AUDIT (0xFFFFEB26). Emit prelude: sem_emit_reset + sem_emit_bind_stdout must succeed before the read loop; bind refusal returns LS_ERR_EMIT_BIND. Loop: pdxfs_dir_readnext(LS_DIR_CAP_SLOT, &_rn_entry_buf); rc == 1 -> proceed; rc == 0 -> break; else LS_ERR_READDIR. Per-entry: extract name_len (offset 16) + name_ptr (offset 24) from the 128-byte record; hidden_filter_accept(name_ptr, flag_bits & AS_BIT_A) -- rejects bump LS_ST_HIDDEN and loop; accepts compose name + '\\n' in _rn_line_buf (byte copy loop with #1248 mitigation) and tty_write; tty_write refusal (negative rax) -> LS_ERR_TTY_WRITE; then sem_emit_entry (144-byte record over the bound stdout endpoint, M3-002 shape with owner Cap wire) -> LS_ERR_EMIT_SEND on refusal; bump LS_ST_ENTRIES; continue. Every ret path (except the pre-audit LS_ERR_BAD_PATH -- but that too goes through the same epilogue because audit_ls_commit is a no-op on _au_id == 0) flows through rn_ls_epilogue which saves exit_code in r13 (dead at epilogue -- flag_bits done), calls audit_ls_commit, then restores rax and unwinds. Six callee-save pushes (rbx = LS_DIR_CAP_SLOT copy; r12 = path_ptr; r13 = flag_bits then exit_code carry; r14 = name_len for the current entry; r15 = _rn_line_buf base for the tty_write call; rbp = name_ptr for the tty_write + hidden_filter_accept chain) + sub rsp,8 pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at every nested-call site (ls_note, audit_ls_begin, sem_emit_reset, sem_emit_bind_stdout, pdxfs_dir_readnext, hidden_filter_accept, tty_write, sem_emit_entry, audit_ls_commit). Matched add rsp,8 + 6 pops before every ret via the shared rn_ls_epilogue label. paideia-as conformance: r11 + r10 for LEA + byte-address scratch; no test mnemonic; largest cmp immediate 128 (RN_ENT_SIZE) fits imm32; the 0xFFFFEB2x return sentinels are mov rax, imm64 emissions, not compares. Effects widened to !{mem, sysreg} @{cap} matching the union of the callees (pdxfs_dir_readnext + tty_write + sem_emit_entry + audit_ls_begin + audit_ls_commit all carry {mem, sysreg}; pdxfs_dir_readnext + sem_emit_entry + audit_ls_begin + audit_ls_commit carry @{cap}). Labels prefixed rn_ls_.",
+      justification: "ls.M3-001 (#8) + ls.M3-003 (#10): Runner flips from LS_RUN_STUB to a real iteration body, wrapped in a libpdx-audit DirListRecord frame (D3 audit-first). Uses pdxfs_dir_readnext (sysno 72) against a pre-handed KIND_PDXFS_FILE(read, <arg-path>) at LS_DIR_CAP_SLOT (2, per caps.decl order). Bumps LS_ST_RUNS on entry unconditionally so the counter records every ATTEMPT. Argument gates preserve the M1 shape: null path_ptr resolves through the read loop with the pre-handed cap (informational path; shell narrowed the cap already); non-null path_ptr with byte0 == 0 refuses with LS_ERR_BAD_PATH. M3-003 audit-open: audit_ls_begin(path_ptr, flag_bits) called AFTER the path gate and BEFORE sem_emit_reset -- this is the boundary the D3 invariant pins (no user-visible byte until the audit frame is open). Refusal returns LS_ERR_AUDIT (0xFFFFEB26). Emit prelude: sem_emit_reset + sem_emit_bind_stdout must succeed before the read loop; bind refusal returns LS_ERR_EMIT_BIND. Loop: pdxfs_dir_readnext(LS_DIR_CAP_SLOT, &_rn_entry_buf); rc == 1 -> proceed; rc == 0 -> break; else LS_ERR_READDIR. Per-entry: extract name_len (offset 16) + name_ptr (offset 24) from the 128-byte record; hidden_filter_accept(name_ptr, flag_bits & AS_BIT_A) -- rejects bump LS_ST_HIDDEN and loop; accepts compose name + '\\n' in _rn_line_buf (byte copy loop with #1248 mitigation) and tty_write; tty_write refusal (negative rax) -> LS_ERR_TTY_WRITE; then sem_emit_entry (144-byte record over the bound stdout endpoint, M3-002 shape with owner Cap wire) -> LS_ERR_EMIT_SEND on refusal; bump LS_ST_ENTRIES; continue. Every ret path (except the pre-audit LS_ERR_BAD_PATH -- but that too goes through the same epilogue because audit_ls_commit is a no-op on _au_id == 0) flows through rn_ls_epilogue which saves exit_code in r13 (dead at epilogue -- flag_bits done), calls audit_ls_commit, then restores rax and unwinds. Six callee-save pushes (rbx = LS_DIR_CAP_SLOT copy; r12 = path_ptr; r13 = flag_bits then exit_code carry; r14 = name_len for the current entry; r15 = _rn_line_buf base for the tty_write call; rbp = name_ptr for the tty_write + hidden_filter_accept chain) + sub rsp,8 pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at every nested-call site (ls_note, audit_ls_begin, sem_emit_reset, sem_emit_bind_stdout, pdxfs_dir_readnext, hidden_filter_accept, tty_write, sem_emit_entry, audit_ls_commit). Matched add rsp,8 + 6 pops before every ret via the shared rn_ls_epilogue label. paideia-as conformance: r11 + r10 for LEA + byte-address scratch; no test mnemonic; largest cmp immediate 128 (RN_ENT_SIZE) fits imm32; the 0xFFFFEB2x return sentinels are mov rax, imm64 emissions, not compares. Effects widened to !{mem, sysreg} @{cap} matching the union of the callees (pdxfs_dir_readnext + tty_write + sem_emit_entry + audit_ls_begin + audit_ls_commit all carry {mem, sysreg}; pdxfs_dir_readnext + sem_emit_entry + audit_ls_begin + audit_ls_commit carry @{cap}). ls.ENH-017 (#35): -R adds two seams, both using only caller-save registers (rax, rcx, rdx, rdi, rsi, r8, r9, r10, r11) so none of the six callee-save carriers above are disturbed. (1) At rn_ls_render_dispatch's entry (per-entry, after hidden_filter_accept has already run), gated on _rn_r_mode: RecurseFilter::recurse_should_descend(kind_nibble, name_ptr) decides candidacy; a qualifying entry is bulk-copied (16-lane loop, identical shape to the GDF collect-copy loop) into _rn_r_buf at slot _rn_r_count, which is bumped after. Overflow (more than RN_R_MAX_ENTRIES=64 buffered) refuses via the existing rn_ls_readdir_fail_real target (LS_ERR_READDIR), mirroring GDF's own overflow discipline verbatim -- unreachable at HEAD for the same 'kernel readnext is a fixed small stub' reason GDF's bound is. (2) At rn_ls_done, gated on the same _rn_r_mode flag: a second loop (rn_ls_recurse_emit_loop) walks _rn_r_buf via _rn_r_idx, extracting name_len + name_ptr per buffered record and calling RecurseHeader::recurse_header_compose(path_ptr, name_ptr, name_len, dst_ptr, dst_cap) with path_ptr read from _rn_r_path_ptr (stashed at function entry, BEFORE rn_ls_gdf_partition permanently repurposes r12 -- see that label's own comment -- so r12 is not a reliable path_ptr carrier by rn_ls_done regardless of whether GDF mode also ran) and dst_ptr/dst_cap set to _rn_line_buf/256 (the same scratch buffer the per-entry render dispatch already uses, now free since that loop has drained). The composed header is written via the existing tty_write trampoline; both recurse_header_compose's overflow sentinel and tty_write's negative-errno return collapse through the existing rn_ls_tty_fail path (LS_ERR_TTY_WRITE), matching every other tty_write call site in this function. r14 is reused post-loop as the composed-header byte count (safe: the per-entry dispatch that owns r14 as 'name_len for the current entry' has fully drained by rn_ls_done). Neither recurse_should_descend ({mem} @{}) nor recurse_header_compose ({mem} @{}) widens this function's own {mem, sysreg} @{cap} declaration -- both are subsets. Labels prefixed rn_ls_.",
       block: {
         // ---- 6-push prologue + 8-byte alignment pad ------------------
         push rbx;
@@ -356,6 +449,28 @@ module Runner = structure {
         mov [r11], r10;
         lea r11, [rip + _rn_gdf_idx];
         mov [r11], r10;
+
+        // ---- ls.ENH-017 (#35): -R mode + state init -------------------
+        //
+        // Same "compute once, stash in .bss" rationale as the GDF block
+        // above -- every callee-save register is already committed.
+        // _rn_r_path_ptr MUST be captured here, before rn_ls_gdf_
+        // partition (reached only when GDF mode is also on) permanently
+        // repurposes r12 as a scratch count; r12 is otherwise still
+        // holding the original path_ptr at this exact point (right
+        // after the prologue, before the path-arg gate).
+        mov r10, r13;                            // flag_bits copy
+        mov r11, 0x200;                          // RN_BIT_R_MASK
+        and r10, r11;
+        lea r11, [rip + _rn_r_mode];
+        mov [r11], r10;
+        lea r11, [rip + _rn_r_count];
+        mov r10, 0;
+        mov [r11], r10;
+        lea r11, [rip + _rn_r_idx];
+        mov [r11], r10;
+        lea r11, [rip + _rn_r_path_ptr];
+        mov [r11], r12;                          // stash path_ptr
 
         // ls.ENH-015 (#33): clear the single-file-fallback flag every
         // call -- only rn_ls_file_fallback ever sets it.
@@ -628,6 +743,68 @@ module Runner = structure {
         // name_len and rbp = name_ptr already loaded, exactly as the
         // fall-through from a real directory entry leaves them.
         //
+        // ---- ls.ENH-017 (#35): -R recursion-candidate detection -----
+        //
+        // Runs for every accepted entry (the file-fallback synthetic
+        // row included -- rn_compose_file_entry always hardcodes
+        // RN_ENT_KIND_FILE (8) for its kind, so recurse_should_descend
+        // rejects it on the kind check alone, no special-casing
+        // needed). Gated on _rn_r_mode (computed once at entry); a
+        // qualifying entry (directory-kind, not "." or "..") is copied
+        // whole into _rn_r_buf so its name survives past this
+        // iteration's _rn_entry_buf being overwritten by the next
+        // readnext call. Uses only caller-save registers (rax, rcx,
+        // rdx, r8, r9, r10, r11, rdi, rsi) -- rbx/r12/r13/r14/r15/rbp
+        // all carry values this function's later code still depends
+        // on and must not be touched here.
+        lea r11, [rip + _rn_r_mode];
+        mov r10, [r11];
+        cmp r10, 0;
+        je  rn_ls_no_recurse_check;
+
+        lea r11, [rip + _rn_entry_buf];
+        mov rdi, [r11 + 8];                      // kind qword
+        and rdi, 0xF;                             // low nibble
+        mov rsi, rbp;                             // name_ptr
+        call recurse_should_descend;
+        cmp rax, 0;
+        je  rn_ls_no_recurse_check;
+
+        // Overflow guard -- reject before writing past _rn_r_buf,
+        // mirroring the GDF collect-copy loop's own discipline
+        // exactly (refuse loudly via the existing LS_ERR_READDIR
+        // path rather than silently truncate the header list).
+        lea r11, [rip + _rn_r_count];
+        mov r10, [r11];                           // current count
+        cmp r10, 64;                              // RN_R_MAX_ENTRIES
+        jae rn_ls_readdir_fail_real;
+
+        mov r9, r10;                               // dst_lane_base = count * 16
+        shl r9, 4;
+
+        xor rcx, rcx;                              // lane idx = 0
+
+      rn_ls_recurse_copy_loop:
+        cmp rcx, 16;
+        jae rn_ls_recurse_copy_done;
+
+        lea r11, [rip + _rn_entry_buf];
+        mov rax, [r11 + rcx * 8];
+
+        mov r11, r9;
+        add r11, rcx;                              // absolute dst lane index
+        lea r8, [rip + _rn_r_buf];
+        mov [r8 + r11 * 8], rax;
+
+        add rcx, 1;
+        jmp rn_ls_recurse_copy_loop;
+
+      rn_ls_recurse_copy_done:
+        add r10, 1;
+        lea r11, [rip + _rn_r_count];
+        mov [r11], r10;
+
+      rn_ls_no_recurse_check:
         // ---- v1.1.0: Renderer dispatch ------------------------------
         //
         // Priority: AS_BIT_JSON > AS_BIT_L > default. JSON wins over
@@ -1032,6 +1209,84 @@ module Runner = structure {
         jmp rn_ls_loop;
 
       rn_ls_done:
+        // ---- ls.ENH-017 (#35): -R header-emission phase ---------------
+        //
+        // Runs once, after the primary listing has fully completed
+        // (every entry emitted, in either the streaming or the GDF-
+        // buffered order). Walks _rn_r_buf in encounter order and
+        // writes one "<path>/<name>:" header per buffered candidate.
+        // It does NOT descend into the named subdirectory -- no
+        // capability exists for a held read-only tool to mint a cap
+        // for a named child of an already-held directory cap (see
+        // RecurseHeader's module doc and src/pdxfs_shim.pdx's own
+        // "why a thin local shim" note). The absence of a listing
+        // after each header is the honest signal that descent is not
+        // wired yet (paideia-os/ls#29 + the still-missing kernel
+        // pdxfs_dir_open_at trampoline), not a claim that the
+        // subdirectory is empty.
+        //
+        // r14 is free here (the per-entry dispatch loop that used it
+        // as "name_len for the current entry" has fully drained);
+        // this phase reuses it as the composed-header byte count.
+        lea r11, [rip + _rn_r_mode];
+        mov r10, [r11];
+        cmp r10, 0;
+        je  rn_ls_success;
+
+      rn_ls_recurse_emit_loop:
+        lea r11, [rip + _rn_r_idx];
+        mov r10, [r11];                           // idx
+        lea r11, [rip + _rn_r_count];
+        mov r9, [r11];                             // count
+        cmp r10, r9;
+        jae rn_ls_success;
+
+        mov r9, r10;                                // record_lane_base = idx * 16
+        shl r9, 4;
+
+        // name_len at lane (record_lane_base + 2) -- byte offset 16.
+        lea r11, [rip + _rn_r_buf];
+        mov rcx, r9;
+        add rcx, 2;
+        mov rdx, [r11 + rcx * 8];                   // name_len
+
+        // name_ptr = &_rn_r_buf[record_lane_base*8 + 24].
+        lea r11, [rip + _rn_r_buf];
+        mov rax, r9;
+        shl rax, 3;                                 // lane_base -> byte offset
+        add r11, rax;
+        add r11, 24;                                // RN_ENT_OFF_NAME
+        mov rsi, r11;                                // name_ptr
+
+        lea r11, [rip + _rn_r_path_ptr];
+        mov rdi, [r11];                              // path_ptr (0 => ".")
+
+        lea r11, [rip + _rn_line_buf];
+        mov rcx, r11;                                 // dst_ptr
+        mov r8, 256;                                  // dst_cap
+
+        call recurse_header_compose;
+
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  rn_ls_tty_fail;                           // header too long -- reuse
+
+        mov r14, rax;                                 // bytes composed
+        lea r11, [rip + _rn_line_buf];
+        mov rdi, r11;
+        mov rsi, r14;
+        call tty_write;
+        cmp rax, 0;
+        jl  rn_ls_tty_fail;
+
+        lea r11, [rip + _rn_r_idx];
+        mov r10, [r11];
+        add r10, 1;
+        mov [r11], r10;
+
+        jmp rn_ls_recurse_emit_loop;
+
+      rn_ls_success:
         // ---- Success --------------------------------------------------
         mov rax, 0xFFFFEB00;                     // LS_OK
         jmp rn_ls_epilogue;

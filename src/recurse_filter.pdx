@@ -1,0 +1,138 @@
+// src/recurse_filter.pdx -- ls.ENH-017 (paideia-os/ls#35)
+//
+// RecurseFilter module: the `-R` recursion-candidacy predicate --
+// decides whether one already-rendered directory entry is a valid
+// target for Runner's recursion-header phase (src/runner.pdx).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// One entry point:
+//
+//   recurse_should_descend(kind_nibble, name_ptr) -> 1 | 0
+//
+//     - kind_nibble != RF_KIND_DIR (4)  -> 0  (not a directory; this
+//       also excludes symlinks (kind 0xA) unconditionally, which is
+//       the correct default -- GNU `ls -R` does not follow a symlink
+//       into a directory unless `-L` is also given, and `-L` is not
+//       implemented anywhere in this tree, so "never follow" is the
+//       only honest behaviour today)
+//     - name_ptr == 0                   -> 0  (defensive)
+//     - name is exactly "."             -> 0  (never re-enter self)
+//     - name is exactly ".."            -> 0  (never re-enter parent
+//       -- this is the one guard that actually exists today against
+//       infinite self-recursion; see src/runner.pdx's -R phase
+//       comment for why a real depth counter is not wired yet)
+//     - anything else (including a
+//       dot-prefixed dir name, e.g. ".git") -> 1
+//
+// Dot-prefix hiding under `-a` is NOT this function's job: Runner
+// already gates every entry through `HiddenFilter::hidden_filter_
+// accept` before an entry ever reaches the recursion check, so a
+// hidden directory is only ever offered to `recurse_should_descend`
+// when `-a` was given. This function only encodes the universal
+// "never `.` / `..`" rule, which applies regardless of `-a`.
+//
+// This predicate is the exact, permanent policy the eventual real
+// descent controller needs once paideia-os/ls#29 (path resolve) and
+// a kernel `pdxfs_dir_open_at`-shaped trampoline land -- landing it
+// now, pure and fixture-tested, means the day real descent is wired
+// this file does not change.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`RecurseFilter`), no directory
+//     prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Immediates in this
+//     module: 0 (null / NUL checks), 4 (RF_KIND_DIR), 0x2E ('.', 46
+//     decimal), 1/2 (byte offsets).
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` per #1248.
+//   - r11 is scratch (paideia-as reserved) for the ".."-scan address
+//     computation.
+//   - LEAF function. No callee-save touched, no push/pop parity to
+//     preserve, no nested calls.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called by:
+//   runner_ls -- Runner (src/runner.pdx), -R recursion-candidate
+//                detection, gated on ArgvSurface::AS_BIT_R_REC (0x200).
+
+module RecurseFilter = structure {
+
+  // ==========================================================================
+  // Kind-code constant (mirrors GroupSort::GS_KIND_DIR / Runner's own
+  // RN_ENT_OFF_KIND low-nibble decode; see src/group_sort.pdx and
+  // src/runner.pdx).
+  // ==========================================================================
+  pub let RF_KIND_DIR : u64 = 4
+
+  // ==========================================================================
+  // recurse_should_descend(kind_nibble, name_ptr) -> u64 (1 or 0)
+  //
+  // Signature: (u64, u64) -> u64 !{mem} @{}
+  //   RDI (input): kind_nibble -- low 4 bits of the entry's kind qword
+  //                (caller already masked with `& 0xF`, matching the
+  //                convention every other Runner kind-nibble consumer
+  //                uses -- see GroupSort::group_sort_partition).
+  //   RSI (input): name_ptr    -- NUL-terminated entry name.
+  //   RAX (output): 1 = valid recursion candidate, 0 = skip.
+  //
+  // Register plan (leaf):
+  //   rax = byte-load scratch / return value
+  //   rdi = kind_nibble (untouched)
+  //   rsi = name_ptr (untouched)
+  //   r11 = scratch address for the byte-1 / byte-2 lookahead reads
+  // ==========================================================================
+  pub let recurse_should_descend : (u64, u64) -> u64 !{mem} @{} =
+    fn (kind_nibble: u64) (name_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-017 (#35): the -R recursion-candidacy predicate. Fast-path rejects any non-directory kind_nibble (this includes symlinks, kind 0xA, which is exactly the 'do not follow a symlink into a directory without -L' default GNU ls uses, and -L is not implemented anywhere in this tree) before touching memory. name_ptr == 0 is a defensive reject (a null name from a broken upstream must not fall through to a load). The remaining checks distinguish '.' and '..' -- both illegal recursion targets under every ls dialect, since re-entering either would either do nothing useful ('.') or walk back up forever ('..') -- from every other name, including a dot-prefixed directory name like '.git' (which IS a valid candidate; -a's hidden-filtering already ran upstream in Runner before this predicate is ever consulted, per HiddenFilter::hidden_filter_accept's existing gate, so this function does not re-implement that policy). Byte reads follow the #1248 mitigation (xor rax, rax; mov_b rax, [ptr]) and r11 stages each successive lookahead address (name_ptr+1 for the second byte of '..', name_ptr+2 for the third). paideia-as conformance: no test mnemonic; every cmp immediate (0, 4, 0x2E, 1, 2) fits imm32 trivially; r11 is the only scratch register, per convention. LEAF function: no nested calls, no callee-save touched. Labels prefixed rf_.",
+      block: {
+        cmp rdi, 4;                            // RF_KIND_DIR
+        jne rf_skip;
+
+        cmp rsi, 0;
+        je  rf_skip;
+
+        // byte 0
+        xor rax, rax;
+        mov_b rax, [rsi];
+        cmp rax, 0x2E;                         // '.'
+        jne rf_keep;                           // not dot-prefixed at all
+
+        // byte 1
+        mov r11, rsi;
+        add r11, 1;
+        xor rax, rax;
+        mov_b rax, [r11];
+        cmp rax, 0;
+        je  rf_skip;                           // name == "."
+        cmp rax, 0x2E;                         // '.'
+        jne rf_keep;                           // ".xyz" -- dotfile dir, keep
+
+        // byte 2
+        mov r11, rsi;
+        add r11, 2;
+        xor rax, rax;
+        mov_b rax, [r11];
+        cmp rax, 0;
+        je  rf_skip;                           // name == ".."
+        jmp rf_keep;                           // "..xyz" -- keep
+
+      rf_keep:
+        mov rax, 1;
+        ret;
+
+      rf_skip:
+        xor rax, rax;
+        ret
+      }
+    }
+}
