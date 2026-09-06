@@ -20,7 +20,7 @@
 # a new PAIDEIA_AS_VER KV record.
 
 name        = ls
-version     = 1.1.7
+version     = 1.1.8
 kind        = tool
 entry       = Dispatch::ls_dispatch
 output      = build-out/ls
@@ -63,10 +63,16 @@ sources:
   - src/json_line.pdx             # v1.1.0 ENH-007 (#26) --json line renderer
   - src/group_sort.pdx            # 1.1.2 ENH-020 (#38) --group-directories-first partition
   - src/recurse_filter.pdx        # 1.1.4 ENH-017 (#35) -R recursion-candidacy predicate
-  - src/recurse_header.pdx        # 1.1.4 ENH-017 (#35) -R "<path>/<name>:" header composer
+  - src/recurse_header.pdx        # 1.1.4 ENH-017 (#35) -R "<path>/<name>:" header composer;
+                                  # 1.1.8 ENH-014 (#32) adds the sibling
+                                  # multipath_header_compose "<path>:" composer
   - src/sort_options.pdx          # 1.1.5 ENH-016 (#34) -t/-S/-r sort comparators
   - src/columns.pdx               # 1.1.6 ENH-018 (#36) multi-column fitted layout
   - src/long_total.pdx            # 1.1.7 ENH-021 (#39) -l total line + PdxLsSummaryRecord@0.1
+  #   ls.ENH-014 (#32) lands: multi-path listing (`ls a b c`). No new
+  #   source file for Dispatch/Runner -- Dispatch (src/dispatch.pdx)
+  #   grows a per-positional loop and Runner (src/runner.pdx) grows the
+  #   RN_BIT_HEADER_MASK / RN_BIT_HEADER_BLANK_MASK gate.
 
 # --- Library dependencies -----------------------------------------------
 # ls consumes four libraries at 1.0.1+ (ls.ENH-013, #22: the phantom
@@ -103,6 +109,7 @@ tests:
   - tests/sort_options_fixtures.pdx   # 1.1.5 ENH-016 (#34) 10 sort_options_by_{name,mtime,size} cases
   - tests/multicol_fixtures.pdx       # 1.1.6 ENH-018 (#36) 5 columns_layout cases
   - tests/long_total_fixtures.pdx     # 1.1.7 ENH-021 (#39) 7 long_total_compute / long_total_summary_record_compose cases
+  - tests/multipath_fixtures.pdx      # 1.1.8 ENH-014 (#32) 5 multipath_header_compose cases
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49/R50 tool observes and every M1

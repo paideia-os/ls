@@ -175,6 +175,15 @@ module ArgvSurface = structure {
   // AS_BIT_COLOR_NEVER slot takes bit 0x8000.
   pub let AS_BIT_COLOR_AUTO : u64 = 0x4000
 
+  // RESERVED: 0x8000 and 0x10000 are NOT argv-recognised flag bits.
+  // Dispatch (src/dispatch.pdx) ORs them into the flag_bits value it
+  // hands Runner -- never into _as_flag_bits itself -- as the private
+  // ls.ENH-014 (#32) "<path>:" header signal (RN_BIT_HEADER_MASK /
+  // RN_BIT_HEADER_BLANK_MASK, defined in src/runner.pdx). A future
+  // AS_BIT_* addition MUST NOT claim either value, or a multi-path
+  // listing would start misfiring header lines whenever that new flag
+  // is passed.
+
   // ==========================================================================
   // Parse-result .bss slots -- populated by argv_surface_parse, read
   // by Runner::runner_ls + Dispatch::ls_dispatch. All three are 8-byte
@@ -202,10 +211,19 @@ module ArgvSurface = structure {
   pub let mut _as_color_value_ptr : u64 = uninit @align(8)
   // ls.ENH-014 (#32): multi-path listing. _as_pos_count captures
   // libpdx-argv's pos_count so Dispatch can iterate every positional
-  // rather than silently ignoring [1..]. Dispatch-side iteration is
-  // deferred (needs a per-positional cap slot from shell InitCap;
-  // today only LS_DIR_CAP_SLOT is populated). This .bss slot is the
-  // hook the multi-path loop will read.
+  // rather than silently ignoring [1..]. Dispatch's per-positional
+  // loop (src/dispatch.pdx) reads this slot directly, alongside the
+  // linked `pos_ptrs` array itself (also read directly by Dispatch --
+  // no new .bss mirror needed for the pointer table, only the count).
+  // The loop is real, but its OUTPUT is still degraded: the shell's
+  // InitCap handoff populates a single LS_DIR_CAP_SLOT regardless of
+  // how many positionals were given (paideia-os/ls#29 tracks the
+  // per-positional cap-slot handoff), so every iteration reads through
+  // the SAME held directory cap -- each path gets its own correct
+  // `<path>:` header (Runner::RN_BIT_HEADER_MASK), but the body under
+  // it is today's single directory's listing repeated, not a distinct
+  // per-path read. This is the honest interim shape the issue itself
+  // authorizes (see its Deps note), not a silently wrong output.
   pub let mut _as_pos_count       : u64 = uninit @align(8)
 
   // ==========================================================================

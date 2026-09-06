@@ -1,0 +1,439 @@
+// tests/multipath_fixtures.pdx -- ls.ENH-014 (paideia-os/ls#32)
+//
+// MultipathHeaderFixtures module: byte-exact goldens for
+// RecurseHeader::multipath_header_compose (src/recurse_header.pdx),
+// the `ls a b c` multi-path listing header composer ("<path>:\n",
+// optionally preceded by a blank line). Follows the M4 fixture
+// convention documented in tests/README.md.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// multipath_header_compose is a leaf with no syscalls, so it is
+// directly fixture-testable -- unlike Dispatch::ls_dispatch's own
+// per-positional loop (src/dispatch.pdx), which drives runner_ls
+// (real `syscall` instructions) once per path and is exercised only
+// by the qemu smoke path, the same boundary
+// tests/file_fallback_fixtures.pdx's own SCOPE section draws for
+// Runner::rn_compose_file_entry. This module pins the exact byte
+// layout Dispatch's loop depends on for the header Runner emits at
+// rn_ls_pre_emit (RN_BIT_HEADER_MASK / RN_BIT_HEADER_BLANK_MASK), by
+// exercising the composer directly with the `path_ptr` / `leading_
+// blank` combinations Dispatch's loop actually produces for a 0/1/2/3-
+// positional invocation:
+//
+//   idx  models                        path_ptr     blank  dst_cap  expect
+//   -----------------------------------------------------------------------
+//    0   (defensive; not reachable      (null->".")  0      256     ".:\n"
+//        via Dispatch today -- header                                (3 B)
+//        is gated on pos_count > 1, and
+//        Dispatch never passes a null
+//        path_ptr on that path)
+//    1   `ls dir1 dir2` -- first of     "dir1"       0      256     "dir1:\n"
+//        two positionals (i == 0, no                                 (6 B)
+//        leading blank)
+//    2   `ls dir1 file.txt` -- second   "file.txt"   1      256     "\nfile.txt:\n"
+//        of two, a REGULAR FILE                                      (11 B)
+//        (mixed file+dir multi-path;
+//        i > 0, leading blank)
+//    3   `ls a b c` -- third of three   "c"          1      2       RH_ERR_OVERFLOW
+//        (i > 0, leading blank), dst_                                (needs 4,
+//        cap deliberately undersized                                 has 2)
+//    4   (shared-bound regression)      205*'q',     0      210     201 B path
+//        no NUL anywhere in the 205                                  clamped to
+//        bytes -- pins that the path-                                RH_PATH_MAX
+//        scan bound this composer                                    (200) + ":\n"
+//        shares with recurse_header_                                 = 202 B
+//        compose (RH_PATH_MAX = 200)
+//        fires here too
+//
+// Cases 1-3 model the real Dispatch call sequence for `ls a b c`-
+// shaped invocations end to end: case 1 is what path[0] of a 2-path
+// listing gets, case 2 is what path[1] gets (deliberately a file name,
+// pinning that the header composer -- like Dispatch's loop itself --
+// does not care whether a positional resolves to a file or a
+// directory; that distinction is Runner's rn_ls_file_fallback
+// concern, already covered by tests/file_fallback_fixtures.pdx, and
+// is orthogonal to header emission since the header is written before
+// the per-entry loop ever inspects an entry's kind), and case 3 pins
+// the overflow refusal a caller-supplied dst_cap can trigger for any
+// positional after the first. Case 0 exercises the defensive null-
+// path branch the composer shares with recurse_header_compose even
+// though Dispatch's current wiring never reaches it (see the module
+// doc in src/recurse_header.pdx). Dispatch's own loop-bound /
+// header-bit-decision logic (0 vs 1 vs 2+ positionals, the
+// MULTIPATH_MAX_PATHS=16 cap, the per-call ExitMap fold) is NOT
+// separately unit-tested here -- it has no leaf entry point of its
+// own (it is inlined into ls_dispatch's block) and is exercised by
+// the qemu smoke matrix's multi-argv invocations instead, matching
+// this repo's "no syscalls -> fixture; syscalls -> smoke" split.
+//
+// =============================================================================
+// TABLE LAYOUT
+// =============================================================================
+//
+//   _mpf_path_is_null    [u64; 5]  -- 1 => pass path_ptr = 0 literally
+//   _mpf_path_offsets    [u64; 5]  -- byte offset into _mpf_paths_all
+//                                     (ignored when is_null == 1)
+//   _mpf_leading_blank   [u64; 5]  -- leading_blank argument per case
+//   _mpf_dst_caps        [u64; 5]  -- dst_cap argument per case
+//   _mpf_expected_lens   [u64; 5]  -- expected return; RH_ERR_OVERFLOW
+//                                     (0xFFFF...F) => byte-diff skipped
+//   _mpf_golden_offsets  [u64; 5]  -- byte offset into _mpf_golden_all
+//                                     (ignored for the overflow case)
+//   _mpf_paths_all       [u8; 221] -- packed path inputs
+//   _mpf_golden_all      [u8; 222] -- packed expected outputs
+//   _mpf_scratch         [u64; 32] -- 256-byte compose dst (@align(8))
+//
+// =============================================================================
+// PUBLIC ENTRY POINTS
+// =============================================================================
+//
+//   multipath_header_fixtures_case_count() -> u64   -- MPF_CASE_COUNT (5)
+//   multipath_header_fixtures_run(case_idx) -> u64  -- 0 pass; err+idx on fail
+//   multipath_header_fixtures_verify_all() -> u64   -- fail-fast walk
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`MultipathHeaderFixtures`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates:
+//     5 (case cap), 221/222 (table sizes). The 0xFFFFFFFFFFFFFFFF
+//     overflow marker and the MPF_ERR_* sentinels are `mov rax, imm64`
+//     stores, never compares.
+//   - Byte reads (diff loop) use `xor rax, rax; mov_b rax, [ptr]` per
+//     #1248, staged through r11 so addressing stays [reg]-only.
+//   - r10 / r11 are scratch.
+//   - Labels prefixed mpf_.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   multipath_header_compose -- RecurseHeader (src/recurse_header.pdx)
+
+module MultipathHeaderFixtures = structure {
+
+  // ==========================================================================
+  // Return codes. Band picked to avoid every sentinel already claimed
+  // by another tests/*_fixtures.pdx module (checked against the whole
+  // 0xFFFFEBxx range in use across this repo at landing time).
+  // ==========================================================================
+  pub let MPF_OK                : u64 = 0
+  pub let MPF_ERR_LEN_MISMATCH  : u64 = 0xFFFFEB42    // + case_idx (0..4)
+  pub let MPF_ERR_BYTE_MISMATCH : u64 = 0xFFFFEB48    // + case_idx (0..4)
+  pub let MPF_ERR_BAD_CASE_IDX  : u64 = 0xFFFFEB4E
+
+  pub let MPF_CASE_COUNT        : u64 = 5
+
+  // ==========================================================================
+  // Per-case scalar inputs / expectations.
+  // ==========================================================================
+  pub let _mpf_path_is_null   : [u64; 5] = [ 1, 0, 0, 0,   0 ]
+  pub let _mpf_path_offsets   : [u64; 5] = [ 0, 0, 5, 14,  16 ]
+  pub let _mpf_leading_blank  : [u64; 5] = [ 0, 0, 1, 1,   0 ]
+  pub let _mpf_dst_caps       : [u64; 5] = [ 256, 256, 256, 2, 210 ]
+  // Case 3 expects RH_ERR_OVERFLOW (0xFFFFFFFFFFFFFFFF); every other
+  // case expects its composed byte count.
+  pub let _mpf_expected_lens  : [u64; 5] = [ 3, 6, 11, 0xFFFFFFFFFFFFFFFF, 202 ]
+  pub let _mpf_golden_offsets : [u64; 5] = [ 0, 3, 9, 20, 20 ]
+
+  // ==========================================================================
+  // Packed path inputs (221 bytes). Cases 1-3 each carry an explicit
+  // NUL terminator so the composer's path-scan stops at the right
+  // byte; case 4's 205 bytes of 'q' carry NO NUL anywhere in the
+  // range multipath_header_compose can reach (its scan is bounded at
+  // RH_PATH_MAX = 200, strictly less than 205) -- the same "clamp
+  // because the bound fired first" path recurse_header_fixtures'
+  // own case 4 already pins for the sibling composer.
+  // ==========================================================================
+  pub let _mpf_paths_all : [u8; 221] = [
+      // case 1: "dir1\0" (5 bytes)
+      0x64, 0x69, 0x72, 0x31, 0x00,
+      // case 2: "file.txt\0" (9 bytes)
+      0x66, 0x69, 0x6C, 0x65, 0x2E, 0x74, 0x78, 0x74, 0x00,
+      // case 3: "c\0" (2 bytes)
+      0x63, 0x00,
+      // case 4: 205 * 'q', no NUL (the RH_PATH_MAX clamp path)
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71
+  ]
+
+  // ==========================================================================
+  // Packed expected outputs (222 bytes: 3 + 6 + 11 + 202; case 3's
+  // overflow expectation contributes no bytes, so its golden_offset
+  // slot (20) is a placeholder shared with case 4's own start).
+  // ==========================================================================
+  pub let _mpf_golden_all : [u8; 222] = [
+      // case 0: ".:\n" (3 bytes)
+      0x2E, 0x3A, 0x0A,
+      // case 1: "dir1:\n" (6 bytes)
+      0x64, 0x69, 0x72, 0x31, 0x3A, 0x0A,
+      // case 2: "\nfile.txt:\n" (11 bytes)
+      0x0A, 0x66, 0x69, 0x6C, 0x65, 0x2E, 0x74, 0x78, 0x74, 0x3A, 0x0A,
+      // case 4: 200 * 'q' + ":\n" (202 bytes)
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71, 0x71,
+      0x3A, 0x0A
+  ]
+
+  // ==========================================================================
+  // .bss destination buffer for multipath_header_compose -- 256 bytes,
+  // same shape/alignment as Runner::_rn_line_buf (the real call site).
+  // ==========================================================================
+  pub let mut _mpf_scratch : [u64; 32] = uninit @align(8)
+
+  // ==========================================================================
+  // multipath_header_fixtures_case_count() -> u64
+  //
+  // Leaf.
+  // ==========================================================================
+  pub let multipath_header_fixtures_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-014 (#32): return MPF_CASE_COUNT (5) for a harness iterating via multipath_header_fixtures_run. Leaf pure function. paideia-as conformance: no test mnemonic; no cmp. Labels prefixed mpfcc_.",
+      block: {
+        mov rax, 5;                              // MPF_CASE_COUNT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // multipath_header_fixtures_run(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI: case_idx (0..4)
+  //   RAX: 0 on pass; MPF_ERR_LEN_MISMATCH + case_idx or
+  //        MPF_ERR_BYTE_MISMATCH + case_idx on fail;
+  //        MPF_ERR_BAD_CASE_IDX on out-of-range.
+  //
+  // Register plan (five callee-save pushes for pipeline stability
+  // across the multipath_header_compose call, mirrors
+  // RecurseHeaderFixtures::recurse_header_fixtures_run):
+  //   rbx = case_idx (survives)
+  //   r12 = expected_len (survives; doubles as the overflow marker)
+  //   r13 = golden_ptr (survives; unused when r12 is the overflow marker)
+  //   r14 = dst_ptr = &_mpf_scratch (survives; also passed as rdx)
+  //   r15 = diff-loop index (reused after the one call)
+  //
+  // Alignment: 5 pushes = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48;
+  // 48 % 16 == 0 at the multipath_header_compose call site.
+  // ==========================================================================
+  pub let multipath_header_fixtures_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-014 (#32): run one multipath_header_compose case. Bounds-check case_idx < 5 -> MPF_ERR_BAD_CASE_IDX. Load expected_len from _mpf_expected_lens[case_idx] into r12 (either a real byte count or the RH_ERR_OVERFLOW sentinel 0xFFFFFFFFFFFFFFFF). Compute golden_ptr = &_mpf_golden_all + _mpf_golden_offsets[case_idx] into r13 (ignored on the overflow path). dst_ptr = &_mpf_scratch into r14. Marshal the four call args: rdi = 0 when _mpf_path_is_null[case_idx] != 0, else &_mpf_paths_all + _mpf_path_offsets[case_idx]; rsi = _mpf_leading_blank[case_idx]; rdx = r14 (dst_ptr); rcx = _mpf_dst_caps[case_idx]. Call multipath_header_compose. Compare rax to r12 -> MPF_ERR_LEN_MISMATCH + case_idx on drift (this single compare also validates the overflow-expected case, since RH_ERR_OVERFLOW is exactly what a correctly-refusing call returns). If r12 IS the overflow sentinel, the length check alone already proves correctness -- dst was never touched on that path (multipath_header_compose's own two-pass contract), so the byte-diff is skipped. Otherwise byte-diff r12 bytes of _mpf_scratch against the golden (actual-then-expected-then-compare idiom, #1248-mitigated loads staged through r11) -> MPF_ERR_BYTE_MISMATCH + case_idx on first drift. Five callee-save pushes (rbx=case_idx, r12=expected_len, r13=golden_ptr, r14=dst_ptr, r15=diff index) = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48; aligned at the multipath_header_compose call site. paideia-as: no test mnemonic; largest cmp immediate 5 (case cap); sentinels via mov rax, imm64 + add rax, rbx. Labels prefixed mpf_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                            // case_idx
+
+        cmp rbx, 5;                               // MPF_CASE_COUNT
+        jae mpf_bad_idx;
+
+        lea r11, [rip + _mpf_expected_lens];
+        mov r12, [r11 + rbx * 8];                 // expected_len
+
+        lea r11, [rip + _mpf_golden_offsets];
+        mov rax, [r11 + rbx * 8];
+        lea r11, [rip + _mpf_golden_all];
+        add r11, rax;
+        mov r13, r11;                              // golden_ptr
+
+        lea r14, [rip + _mpf_scratch];             // dst_ptr
+
+        // ---- path_ptr (rdi) ----
+        lea r11, [rip + _mpf_path_is_null];
+        mov rax, [r11 + rbx * 8];
+        cmp rax, 0;
+        jne mpf_path_from_table;
+        xor rdi, rdi;                              // literal 0
+        jmp mpf_path_done;
+
+      mpf_path_from_table:
+        lea r11, [rip + _mpf_path_offsets];
+        mov rax, [r11 + rbx * 8];
+        lea r11, [rip + _mpf_paths_all];
+        add r11, rax;
+        mov rdi, r11;
+
+      mpf_path_done:
+        // ---- leading_blank (rsi) ----
+        lea r11, [rip + _mpf_leading_blank];
+        mov rsi, [r11 + rbx * 8];
+
+        // ---- dst_ptr (rdx) / dst_cap (rcx) ----
+        mov rdx, r14;
+        lea r11, [rip + _mpf_dst_caps];
+        mov rcx, [r11 + rbx * 8];
+
+        call multipath_header_compose;
+
+        cmp rax, r12;
+        jne mpf_len_fail;
+
+        // Overflow-expected case: length check already proved it.
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp r12, r11;
+        je  mpf_ok;
+
+        // Byte-diff loop over r12 bytes.
+        xor r15, r15;
+
+      mpf_diff_loop:
+        cmp r15, r12;
+        jae mpf_ok;
+
+        mov r11, r14;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];                          // actual byte
+        mov r10, rax;
+
+        mov r11, r13;
+        add r11, r15;
+        xor rax, rax;
+        mov_b rax, [r11];                          // expected byte
+
+        cmp rax, r10;
+        jne mpf_byte_fail;
+
+        add r15, 1;
+        jmp mpf_diff_loop;
+
+      mpf_ok:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mpf_len_fail:
+        mov rax, 0xFFFFEB42;                      // MPF_ERR_LEN_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mpf_byte_fail:
+        mov rax, 0xFFFFEB48;                      // MPF_ERR_BYTE_MISMATCH
+        add rax, rbx;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mpf_bad_idx:
+        mov rax, 0xFFFFEB4E;                      // MPF_ERR_BAD_CASE_IDX
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // multipath_header_fixtures_verify_all() -> u64
+  //
+  // Fail-fast walk of all 5 cases. Two callee-save pushes (rbx=idx,
+  // r12=cap) + sub rsp,8 pad = 24; entry rsp % 16 == 8; 8 + 24 = 32;
+  // aligned at multipath_header_fixtures_run's call site.
+  // ==========================================================================
+  pub let multipath_header_fixtures_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-014 (#32): fail-fast walk of all 5 multipath_header_compose cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp % 16 == 8; 8 + 24 = 32; aligned at multipath_header_fixtures_run's call site. Matched add rsp,8 + 2 pops. paideia-as: no test; cmp against 5 fits imm32. Labels prefixed mpfva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 5;                               // MPF_CASE_COUNT
+
+      mpfva_loop:
+        cmp rbx, r12;
+        jae mpfva_ok;
+
+        mov rdi, rbx;
+        call multipath_header_fixtures_run;
+        cmp rax, 0;
+        jne mpfva_out;
+
+        add rbx, 1;
+        jmp mpfva_loop;
+
+      mpfva_ok:
+        xor rax, rax;
+      mpfva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

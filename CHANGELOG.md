@@ -9,9 +9,69 @@ and stored under `pkgs.paideia-os/ls/<version>/`.
 
 ## [Unreleased]
 
-Post-1.1.7 items on the Enhancement v1.x wave
+Post-1.1.8 items on the Enhancement v1.x wave
 (`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
 exit-code map, wire body shape, `caps.decl`) changes in this section.
+
+## [1.1.8] -- 2026-09-06 -- multi-path listing, `ls a b c` (ls.ENH-014) <a id="118"></a>
+
+**1.1.8.** `ls a b c` now iterates every positional path argument
+instead of silently ignoring everything past the first. Each path
+after the first is preceded by a blank line and a `<path>:` header
+(GNU `ls` convention); a single explicit path, or none at all, stays
+byte-identical to pre-1.1.8 output.
+
+### Added
+
+- **`RecurseHeader::multipath_header_compose`**
+  (`src/recurse_header.pdx`) -- composes the `[\n]<path>:\n` header,
+  reusing that module's "scan-or-default path, clamp at `RH_PATH_MAX`,
+  two-pass compose, no partial write on overflow" discipline rather
+  than duplicating it. Byte-exact goldens plus the overflow path live
+  in `tests/multipath_fixtures.pdx` (5 cases).
+- **`Runner::runner_ls`** -- at `rn_ls_pre_emit`, right after the bind
+  check and before the (unrelated) `-l` total-line gate, composes and
+  writes the header via the existing `tty_write` trampoline when the
+  new `RN_BIT_HEADER_MASK` (0x8000) is set, with `RN_BIT_HEADER_BLANK_
+  MASK` (0x10000) additionally requesting the leading blank line. Both
+  bits are Dispatch-private -- never argv-recognised (see
+  `ArgvSurface`'s own "RESERVED: 0x8000 and 0x10000" note in
+  `src/argv_surface.pdx`).
+- **`Dispatch::ls_dispatch`** (`src/dispatch.pdx`) -- replaces the
+  single `runner_ls` call with a per-positional loop (capped at the
+  new `MULTIPATH_MAX_PATHS` = 16) once `_as_pos_count > 1`; a
+  `pos_count <= 1` invocation keeps the pre-1.1.8 single-call shape
+  exactly. Every `runner_ls` return is folded through `ExitMap::
+  exit_map` immediately inside the loop, and Dispatch returns the
+  worst (numerically largest: 4 cap-denied > 3 system > 2 usage > 0
+  ok) of those folded codes.
+- **`tests/multipath_fixtures.pdx`** (new, 5 cases) -- byte-exact
+  goldens for `multipath_header_compose` modeling the real Dispatch
+  call sequence for a 2-3 path invocation (including a mixed file+dir
+  pair), plus the shared `RH_PATH_MAX` clamp and an overflow case.
+
+### Interaction notes
+
+- **`-R`**: each per-path `runner_ls` call is a fully independent
+  invocation with its own `-R` state, so `ls -R a b` performs a
+  complete `-R` pass under each of `a` and `b` in turn.
+- **Sort / `--group-directories-first` / multi-column**: also
+  per-call and independent -- nothing merges entries across paths.
+
+### Known gaps (tracked, not regressions)
+
+- The shell's `InitCap` handoff still narrows only one directory cap
+  (`LS_DIR_CAP_SLOT`) per invocation regardless of how many
+  positionals were given (paideia-os/ls#29). Every per-path
+  `runner_ls` call therefore reads through that SAME held cap -- each
+  path gets its own correct header, but the listing body under it is
+  today's single directory's content repeated, not a distinct
+  per-path read. This is the exact interim shape the issue itself
+  authorizes, not a silent regression.
+- Positionals past `MULTIPATH_MAX_PATHS` (16) are silently not
+  iterated -- no error surfaces, matching this repo's existing
+  "unreachable at HEAD" static-bound style (`RN_GDF_MAX_ENTRIES`,
+  `RN_R_MAX_ENTRIES`).
 
 ## [1.1.7] -- 2026-09-06 -- `-l` total line + `PdxLsSummaryRecord@0.1` (ls.ENH-021) <a id="117"></a>
 

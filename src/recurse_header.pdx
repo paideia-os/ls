@@ -73,11 +73,80 @@
 //     alignment applies.
 //
 // =============================================================================
+// ls.ENH-014 (#32): multipath_header_compose -- MULTI-PATH LISTING HEADER
+// =============================================================================
+//
+// `ls a b c` prints a `\n<path>:\n` block header ahead of each path's
+// own listing once more than one positional argument is given (GNU
+// `ls` precedent). This is a DIFFERENT byte shape than the `-R`
+// header above -- no `/`, no child `<name>` -- so it is not a call
+// site of `recurse_header_compose` itself; it lands here anyway
+// (rather than in a new file) because it shares the exact "scan-or-
+// default path, clamp at a bound, two-pass compose, no partial write
+// on overflow" discipline that function already pins, and the issue
+// that requested this landing (paideia-os/ls#32) explicitly points at
+// this module as the place to reuse.
+//
+// One entry point:
+//
+//   multipath_header_compose(path_ptr, leading_blank, dst_ptr, dst_cap)
+//     -> bytes_written | RH_ERR_OVERFLOW
+//
+// Byte layout written to dst_ptr:
+//
+//   ['\n']  path bytes  ':'  '\n'
+//
+// The leading '\n' is written only when `leading_blank != 0` --
+// Dispatch (src/dispatch.pdx) passes 0 for the first positional in a
+// multi-path listing and 1 for every one after, matching GNU `ls`'s
+// own "blank line between blocks, none before the first" convention.
+// `path_ptr == 0` selects the single-byte default `.`, mirroring
+// `recurse_header_compose`'s own convention above -- defensive only:
+// Dispatch's current wiring never calls this composer with a null
+// path_ptr (the header is gated on `pos_count > 1`, and every
+// positional in that case is a real, non-null argv string; the
+// `pos_count == 0` default-"." single-path case never sets the header
+// bit at all -- see src/dispatch.pdx's per-positional loop). Kept and
+// fixture-tested anyway so the composer's contract does not silently
+// depend on its one caller's current shape.
+//
+// A non-zero path_ptr is a NUL-terminated string of unknown length,
+// copied up to RH_PATH_MAX (200) bytes -- the same shared bound
+// `recurse_header_compose` uses above, for the same "clamp, do not
+// scan unbounded" reason.
+//
+// Two-pass composition, identical discipline to
+// `recurse_header_compose`: pass 1 computes the total byte count and
+// refuses with dst untouched if it exceeds dst_cap; pass 2 writes
+// every byte.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediate:
+//     200 (RH_PATH_MAX, shared with recurse_header_compose). The
+//     overflow sentinel (0xFFFFFFFFFFFFFFFF, the same value as
+//     RH_ERR_OVERFLOW) is a `mov rax, imm64` emission, never a
+//     compare.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` per #1248; byte
+//     writes use `mov_b [dst], reg`.
+//   - r9 / r10 / r11 are scratch. No `and reg, imm64`; no `neg` /
+//     `cqo` / `idiv`.
+//   - LEAF function, no nested calls: every input (path_ptr,
+//     leading_blank, dst_ptr, dst_cap) lives in a caller-save register
+//     for the whole body, so no callee-save push/pop or SysV call-site
+//     alignment applies.
+//
+// =============================================================================
 // CROSS-MODULE SYMBOLS
 // =============================================================================
 //
 // Called by:
 //   runner_ls -- Runner (src/runner.pdx), -R header-emission phase.
+//   runner_ls -- Runner (src/runner.pdx), ls.ENH-014 (#32) multi-path
+//               header phase at rn_ls_pre_emit (RN_BIT_HEADER_MASK).
 
 module RecurseHeader = structure {
 
@@ -220,6 +289,129 @@ module RecurseHeader = structure {
         ret;
 
       rh_overflow:
+        mov rax, 0xFFFFFFFFFFFFFFFF;           // RH_ERR_OVERFLOW
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // multipath_header_compose(path_ptr, leading_blank, dst_ptr, dst_cap)
+  //   -> bytes_written | RH_ERR_OVERFLOW
+  //
+  // ls.ENH-014 (#32). See the file-header section above for the full
+  // scope + rationale.
+  //
+  // Signature: (u64, u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI (input): path_ptr      -- NUL-terminated path, or 0 for the
+  //                                 "." default (see file header).
+  //   RSI (input): leading_blank -- non-zero writes a leading '\n'
+  //                                 before the path (every positional
+  //                                 after the first in Dispatch's
+  //                                 multi-path loop).
+  //   RDX (input): dst_ptr       -- caller-owned destination buffer.
+  //   RCX (input): dst_cap       -- destination buffer capacity.
+  //   RAX (output): total bytes written, or RH_ERR_OVERFLOW (dst left
+  //                 untouched).
+  //
+  // Register plan (leaf, four caller-save inputs, no push/pop needed):
+  //   rdi = path_ptr  (scan cursor in pass 1; copy source in pass 2 --
+  //                    safe, never read again after)
+  //   rsi = leading_blank -> re-tested at the top of pass 2 (mov does
+  //         not touch flags, but every branch here re-issues its own
+  //         cmp for clarity, matching this file's existing style)
+  //   rdx = dst_ptr -> becomes the write cursor in pass 2
+  //   rcx = dst_cap (kept for the pass-1/pass-2 boundary bound check)
+  //   r9  = path_len (computed in pass 1, consumed as a countdown in
+  //         pass 2's path-copy loop)
+  //   r10 = total_len, stashed here across pass 2 so it survives the
+  //         write-cursor/countdown churn in rdx/r9/rax and is still
+  //         available for the final `mov rax, r10` return
+  //   r11 = scratch address (path-scan byte address in pass 1)
+  //   rax = byte-load / byte-store scratch (pass 2); total_len
+  //         accumulator (end of pass 1); return value
+  // ==========================================================================
+  pub let multipath_header_compose : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (path_ptr: u64) (leading_blank: u64) (dst_ptr: u64) (dst_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-014 (#32): two-pass composition of the '[\\n]<path>:\\n' multi-path listing header GNU ls prints ahead of each positional's own block once more than one path is given on argv. Pass 1: if path_ptr == 0, path_len = 1 (the literal '.' placeholder is written directly in pass 2, no scan needed, mirroring recurse_header_compose's own rh_path_default branch verbatim); else scan path_ptr byte-by-byte up to RH_PATH_MAX (200, the same shared bound recurse_header_compose uses) looking for a NUL terminator, clamping path_len at the bound if none is found within it -- the #1248-mitigated byte load (xor rax, rax; mov_b rax, [r11]) runs inside this bounded loop, identical shape to rh_path_scan above. total_len = path_len + 2 (':' + trailing '\\n') + (1 if leading_blank != 0, else 0); if total_len > dst_cap, return RH_ERR_OVERFLOW with dst untouched, matching recurse_header_compose's and Render::render_dec_u64's own overflow contract (no partial write on a buffer a caller might recycle). Pass 2 stashes total_len in r10 (r9/rdx/rax all get reused for the write) and writes in order: an optional leading '\\n' (0x0A) when leading_blank != 0; then either the literal '.' (0x2E) when path_ptr == 0, or path_len bytes copied from path_ptr (destructive cursor advance on rdi + countdown on r9 -- safe because path_ptr is never read again after this pass and no callee-save register is needed to preserve it); then ':' (0x3A) and a trailing '\\n' (0x0A). Every byte read during the path copy loop uses the #1248 mitigation; every byte write uses mov_b [dst], reg per the recurse_header_compose / Render / LongFormat precedent. This function issues NO calls (no CALL instruction anywhere in the body), so every input register is caller-save for the whole body and no callee-save push/pop or SysV call-site alignment applies -- consistent with recurse_header_compose's identical 'leaf, no nested calls, every register caller-save' shape immediately above in this same file. paideia-as conformance: no test mnemonic; every cmp immediate (0, 200, 2, 0x0A, 0x2E, 0x3A) fits imm32 trivially; RH_ERR_OVERFLOW's value (0xFFFFFFFFFFFFFFFF) is a mov rax, imm64 emission, never a compare; no and with a 64-bit immediate; no neg/cqo/idiv; r9, r10, and r11 are the only long-lived scratch registers beyond the four named inputs. Labels prefixed mh_.",
+      block: {
+        // ================================================================
+        // Pass 1: compute path_len (r9) and total_len.
+        // ================================================================
+        cmp rdi, 0;
+        je  mh_path_default;
+
+        xor r11, r11;                          // scan idx (bytes examined)
+
+      mh_path_scan:
+        cmp r11, 200;                          // RH_PATH_MAX
+        jae mh_path_scan_done;
+        mov r10, rdi;
+        add r10, r11;
+        xor rax, rax;
+        mov_b rax, [r10];                      // #1248 mitigation
+        cmp rax, 0;
+        je  mh_path_scan_done;
+        add r11, 1;
+        jmp mh_path_scan;
+
+      mh_path_scan_done:
+        mov r9, r11;                           // path_len (scanned or clamped)
+        jmp mh_total_len;
+
+      mh_path_default:
+        mov r9, 1;                             // path_len for the '.' placeholder
+
+      mh_total_len:
+        // total_len = path_len + 2 (':' + '\n') [+ 1 if leading_blank]
+        mov rax, r9;
+        add rax, 2;
+        cmp rsi, 0;
+        je  mh_total_no_blank;
+        add rax, 1;
+
+      mh_total_no_blank:
+        cmp rax, rcx;                          // dst_cap
+        ja  mh_overflow;
+
+        mov r10, rax;                          // stash total_len for the return
+
+        // ================================================================
+        // Pass 2: write ['\n'] path/'.' ':' '\n' at the cursor (rdx).
+        // ================================================================
+        cmp rsi, 0;
+        je  mh_write_path_check;
+        mov_b [rdx], 0x0A;                     // leading '\n'
+        add rdx, 1;
+
+      mh_write_path_check:
+        cmp rdi, 0;
+        je  mh_write_path_dot;
+
+      mh_write_path_copy:
+        cmp r9, 0;
+        je  mh_write_tail;
+        xor rax, rax;
+        mov_b rax, [rdi];                      // #1248 mitigation
+        mov_b [rdx], rax;
+        add rdi, 1;
+        add rdx, 1;
+        sub r9, 1;
+        jmp mh_write_path_copy;
+
+      mh_write_path_dot:
+        mov_b [rdx], 0x2E;                     // '.'
+        add rdx, 1;
+
+      mh_write_tail:
+        mov_b [rdx], 0x3A;                     // ':'
+        add rdx, 1;
+        mov_b [rdx], 0x0A;                     // trailing '\n'
+
+        mov rax, r10;                          // return total_len
+        ret;
+
+      mh_overflow:
         mov rax, 0xFFFFFFFFFFFFFFFF;           // RH_ERR_OVERFLOW
         ret
       }

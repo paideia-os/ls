@@ -25,11 +25,16 @@
 //   2. On AS_OK, load _as_path_ptr + _as_flag_bits from
 //      ArgvSurface's .bss.
 //   3. Call Runner::runner_ls(path_ptr, flag_bits). rax becomes its
-//      return (LS_RUN_STUB at M1; LS_OK / LS_ERR_* at M2+).
+//      return (LS_RUN_STUB at M1; LS_OK / LS_ERR_* at M2+). ls.ENH-014
+//      (#32): when more than one positional argument was given, step
+//      3 repeats once per path instead of running once -- see the
+//      dedicated "ls.ENH-014" section below for the full loop shape.
 //   4. ls.ENH-004 (#18): call ExitMap::exit_map(rax) and return ITS
 //      result. ls_dispatch's caller therefore always sees 0/2/3/4 --
 //      never a raw 0xFFFFEBxx sentinel -- per design/architecture.md
-//      §6.
+//      §6. ls.ENH-014 (#32): under the multi-path loop this fold runs
+//      once per call, inside the loop, and Dispatch returns the worst
+//      of those folded codes -- see below.
 //
 // =============================================================================
 // PAIDEIA-AS CONFORMANCE
@@ -49,12 +54,69 @@
 //   - r11 is scratch for every LEA base; r10 is scratch for the
 //     staged AS_OK constant. Neither is assumed live across a call.
 //   - No byte reads in this module.
-//   - Non-leaf: one r12 push (for SysV 16-byte alignment across the
-//     two nested calls -- argv_surface_parse and runner_ls -- and
-//     for callee-save discipline per SysV convention even though r12
-//     is not clobbered inside this function). Same idiom as
-//     doc.M1-003's doc_dispatch_from_buf single-push wrapper (see
-//     paideia-os/doc src/argv_dispatch.pdx L339).
+//   - Non-leaf: four callee-save pushes (rbx, r12, r13, rbp) + `sub
+//     rsp, 8` pad for SysV 16-byte alignment across every nested call
+//     site (argv_surface_parse, schema_dump_emit, runner_ls,
+//     exit_map). Widened at ls.ENH-014 (#32) from the pre-#32 single
+//     r12 push (same idiom as doc.M1-003's doc_dispatch_from_buf
+//     single-push wrapper, paideia-os/doc src/argv_dispatch.pdx L339)
+//     to carry the per-positional loop's state (multipath_mode, loop
+//     index, effective_count, worst-exit accumulator) across the
+//     repeated runner_ls / exit_map calls -- see ls.ENH-014's own
+//     section below for the full register plan.
+//
+// =============================================================================
+// ls.ENH-014 (#32): multi-path listing (`ls a b c`)
+// =============================================================================
+//
+// After the --schema short-circuit check (below) falls through to the
+// runner path, Dispatch no longer calls runner_ls exactly once. It
+// reads _as_pos_count (ArgvSurface, src/argv_surface.pdx) and iterates:
+//
+//   pos_count <= 1 -- unchanged single-call shape: runner_ls(path_ptr,
+//     flag_bits) once, path_ptr = _as_path_ptr (0 default when
+//     pos_count == 0). Byte-identical to pre-#32 output; no header
+//     bit is ever set on this path.
+//
+//   pos_count > 1 -- iterate i in 0..min(pos_count, MULTIPATH_MAX_
+//     PATHS), reading pos_ptrs[i] directly (the linked libpdx-argv
+//     array; MAX_POS there is 32, comfortably above our own 16-path
+//     cap). Each call ORs Runner::RN_BIT_HEADER_MASK into flag_bits
+//     (requesting a "<path>:" header) and, for every i > 0, also
+//     Runner::RN_BIT_HEADER_BLANK_MASK (a leading blank line -- GNU ls
+//     separates per-path blocks with a blank line, never before the
+//     first). Every runner_ls return is folded through ExitMap::
+//     exit_map IMMEDIATELY (not deferred to one final fold), and the
+//     WORST (numerically largest -- 4 cap-denied > 3 system > 2 usage
+//     > 0 ok) of those folded codes is Dispatch's own eventual return.
+//     This makes "fold worst-case exit code through exit_map" concrete
+//     without inventing an ordering over the raw 0xFFFFEBxx sentinels
+//     themselves -- ExitMap is still the single source of truth for
+//     what counts as worse.
+//
+// Interaction with -R: unaffected. Each per-path runner_ls call is a
+// fully independent invocation with its own -R state (_rn_r_mode etc.
+// are all re-initialized at the top of runner_ls), so `ls -R a b`
+// performs a complete -R pass (primary listing + header-only child
+// phase) under EACH of `a` and `b` in turn, exactly as if `ls -R a`
+// and `ls -R b` had run back to back with a blank-line-plus-header
+// separator between them.
+//
+// Interaction with sort/GDF/multi-column: also unaffected for the
+// same reason -- every mode flag Runner computes (_rn_gdf_mode,
+// _rn_sort_mode, _rn_multicol_mode) is a fresh per-call computation
+// from flag_bits, so each path's listing is sorted/grouped/columnized
+// independently. Nothing merges entries across paths.
+//
+// KNOWN GAP (tracked, not a silent regression -- see paideia-os/ls#29
+// and ArgvSurface's own _as_pos_count doc): the shell's InitCap
+// handoff still narrows only ONE directory cap (LS_DIR_CAP_SLOT) per
+// invocation, regardless of how many positionals were given. Every
+// per-path runner_ls call therefore reads through that SAME held cap
+// -- each path gets its own correct header, but the listing body
+// under it is today's single directory's content repeated, not a
+// distinct per-path read. Real per-path cap narrowing needs the
+// shell-side multi-slot handoff #29 tracks.
 //
 // =============================================================================
 // v1.1.0 (ls.ENH-006 / #19): --schema short-circuit
@@ -81,8 +143,25 @@
 // Read:
 //   _as_path_ptr         -- ArgvSurface (src/argv_surface.pdx .bss)
 //   _as_flag_bits        -- ArgvSurface (src/argv_surface.pdx .bss)
+//   _as_pos_count        -- ArgvSurface (src/argv_surface.pdx .bss), ls.ENH-014 (#32)
+//   pos_ptrs             -- libpdx-argv (linked symbol), ls.ENH-014 (#32)
 
 module Dispatch = structure {
+
+  // ==========================================================================
+  // ls.ENH-014 (#32): hard cap on the number of positional paths a
+  // single `ls` invocation iterates. pos_ptrs itself (libpdx-argv,
+  // MAX_POS) holds up to 32 entries; this repo's own bound is
+  // narrower on purpose -- it exists to keep the per-call header-
+  // composition + Runner re-entry cost bounded even if libpdx-argv's
+  // own ceiling is ever raised, mirroring Runner's own RN_GDF_MAX_
+  // ENTRIES / RN_R_MAX_ENTRIES "fail loudly, not silently, past a
+  // static bound" precedent. Positionals beyond this cap are silently
+  // NOT iterated at #32 -- no error surfaces, matching this repo's
+  // "unreachable at HEAD" bound style (16 real paths on one command
+  // line is already far past any realistic invocation).
+  // ==========================================================================
+  pub let MULTIPATH_MAX_PATHS : u64 = 16
 
   // ==========================================================================
   // ls_dispatch(argv, argc) -> u64
@@ -95,21 +174,39 @@ module Dispatch = structure {
   //        exit_map. ls.ENH-004 (#18): no 0xFFFFEBxx sentinel ever
   //        escapes ls_dispatch.
   //
-  // Register plan:
-  //   r10 = AS_OK stage (large-imm compare workaround)
-  //   r11 = scratch (LEA base for .bss reads)
-  //   r12 = pushed for alignment + SysV callee-save discipline
-  //   rdi/rsi = pass-through to argv_surface_parse; then loaded from
-  //             .bss for runner_ls; then rdi reloaded with the
-  //             pre-fold code for exit_map
-  //   rax = pre-fold code in, folded I4 exit code out
+  // Register plan (four callee-save pushes for pipeline stability
+  // across the whole per-positional loop -- see ls.ENH-014's own file-
+  // header section for why this widened from the pre-#32 single r12
+  // push):
+  //   rbx = multipath_mode (0/1: pos_count > 1, decided once)
+  //   r12 = loop index i (0.. effective_count)
+  //   r13 = effective_count (pos_count, defaulted to 1 when 0, capped
+  //         at MULTIPATH_MAX_PATHS)
+  //   rbp = worst-so-far I4 exit code accumulator (max across every
+  //         exit_map fold in the loop)
+  //   r10 = AS_OK stage / mask scratch (large-imm compare workaround)
+  //   r11 = scratch (LEA base for .bss + pos_ptrs reads)
+  //   rdi/rsi = pass-through to argv_surface_parse; then loaded fresh
+  //             from .bss/pos_ptrs each iteration for runner_ls; then
+  //             rdi reloaded with the pre-fold code for exit_map
+  //   rax = pre-fold code in, folded I4 exit code out (per call, then
+  //         the final max)
+  //
+  // Alignment: 4 pushes (rbx, r12, r13, rbp) leaves rsp % 16 == 8
+  // (entry rsp % 16 == 8; even push count preserves the parity); `sub
+  // rsp, 8` brings it to 0 for every nested call site. Matched `add
+  // rsp, 8` + 4 pops before the single shared ret.
   // ==========================================================================
   pub let ls_dispatch : (u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "ls.M1-003 (#3) + ls.ENH-004 (#18): the composition entry point named as `entry` in manifest.pdxproj. Passes argv/argc verbatim to ArgvSurface::argv_surface_parse. On AS_OK (0xFFFFEB10) loads _as_path_ptr + _as_flag_bits from ArgvSurface's .bss and calls Runner::runner_ls; any non-AS_OK argv-parse rejection instead falls straight to the shared epilogue with rax still holding the AS_ERR_* sentinel. Either way, the epilogue (ls_dp_done) moves rax into rdi and calls ExitMap::exit_map so ls_dispatch always returns the I4 vocabulary (0/2/3/4), never a raw 0xFFFFEBxx code -- this repo ships no `_start` frame, so ls_dispatch is the entry boundary the fold belongs at (design/enhancement-plan.md §7 point 3). The AS_OK compare stages the 0xFFFFEB10 constant into r10 because it does not fit in a sign-extended imm32 (paideia-as `cmp reg, imm <= 0x7FFFFFFF` rule -- same staging idiom libpdx-elevate uses for its 0xFFFFFFFFFFFFFFFF sentinel at elevate_client_lookup_broker). Push/pop parity: single r12 push aligns rsp % 16 to 0 for all three nested call sites (entry rsp % 16 == 8; one push takes it to 0; no additional call changes that alignment since r12 stays pushed until the shared epilogue) AND preserves r12 across every callee per SysV callee-save discipline. Same idiom as doc's doc_dispatch_from_buf (paideia-os/doc src/argv_dispatch.pdx L339). Labels prefixed ls_dp_.",
+      justification: "ls.M1-003 (#3) + ls.ENH-004 (#18) + ls.ENH-014 (#32): the composition entry point named as `entry` in manifest.pdxproj. Passes argv/argc verbatim to ArgvSurface::argv_surface_parse. On AS_OK (0xFFFFEB10) loads _as_flag_bits from ArgvSurface's .bss and checks the --schema short-circuit (ls.ENH-006/#19) exactly as before; any non-AS_OK argv-parse rejection or a completed --schema emission falls straight to the shared ls_dp_done fold with rax holding the sentinel, unaffected by #32. On the ordinary runner path (ls_dp_multipath_init), #32 replaces the old single runner_ls call with a per-positional loop: r13 = _as_pos_count, clamped to 1 when 0 (the pre-existing 'default to .' shape) and capped at MULTIPATH_MAX_PATHS (16); rbx = 1 iff the RAW pos_count (before the zero-default) was > 1 -- this is the 'multipath_mode' flag that gates BOTH which path-source each iteration reads (pos_ptrs[i] when set, else the unchanged _as_path_ptr sentinel) AND whether Runner::RN_BIT_HEADER_MASK / RN_BIT_HEADER_BLANK_MASK ever get OR'd into the per-call flag_bits -- so a pos_count <= 1 invocation is byte-identical to pre-#32 output (no header bit ever set, single call, same path source). rbp accumulates the worst-so-far I4 exit code: EVERY runner_ls return is folded through ExitMap::exit_map immediately inside the loop body (not deferred), and rbp := max(rbp, folded) after each call -- this makes 'fold worst-case exit code through exit_map' concrete via ExitMap's own ordering (0 ok < 2 usage < 3 system < 4 cap-denied) rather than inventing a second ordering over the raw 0xFFFFEBxx sentinels. flag_bits and path_ptr are both reloaded fresh from memory (.bss / the linked pos_ptrs array) on every iteration rather than cached in a fifth callee-save register, since neither _as_flag_bits nor pos_ptrs is written by any callee in this function's call graph. Four callee-save pushes (rbx=multipath_mode, r12=loop index i, r13=effective_count, rbp=worst-exit accumulator) + sub rsp,8 pad = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48; 48 % 16 == 0 at every nested-call site (argv_surface_parse, schema_dump_emit, runner_ls, exit_map). Matched add rsp,8 + 4 pops via the single shared ls_dp_epilogue label every path (parse-error, --schema, and the loop's own completion) converges on. The AS_OK compare still stages the 0xFFFFEB10 constant into r10 because it does not fit in a sign-extended imm32 (paideia-as `cmp reg, imm <= 0x7FFFFFFF` rule -- same staging idiom libpdx-elevate uses for its 0xFFFFFFFFFFFFFFFF sentinel at elevate_client_lookup_broker). Labels prefixed ls_dp_.",
       block: {
-        push r12;                            // alignment + callee-save
+        push rbx;
+        push r12;
+        push r13;
+        push rbp;
+        sub rsp, 8;                           // align: 4 pushes leaves rsp%16==8
 
         // argv_surface_parse(argv, argc) -- rdi + rsi already correct
         // from our own SysV entry.
@@ -133,7 +230,7 @@ module Dispatch = structure {
         mov r10, rsi;
         and r10, 0x10;                       // AS_BIT_SCHEMA
         cmp r10, 0;
-        je  ls_dp_run_runner;                // no --schema -> runner path
+        je  ls_dp_multipath_init;            // no --schema -> runner path
 
         // --schema present: emit catalog + fold.
         call schema_dump_emit;
@@ -147,22 +244,87 @@ module Dispatch = structure {
         mov rax, 0xFFFFEB00;                 // LS_OK -> exit 0
         jmp ls_dp_done;
 
-      ls_dp_run_runner:
-        // Standard runner path: load path_ptr + call runner_ls.
+      ls_dp_multipath_init:
+        // ls.ENH-014 (#32): decide multipath_mode + effective_count.
+        lea r11, [rip + _as_pos_count];
+        mov r13, [r11];                       // r13 = raw pos_count
+
+        xor rbx, rbx;                         // multipath_mode = 0
+        cmp r13, 1;
+        jbe ls_dp_mp_count_fix;
+        mov rbx, 1;                           // multipath_mode = 1 (pos_count > 1)
+
+      ls_dp_mp_count_fix:
+        cmp r13, 0;
+        jne ls_dp_mp_count_cap;
+        mov r13, 1;                           // 0 positionals -> exactly one call
+
+      ls_dp_mp_count_cap:
+        cmp r13, 16;                          // MULTIPATH_MAX_PATHS
+        jbe ls_dp_mp_ready;
+        mov r13, 16;
+
+      ls_dp_mp_ready:
+        xor rbp, rbp;                         // worst-so-far exit code = 0 (ok)
+        xor r12, r12;                         // i = 0
+
+      ls_dp_mp_loop:
+        cmp r12, r13;
+        jae ls_dp_mp_loop_done;
+
+        // ---- resolve path_ptr for this iteration ----------------
+        cmp rbx, 0;
+        je  ls_dp_mp_use_default;
+        lea r11, [rip + pos_ptrs];
+        mov rdi, [r11 + r12 * 8];             // pos_ptrs[i]
+        jmp ls_dp_mp_have_path;
+
+      ls_dp_mp_use_default:
         lea r11, [rip + _as_path_ptr];
-        mov rdi, [r11];
-        // rsi already holds flag_bits from the load above.
+        mov rdi, [r11];                       // 0 default when pos_count == 0
+
+      ls_dp_mp_have_path:
+        // ---- rebuild flag_bits for this call ---------------------
+        lea r11, [rip + _as_flag_bits];
+        mov rsi, [r11];
+        cmp rbx, 0;
+        je  ls_dp_mp_call;                    // single-path: no header bit ever
+        or  rsi, 0x8000;                      // RN_BIT_HEADER_MASK
+        cmp r12, 0;
+        je  ls_dp_mp_call;                    // first path: no leading blank
+        or  rsi, 0x10000;                     // RN_BIT_HEADER_BLANK_MASK
+
+      ls_dp_mp_call:
         call runner_ls;
-        // rax = Runner's return code (LS_RUN_STUB at M1; LS_OK / LS_
-        // ERR_* at M2+). Fall through to the shared fold below.
+        mov rdi, rax;                          // ls_code arg for exit_map
+        call exit_map;
+        cmp rax, rbp;
+        jbe ls_dp_mp_advance;
+        mov rbp, rax;                          // new worst-so-far
+
+      ls_dp_mp_advance:
+        add r12, 1;
+        jmp ls_dp_mp_loop;
+
+      ls_dp_mp_loop_done:
+        // Already folded through exit_map inside the loop -- return
+        // the worst accumulated I4 code directly.
+        mov rax, rbp;
+        jmp ls_dp_epilogue;
 
       ls_dp_done:
         // ls.ENH-004 (#18): fold whatever 0xFFFFEBxx sentinel is in
-        // rax (from either the parse-error early-out or Runner)
+        // rax (from either the parse-error early-out or --schema)
         // through ExitMap::exit_map before returning to our caller.
         mov rdi, rax;                        // ls_code arg for exit_map
         call exit_map;
+
+      ls_dp_epilogue:
+        add rsp, 8;
+        pop rbp;
+        pop r13;
         pop r12;
+        pop rbx;
         ret
       }
     }
