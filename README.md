@@ -95,7 +95,7 @@ pinned byte-exact by `tests/schema_golden.pdx`.
 | 16 | `name_len` | `u64` | kernel record | clamped to 104 by `Runner` before the text write |
 | 24 | `name` | `[u8; 104]` | kernel record | entry name bytes; no escaping at 1.0 |
 | 128 | `owner_kind` | `u64` | `ls` | always `KIND_USER` = `0x190` |
-| 136 | `owner_target_ptr` | `u64` | `ls` | `user_row`; `0` placeholder at 1.0 until `sys_pdxfs_stat_by_inode` ships |
+| 136 | `owner_target_ptr` | `u64` | `ls` | `user_row` from `OwnerCol::owner_col_owner_row_from_entry`; `0` today (honest gap -- `PdxFsDirEntry` carries no owner field) until `sys_pdxfs_stat_by_inode` ships (ls.ENH-008, #28) |
 
 Bytes `[0..128)` are the M3-001 record unchanged, so a decoder pinned to the
 128-byte shape still reads a valid prefix of a 144-byte record. Field additions

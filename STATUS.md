@@ -109,6 +109,7 @@ semantic-pipe substrate).
 | ENH-023 (#41)   | --color=auto discriminates on stdout KIND (probe today = off)  | WIRED  |
 | ENH-020 (#38)   | --group-directories-first buffers + partitions dirs-first      | WIRED  |
 | ENH-015 (#33)   | file-as-path single-row fallback (interim, kind hardcoded)     | WIRED  |
+| ENH-008 (#28)   | real per-entry owner row (retire the hardcoded 0)              | GAP-CENTRALIZED |
 
 See `design/tooling/r49-r50-plan.md` §5.4 in paideia-os for the full
 milestone breakdown (M1–M5) and cross-repo dependencies.
@@ -135,7 +136,10 @@ milestone breakdown (M1–M5) and cross-repo dependencies.
 - `src/human_size.pdx` — `HumanSize` module (the `-h`
   base-2 K/M/G/T/P/E renderer). M2-003.
 - `src/owner_col.pdx` — `OwnerCol` module (the `-l` owner
-  column: `u:<row>` from a raw row or a KIND_USER wire Cap).
+  column: `u:<row>` from a raw row or a KIND_USER wire Cap; plus
+  `owner_col_owner_row_from_entry`, the ls.ENH-008 (#28) honest-gap
+  accessor that centralizes the "kernel record has no owner field"
+  placeholder for all three call sites).
   M2-002. Shim for libpdx-cap.M3-001 (KIND_USER_ref decoder).
 - `src/long_format.pdx` — `LongFormat` module (the `-l` line
   renderer: kind, mode, owner, size, mtime, name; composes

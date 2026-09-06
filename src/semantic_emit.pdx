@@ -37,14 +37,17 @@
 //             layout mirrors paideia-os pdxfs_dir_iter.pdx §1).
 //   [128..136] owner_kind : u64 = KIND_USER (0x190)
 //   [136..144] owner_target_ptr : u64 = user_row (low 16 bits from
-//             the file's KIND_USER_ref, zero-extended). At M3-002 the
-//             kernel PdxFsDirEntry does not carry an owner field, so
-//             sem_emit_entry writes 0 as the placeholder user_row; the
-//             concrete owner discovery lands in a follow-up round when
-//             either (a) PdxFsDirEntry grows an owner_ref field, or
-//             (b) the tool syscalls sys_pdxfs_stat_by_inode for the
-//             owner during emit. Either upgrade is a one-line change
-//             (add an argument to sem_emit_entry, plumb from Runner).
+//             the file's KIND_USER_ref, zero-extended), sourced from
+//             OwnerCol::owner_col_owner_row_from_entry(kernel_entry_ptr)
+//             (src/owner_col.pdx, ls.ENH-008 #28). The kernel
+//             PdxFsDirEntry does not carry an owner field at HEAD, so
+//             that accessor honestly returns 0; the concrete owner
+//             discovery lands in a follow-up round when either
+//             (a) PdxFsDirEntry grows an owner_ref field, or (b) the
+//             tool syscalls sys_pdxfs_stat_by_inode for the owner
+//             during emit. Either upgrade is now a one-function-body
+//             edit inside owner_col_owner_row_from_entry rather than a
+//             change to sem_emit_entry / sem_emit_wire_compose.
 //
 // This is the D2 literal at the schema level: the downstream query
 // tool filters by owner == alice by comparing the 16-byte Cap wire
@@ -115,10 +118,13 @@
 //     for symmetry with the M3-002 extension that needs r13 for the
 //     owner_row) + `sub rsp, 8` pad -> rsp % 16 == 0 at every nested
 //     call site.
-//   - sem_emit_entry: non-leaf (calls send_record). Three callee-save
-//     pushes (r12 = kernel_entry_ptr survivor, r13 = copy cursor,
-//     r14 = length) -> 3*8 = 24 bytes; entry rsp % 16 == 8; 8 + 24 =
-//     32; 32 % 16 == 0 at every nested call site.
+//   - sem_emit_entry: non-leaf (calls owner_col_owner_row_from_entry
+//     + send_record). Three callee-save pushes (r12 = kernel_entry_ptr
+//     survivor, r13 = copy cursor / wire base, r14 = unused padding)
+//     -> 3*8 = 24 bytes; entry rsp % 16 == 8; 8 + 24 = 32; 32 % 16 ==
+//     0 at every nested call site. sem_emit_wire_compose (ls.ENH-008,
+//     #28) gained the same owner_col_owner_row_from_entry call; its
+//     pre-existing sub rsp,8 pad already covered the alignment.
 //
 // =============================================================================
 // CROSS-MODULE SYMBOLS
@@ -129,6 +135,8 @@
 //   send_record                    -- libpdx-semantic-pipe::Send
 //   spipe_schema_id_from_name      -- libpdx-semantic-pipe::Schema
 //                                     (ls.ENH-010, #27)
+//   owner_col_owner_row_from_entry -- OwnerCol (src/owner_col.pdx)
+//                                     -- ls.ENH-008, #28
 //
 // Written / read:
 //   _se_pdxfsdirentry_hash         -- 32-byte PdxFsDirEntry@0.1 schema
@@ -338,32 +346,42 @@ module SemanticEmit = structure {
   //   (1) Copy kernel_entry_ptr[0..128] into _se_wire_scratch[0..128]
   //       byte-by-byte (paideia-as #1248 mitigation: xor rax, rax
   //       before every mov_b load).
-  //   (2) M3-002: append owner Cap wire at scratch[128..144] --
-  //       [128..136] = KIND_USER (0x190), [136..144] = user_row
-  //       placeholder (0). The placeholder concretises when a follow-
-  //       up round plumbs per-file owner into PdxFsDirEntry or exposes
-  //       sys_pdxfs_stat_by_inode. Bytes are qword-wide stores (owner
-  //       fields are naturally 8-aligned inside the 8-aligned scratch).
+  //   (2) M3-002 + ls.ENH-008 (#28): append owner Cap wire at
+  //       scratch[128..144] -- [128..136] = KIND_USER (0x190),
+  //       [136..144] = OwnerCol::owner_col_owner_row_from_entry
+  //       (kernel_entry_ptr) -- an honest-gap accessor that returns 0
+  //       today (PdxFsDirEntry has no owner field), replacing the
+  //       earlier inline `xor rax, rax` placeholder. The value
+  //       concretises when a follow-up round plumbs per-file owner
+  //       into PdxFsDirEntry or exposes sys_pdxfs_stat_by_inode --
+  //       that upgrade is now a one-function-body edit inside
+  //       owner_col_owner_row_from_entry, not a search-and-replace
+  //       across this file's call sites. Bytes are qword-wide stores
+  //       (owner fields are naturally 8-aligned inside the 8-aligned
+  //       scratch).
   //   (3) Call Send::send_record(fd = LS_STDOUT_ENDPOINT_SLOT,
   //                              rec_ptr = &_se_wire_scratch,
   //                              rec_len = SE_WIRE_RECORD_SIZE).
   //   (4) Return SE_OK on send_record's SP_SEND_OK; else SE_ERR_SEND.
   //
   // Register plan (non-leaf, 3 callee-save pushes for alignment + carry):
-  //   r12 = kernel_entry_ptr (survives across the copy loop and the send)
+  //   r12 = kernel_entry_ptr (survives across the copy loop, the
+  //         owner_col_owner_row_from_entry call, and the send)
   //   r13 = copy loop cursor / wire base pointer during send
-  //   r14 = reserved for M3-002 owner_row survival (unused at M3-001)
-  //   rax = load byte / return
-  //   r11 = LEA scratch + sentinel staging
+  //   r14 = unused (kept for the established 3-push alignment shape)
+  //   rax = load byte / owner_col_owner_row_from_entry return / send
+  //         return
+  //   r11 = LEA scratch + sentinel staging + owner-wire address calc
   //   rcx = copy counter (caller-save; recomputed as needed)
   //
   // Alignment: 3 pushes = 24 bytes; entry rsp % 16 == 8; 8 + 24 = 32;
-  // 32 % 16 == 0 at every nested call site.
+  // 32 % 16 == 0 at every nested call site (including the new
+  // owner_col_owner_row_from_entry call).
   // ==========================================================================
   pub let sem_emit_entry : (u64) -> u64 !{mem, sysreg} @{cap} =
     fn (kernel_entry_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap},
-      justification: "ls.M3-001 (#8) + ls.M3-002 (#9): copy the 128-byte kernel PdxFsDirEntry into _se_wire_scratch, append a 16-byte owner Cap wire at scratch[128..144] (kind=KIND_USER 0x190 at offset 128; target_ptr placeholder 0 at offset 136 -- the D2 literal owner-as-cap-ref shape from r49-r50-plan.md §4.4), and call libpdx-semantic-pipe::Send::send_record(LS_STDOUT_ENDPOINT_SLOT, scratch, SE_WIRE_RECORD_SIZE=144). Byte-by-byte copy loop with the #1248 mitigation (xor rax, rax; mov_b rax, [src]; mov_b [dst], rax) for the 128-byte kernel prefix -- the record is small enough that qword-wide copy has no material saving vs. the byte loop's uop cost, and the byte-loop shape is symmetric with libpdx-semantic-pipe::Send::send_record's own body copy. The two owner qwords are qword stores (owner fields are naturally 8-aligned inside the 8-aligned scratch); no #1248 concern because these are stores, not loads. Placeholder user_row = 0 concretises in a follow-up round when either (a) PdxFsDirEntry grows an owner field, or (b) sys_pdxfs_stat_by_inode ships -- both are one-line changes here (add an argument to sem_emit_entry, plumb from Runner, replace `mov rax, 0` with `mov rax, r12`). Send return: SP_SEND_OK (0) -> SE_OK (0); every other value collapses to SE_ERR_SEND (0xFFFFEB25). This translation preserves the tool-level error taxonomy (0xFFFFEB2x = Runner sub-band) rather than surfacing library-internal codes to _start. Three callee-save pushes (r12=kernel_entry_ptr for pipeline stability, r13=wire scratch base, r14=reserved for the M3-002++ owner_row plumb-through) -> rsp % 16 == 0 at every nested call site (entry rsp %16 ==8; 3*8=24; 8+24=32; 32%16==0). Matched pops before every ret. paideia-as conformance: r11 scratch for LEA + sentinel; no test mnemonic; largest cmp immediate is 128 (SE_KERNEL_ENTRY_SIZE); the 0x190 owner-kind constant + SE_ERR_SEND stage via mov rax, imm32/imm64 (return path, not compare). Effects {mem, sysreg} @{cap} match send_record's effects tail. Labels prefixed seme_.",
+      justification: "ls.M3-001 (#8) + ls.M3-002 (#9) + ls.ENH-008 (#28): copy the 128-byte kernel PdxFsDirEntry into _se_wire_scratch, append a 16-byte owner Cap wire at scratch[128..144] (kind=KIND_USER 0x190 at offset 128; target_ptr = OwnerCol::owner_col_owner_row_from_entry(kernel_entry_ptr) at offset 136 -- the D2 literal owner-as-cap-ref shape from r49-r50-plan.md §4.4), and call libpdx-semantic-pipe::Send::send_record(LS_STDOUT_ENDPOINT_SLOT, scratch, SE_WIRE_RECORD_SIZE=144). Byte-by-byte copy loop with the #1248 mitigation (xor rax, rax; mov_b rax, [src]; mov_b [dst], rax) for the 128-byte kernel prefix -- the record is small enough that qword-wide copy has no material saving vs. the byte loop's uop cost, and the byte-loop shape is symmetric with libpdx-semantic-pipe::Send::send_record's own body copy. owner_col_owner_row_from_entry(r12) is called BEFORE the scratch[136] address is computed into r11, so its return in rax is stored immediately without being clobbered by intervening address arithmetic; it is a leaf ({} @{}), a strict subset of this function's own effects, so no widening. It honestly returns 0 today (PdxFsDirEntry has no owner field at HEAD -- see that function's own doc); the upgrade path when either (a) PdxFsDirEntry grows an owner field, or (b) sys_pdxfs_stat_by_inode ships is now a one-function-body edit inside owner_col_owner_row_from_entry rather than a change to this call site. Send return: SP_SEND_OK (0) -> SE_OK (0); every other value collapses to SE_ERR_SEND (0xFFFFEB25). This translation preserves the tool-level error taxonomy (0xFFFFEB2x = Runner sub-band) rather than surfacing library-internal codes to _start. Three callee-save pushes (r12=kernel_entry_ptr for pipeline stability across both nested calls, r13=wire scratch base, r14=unused padding) -> rsp % 16 == 0 at every nested call site (entry rsp %16 ==8; 3*8=24; 8+24=32; 32%16==0). Matched pops before every ret. paideia-as conformance: r11 scratch for LEA + sentinel; no test mnemonic; largest cmp immediate is 128 (SE_KERNEL_ENTRY_SIZE); the 0x190 owner-kind constant + SE_ERR_SEND stage via mov rax, imm32/imm64 (return path, not compare). Effects {mem, sysreg} @{cap} match send_record's effects tail. Labels prefixed seme_.",
       block: {
         push r12;
         push r13;
@@ -400,10 +418,12 @@ module SemanticEmit = structure {
         jmp seme_copy_head;
 
       seme_copy_done:
-        // ---- (2) M3-002: append owner Cap wire at scratch[128..144] --
+        // ---- (2) M3-002 + ls.ENH-008 (#28): append owner Cap wire at
+        //      scratch[128..144] --
         //
         //   [128..136] owner_kind      = KIND_USER (0x190)
-        //   [136..144] owner_target_ptr = 0 (placeholder user_row)
+        //   [136..144] owner_target_ptr = owner_col_owner_row_from_entry
+        //                                 (kernel_entry_ptr) -- 0 today
         //
         // Qword-wide stores; owner fields are 8-aligned inside the 8-
         // aligned scratch, so no #1248 concern (stores, not loads).
@@ -412,10 +432,17 @@ module SemanticEmit = structure {
         mov rax, 0x190;                          // SE_OWNER_KIND_USER
         mov [r11], rax;
 
+        // owner_target_ptr @ scratch[136]: delegate to OwnerCol::
+        // owner_col_owner_row_from_entry (ls.ENH-008, #28) rather than
+        // an inline `xor rax, rax` placeholder -- r12/r13 survive the
+        // call (callee-saved); rax is overwritten by the call return
+        // and consumed immediately, so the address computation happens
+        // AFTER the call rather than before.
+        mov rdi, r12;                            // kernel_entry_ptr
+        call owner_col_owner_row_from_entry;
         mov r11, r13;
         add r11, 136;                            // r11 = &scratch[136]
-        xor rax, rax;                            // placeholder user_row = 0
-        mov [r11], rax;
+        mov [r11], rax;                          // owner_target_ptr (0 today)
 
         // ---- (3) send_record(fd, rec_ptr, rec_len) ------------------
         mov rdi, 3;                              // LS_STDOUT_ENDPOINT_SLOT
@@ -486,15 +513,15 @@ module SemanticEmit = structure {
   //   r10, r11 = address-holder scratch (byte + qword store addressing)
   //
   // Alignment: 2 pushes + sub rsp,8 pad = 24 bytes; entry rsp % 16 ==
-  // 8; 8 + 24 = 32; 32 % 16 == 0. Function has NO nested calls, so
-  // the alignment discipline is trivially satisfied -- but we keep
-  // the sub rsp,8 for parity with sem_emit_entry so a future
-  // refactor that adds a call site inherits alignment for free.
+  // 8; 8 + 24 = 32; 32 % 16 == 0 at the owner_col_owner_row_from_entry
+  // call site introduced by ls.ENH-008 (#28) -- the sub rsp,8 pad this
+  // function always carried "for parity with sem_emit_entry" is what
+  // that call now actually needs.
   // ==========================================================================
   pub let sem_emit_wire_compose : (u64) -> u64 !{mem} @{} =
     fn (kernel_entry_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "ls.M4-004 (#14): the compose-only sibling of sem_emit_entry, exposing the same 128-byte kernel-record copy + 16-byte owner Cap wire append into _se_wire_scratch WITHOUT the Send::send_record tail call. Callers (the schema-golden fixture at tests/schema_golden.pdx) get byte-exact wire bytes in _se_wire_scratch to diff against a golden, with no dependency on a live libpdx-semantic-pipe substrate. Defensive gate: kernel_entry_ptr == 0 returns 0 (bytes composed) without touching the scratch -- a broken caller sees a zero return, not garbage in _se_wire_scratch. Byte-by-byte copy loop follows the #1248 mitigation (xor rax, rax; mov_b rax, [src]; mov_b [dst], rax) identical to sem_emit_entry's copy body. Owner Cap wire append: qword stores at scratch[128] = SE_OWNER_KIND_USER (0x190), scratch[136] = 0 (placeholder user_row, concretises when PdxFsDirEntry grows an owner field). Two callee-save pushes (r12=kernel_entry_ptr, r13=wire scratch base) + sub rsp,8 pad = 24 bytes; entry rsp % 16 == 8; 8 + 24 = 32; 32 % 16 == 0. No nested calls so alignment is trivial, but the sub rsp,8 stays for parity with sem_emit_entry (a future refactor that adds a call site inherits alignment). Return value SE_WIRE_RECORD_SIZE (144) matches the number of wire bytes populated. paideia-as conformance: r11 + r10 as address scratch; no test mnemonic; largest cmp immediate 128 (SE_KERNEL_ENTRY_SIZE); the 0x190 owner-kind constant is a `mov rax, imm32` store, not a compare. Effects {mem} only (no send_record, no cap invoke). Labels prefixed semc_.",
+      justification: "ls.M4-004 (#14) + ls.ENH-008 (#28): the compose-only sibling of sem_emit_entry, exposing the same 128-byte kernel-record copy + 16-byte owner Cap wire append into _se_wire_scratch WITHOUT the Send::send_record tail call. Callers (the schema-golden fixture at tests/schema_golden.pdx) get byte-exact wire bytes in _se_wire_scratch to diff against a golden, with no dependency on a live libpdx-semantic-pipe substrate. Defensive gate: kernel_entry_ptr == 0 returns 0 (bytes composed) without touching the scratch -- a broken caller sees a zero return, not garbage in _se_wire_scratch. Byte-by-byte copy loop follows the #1248 mitigation (xor rax, rax; mov_b rax, [src]; mov_b [dst], rax) identical to sem_emit_entry's copy body. Owner Cap wire append: qword stores at scratch[128] = SE_OWNER_KIND_USER (0x190), scratch[136] = OwnerCol::owner_col_owner_row_from_entry(r12) -- called before the scratch[136] address is computed into r11 so its rax return is not clobbered by the address arithmetic; it is a leaf ({} @{}), a strict subset of this function's own {mem} @{}, so no widening. Same honest-gap discipline as sem_emit_entry: returns 0 today (PdxFsDirEntry has no owner field at HEAD), and the future upgrade is a one-function-body edit inside owner_col_owner_row_from_entry rather than a change here. Two callee-save pushes (r12=kernel_entry_ptr, r13=wire scratch base) + sub rsp,8 pad = 24 bytes; entry rsp % 16 == 8; 8 + 24 = 32; 32 % 16 == 0 -- this function now HAS one nested call (owner_col_owner_row_from_entry), and the sub rsp,8 pad this function always carried 'for parity with sem_emit_entry' is what makes that call site aligned. Return value SE_WIRE_RECORD_SIZE (144) matches the number of wire bytes populated. paideia-as conformance: r11 + r10 as address scratch; no test mnemonic; largest cmp immediate 128 (SE_KERNEL_ENTRY_SIZE); the 0x190 owner-kind constant is a `mov rax, imm32` store, not a compare. Effects {mem} only (owner_col_owner_row_from_entry is {} @{}, a subset; no send_record, no cap invoke). Labels prefixed semc_.",
       block: {
         push r12;
         push r13;
@@ -533,10 +560,15 @@ module SemanticEmit = structure {
         mov rax, 0x190;                          // SE_OWNER_KIND_USER
         mov [r11], rax;
 
+        // owner_target_ptr @ scratch[136]: same OwnerCol delegation as
+        // sem_emit_entry (ls.ENH-008, #28) -- call happens before the
+        // address computation so rax (the call's return) is not
+        // clobbered by the r11 arithmetic.
+        mov rdi, r12;                            // kernel_entry_ptr
+        call owner_col_owner_row_from_entry;
         mov r11, r13;
         add r11, 136;
-        xor rax, rax;                            // placeholder user_row
-        mov [r11], rax;
+        mov [r11], rax;                          // owner_target_ptr (0 today)
 
         mov rax, 144;                            // SE_WIRE_RECORD_SIZE
         add rsp, 8;

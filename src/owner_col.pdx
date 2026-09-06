@@ -8,7 +8,7 @@
 // SCOPE
 // =============================================================================
 //
-// Two entry points:
+// Three entry points:
 //
 //   owner_col_render_from_row(dst_ptr, dst_cap, user_row)
 //     -> bytes_written | OC_ERR_OVERFLOW
@@ -29,6 +29,37 @@
 //     paideia-os src/kernel/core/cap/kind_user.pdx SECTION 5), and
 //     delegates to owner_col_render_from_row.  Refuses with
 //     OC_ERR_NOT_USER if the wire record's kind is anything else.
+//
+//   owner_col_owner_row_from_entry(kernel_entry_ptr) -> u64
+//
+//     ls.ENH-008 (paideia-os/ls#28): THE HONEST GAP. The kernel's
+//     PdxFsDirEntry record -- the exact 128 bytes `sys_pdxfs_dir_
+//     readnext` (sysno 72) fills and Runner buffers into
+//     `_rn_entry_buf` -- is frozen at inode@0, kind@8, name_len@16,
+//     name@24 (see paideia-os src/kernel/core/cap/pdxfs_dir_iter.pdx
+//     SECTION 1, "FROZEN LAYOUT (unchanged since R42-PREP-008)").
+//     There is NO uid/owner field anywhere in that record, so there is
+//     no per-entry owner to read -- the exact same shape of gap
+//     `SortOptions::sort_options_by_mtime` / `sort_options_by_size`
+//     (src/sort_options.pdx) already document and trip-wire for the
+//     `-t`/`-S` sort keys.
+//
+//     This function is the single named, documented, fixture-pinned
+//     place that gap lives for the OWNER column specifically. It
+//     replaces three previously-scattered raw `xor rax, rax` / `mov
+//     rax, 0` placeholder writes (Runner::runner_ls's `-l` text path,
+//     SemanticEmit::sem_emit_entry's wire path, SemanticEmit::
+//     sem_emit_wire_compose's compose-only sibling) with one call
+//     site each. `kernel_entry_ptr` is accepted (not ignored at the
+//     call site) so the future upgrade -- either PdxFsDirEntry growing
+//     a real owner field, or a `sys_pdxfs_stat_by_inode` follow-up
+//     call -- is a one-function edit (this body starts reading
+//     `kernel_entry_ptr`) rather than a three-site search-and-replace.
+//     Pinned by `tests/owner_fixtures.pdx` cases 9-10 (sub-matrix C):
+//     both an all-zero entry and a densely-populated entry (non-zero
+//     bytes at every field, including past `name_len`) must return 0,
+//     proving the function truly never reads the entry rather than
+//     coincidentally returning 0 on an empty fixture.
 //
 // =============================================================================
 // LIBPDX-CAP DEPENDENCY (M2 shim)
@@ -89,6 +120,9 @@
 //     owner_col_render_from_row).  Three callee-save pushes
 //     (rbx/r12/r13) + `sub rsp, 8` pad leave rsp % 16 == 0 at every
 //     nested-call site.
+//   - owner_col_owner_row_from_entry is a LEAF (no calls, no
+//     branches, touches no memory -- honest pass-through matching
+//     `SortOptions::sort_options_by_mtime`'s shape exactly).
 //
 // =============================================================================
 // CROSS-MODULE SYMBOLS
@@ -290,6 +324,59 @@ module OwnerCol = structure {
         pop r13;
         pop r12;
         pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // owner_col_owner_row_from_entry(kernel_entry_ptr) -> u64
+  //
+  // Signature: (u64) -> u64 !{} @{}
+  //   RDI (input): kernel_entry_ptr -- 128-byte kernel-visible
+  //                                     PdxFsDirEntry (see paideia-os
+  //                                     pdxfs_dir_iter.pdx SECTION 1)
+  //   RAX (output): user_row (always 0 today -- see below)
+  //
+  // ls.ENH-008 (#28): THE HONEST GAP, owner edition. PdxFsDirEntry's
+  // frozen layout is inode@0, kind@8, name_len@16, name@24 (104 B) --
+  // 128 bytes, no owner/uid field anywhere. There is therefore no
+  // per-entry owner to read out of `kernel_entry_ptr`, so this
+  // function is the literal reduction of "read the owner field": echo
+  // 0 and return, touching neither `kernel_entry_ptr` nor memory.
+  // Exactly the shape of `SortOptions::sort_options_by_mtime` /
+  // `sort_options_by_size` (src/sort_options.pdx) for the identical
+  // reason (same frozen record, same missing-field gap, different
+  // column).
+  //
+  // `kernel_entry_ptr` is accepted as a real parameter (not folded
+  // away) specifically so the future upgrade -- PdxFsDirEntry growing
+  // an owner field, or a `sys_pdxfs_stat_by_inode` follow-up call --
+  // is a one-function body edit (start reading `kernel_entry_ptr`)
+  // rather than a change to every call site's argument marshalling.
+  // The three call sites this function centralizes (Runner::runner_ls
+  // `-l` text path, SemanticEmit::sem_emit_entry, SemanticEmit::
+  // sem_emit_wire_compose) are unchanged in shape across that future
+  // swap -- only this function's body stops being `xor rax, rax; ret`.
+  //
+  // Pinned by tests/owner_fixtures.pdx cases 9-10 (sub-matrix C): an
+  // all-zero entry AND a densely-populated entry (non-zero at every
+  // field, including bytes past name_len) both must return 0 -- the
+  // second case is what proves this function truly never dereferences
+  // `kernel_entry_ptr` rather than coincidentally landing on 0 because
+  // the fixture entry happened to be blank. A future real
+  // implementation has to touch that golden, surfacing the behaviour
+  // change in review exactly like GroupSortFixtures case 4 does for
+  // symlink-promotion and SortOptionsFixtures cases 6-9 do for mtime/
+  // size.
+  //
+  // Leaf; effects {}; no branches; touches no memory.
+  // ==========================================================================
+  pub let owner_col_owner_row_from_entry : (u64) -> u64 !{} @{} =
+    fn (kernel_entry_ptr: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-008 (#28): honest pass-through -- PdxFsDirEntry (inode@0, kind@8, name_len@16, name@24; frozen since R42-PREP-008, see paideia-os src/kernel/core/cap/pdxfs_dir_iter.pdx SECTION 1) has no owner/uid field at HEAD, so there is no per-entry owner to read. Rather than leave the placeholder scattered as three separate `xor rax, rax` / `mov rax, 0` inline writes (Runner's `-l` text path, SemanticEmit::sem_emit_entry's and sem_emit_wire_compose's wire paths), this function is the single named, documented, fixture-pinned reduction: echo 0 and return without touching kernel_entry_ptr or memory. Same discipline as SortOptions::sort_options_by_mtime / sort_options_by_size (src/sort_options.pdx) for the identical frozen-record gap. kernel_entry_ptr is accepted (read into no register beyond rdi, never dereferenced) so a future kernel-schema upgrade is a one-function-body edit. Leaf; effects {} because no memory is read or written. paideia-as conformance: no test mnemonic; no cmp; no branches. Labels: none needed.",
+      block: {
+        xor rax, rax;
         ret
       }
     }

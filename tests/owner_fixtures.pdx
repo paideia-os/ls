@@ -1,7 +1,8 @@
-// tests/owner_fixtures.pdx -- ls.M4-002 (paideia-os/ls#12)
+// tests/owner_fixtures.pdx -- ls.M4-002 (paideia-os/ls#12) +
+//                             ls.ENH-008 (paideia-os/ls#28)
 //
 // OwnerFixtures module: multi-user quota-share subtree correctness for
-// OwnerCol (src/owner_col.pdx). Two sub-matrices:
+// OwnerCol (src/owner_col.pdx). Three sub-matrices:
 //
 //   (A) owner_col_render_from_row: 7 (user_row, expected_bytes) cases
 //       covering the row-id range a multi-user quota subtree exhibits
@@ -13,6 +14,19 @@
 //       * KIND_USER (0x190) cap with target_ptr's low 16 bits = 42
 //         -> expected "u:42" (4 bytes).
 //       * KIND_TTY (0x197) cap -> expected OC_ERR_NOT_USER refusal.
+//
+//   (C) owner_col_owner_row_from_entry: 2 honest-gap trip-wire cases
+//       (ls.ENH-008, #28). The kernel's PdxFsDirEntry record carries
+//       no owner field at HEAD (see that function's own doc), so
+//       owner_col_owner_row_from_entry is an honest pass-through that
+//       always returns 0 -- the same shape of gap SortOptionsFixtures
+//       cases 6-9 pin for `-t`/`-S`. Both an all-zero entry AND a
+//       densely-populated entry (every byte 0xFF, including bytes past
+//       name_len) must return 0; the second case is what proves the
+//       function truly never dereferences kernel_entry_ptr rather than
+//       coincidentally landing on 0 because the fixture happened to be
+//       blank. A future real implementation has to touch this golden,
+//       surfacing the behaviour change in review.
 //
 // The wire-cap sub-matrix uses libpdx-cap's wire format (see
 // libpdx-cap/src/cap.pdx L307 cap_unpack):
@@ -27,7 +41,7 @@
 // FIXTURE module, not production code. Public entry points:
 //
 //   owner_fixtures_case_count() -> u64
-//     Returns OF_CASE_COUNT (7 row + 2 wire = 9).
+//     Returns OF_CASE_COUNT (7 row + 2 wire + 2 entry-gap = 11).
 //
 //   owner_fixtures_run(case_idx) -> u64
 //     Runs one case. Returns 0 on pass; OF_ERR_* + case_idx on fail.
@@ -66,13 +80,22 @@
 //    8   KIND_TTY (0x197) wire                            OC_ERR_NOT_USER
 //
 // =============================================================================
+// ENTRY-GAP CASES (ls.ENH-008, #28)
+// =============================================================================
+//
+//   idx  kernel_entry_ptr                                  expected outcome
+//   -------------------------------------------------------------------------
+//    9   _of_entry_zero (128 bytes, all 0)                 0 (honest gap)
+//   10   _of_entry_populated (128 bytes, every byte 0xFF)  0 (honest gap)
+//
+// =============================================================================
 // PAIDEIA-AS CONFORMANCE
 // =============================================================================
 //
 //   - Module name PascalCase basename (`OwnerFixtures`).
 //   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
 //   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates
-//     in this module: 7 (row-case cap), 9 (total case cap), 32 (row-
+//     in this module: 7 (row-case cap), 11 (total case cap), 32 (row-
 //     scratch buffer capacity). The OF_ERR_* sentinels and the
 //     OC_ERR_NOT_USER sentinel (0xFFFFEB30) are `mov rax, imm64`
 //     stores or compare via r10.
@@ -84,8 +107,10 @@
 // =============================================================================
 //
 // Called:
-//   owner_col_render_from_row     -- OwnerCol (src/owner_col.pdx)
-//   owner_col_render_from_wire    -- OwnerCol (src/owner_col.pdx)
+//   owner_col_render_from_row       -- OwnerCol (src/owner_col.pdx)
+//   owner_col_render_from_wire      -- OwnerCol (src/owner_col.pdx)
+//   owner_col_owner_row_from_entry  -- OwnerCol (src/owner_col.pdx)
+//                                      -- ls.ENH-008, #28
 
 module OwnerFixtures = structure {
 
@@ -99,13 +124,16 @@ module OwnerFixtures = structure {
   pub let OF_ERR_WIRE_BYTE        : u64 = 0xFFFFEBB0    // + case_idx
   pub let OF_ERR_WIRE_NOT_REFUSED : u64 = 0xFFFFEBC0    // TTY cap accepted
   pub let OF_ERR_BAD_CASE_IDX     : u64 = 0xFFFFEBCF
+  // + case_idx (9 or 10); owner_col_owner_row_from_entry returned non-zero.
+  pub let OF_ERR_ENTRY_GAP        : u64 = 0xFFFFEBD0
 
   // ==========================================================================
   // Case counts
   // ==========================================================================
   pub let OF_ROW_COUNT  : u64 = 7
   pub let OF_WIRE_COUNT : u64 = 2
-  pub let OF_CASE_COUNT : u64 = 9
+  pub let OF_GAP_COUNT  : u64 = 2
+  pub let OF_CASE_COUNT : u64 = 11
 
   // ==========================================================================
   // Row-case table (7 cases, 2 u64 lanes each = 14 u64).
@@ -184,6 +212,35 @@ module OwnerFixtures = structure {
   pub let _of_wire_u42_expected : [u64; 1] = [ 0x0000000032343A75 ]
 
   // ==========================================================================
+  // Entry-gap fixtures (ls.ENH-008, #28) -- 2 kernel-record-shaped
+  // inputs to owner_col_owner_row_from_entry, 16 u64 lanes each (128
+  // bytes, matching PdxFsDirEntry's frozen size exactly).
+  //
+  // _of_entry_zero: every lane 0 -- the "nothing here" shape a real
+  // EOD-adjacent or freshly-zeroed record might have.
+  //
+  // _of_entry_populated: every lane 0xFFFFFFFFFFFFFFFF -- every byte
+  // in the record is 0xFF, including bytes past where name_len (a
+  // real record's offset 16) would bound a name. This is the case
+  // that actually proves owner_col_owner_row_from_entry never
+  // dereferences kernel_entry_ptr: a function that accidentally read
+  // ANY byte of this record and treated it as (part of) a row id would
+  // return something other than 0 here, whereas it would still return
+  // 0 by coincidence against _of_entry_zero.
+  // ==========================================================================
+  pub let _of_entry_zero : [u64; 16] = [
+      0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0
+  ]
+
+  pub let _of_entry_populated : [u64; 16] = [
+      0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF,
+      0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF,
+      0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF,
+      0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF
+  ]
+
+  // ==========================================================================
   // .bss render scratch -- 32 bytes = 4 u64 lanes. Sized bigger than
   // the widest expected (7 bytes for "u:65535") so a corrupt oversized
   // render surfaces as a byte mismatch inside the fixed diff window
@@ -195,16 +252,16 @@ module OwnerFixtures = structure {
   // owner_fixtures_case_count() -> u64
   //
   // Signature: () -> u64 !{} @{}
-  //   RAX: OF_CASE_COUNT (9).
+  //   RAX: OF_CASE_COUNT (11).
   //
   // Leaf.
   // ==========================================================================
   pub let owner_fixtures_case_count : () -> u64 !{} @{} =
     fn () -> unsafe {
       effects: {}, capabilities: {},
-      justification: "ls.M4-002 (#12): return the total case count (7 row + 2 wire = 9) for a harness iterating via owner_fixtures_run. Leaf pure function. paideia-as conformance: no test mnemonic; no cmp. Labels prefixed ofcc_.",
+      justification: "ls.M4-002 (#12) + ls.ENH-008 (#28): return the total case count (7 row + 2 wire + 2 entry-gap = 11) for a harness iterating via owner_fixtures_run. Leaf pure function. paideia-as conformance: no test mnemonic; no cmp. Labels prefixed ofcc_.",
       block: {
-        mov rax, 9;                              // OF_CASE_COUNT
+        mov rax, 11;                             // OF_CASE_COUNT
         ret
       }
     }
@@ -497,33 +554,114 @@ module OwnerFixtures = structure {
     }
 
   // ==========================================================================
-  // owner_fixtures_run(case_idx) -> u64
+  // owner_fixtures_run_entry_gap(gap_idx) -> u64
   //
-  // 0..6 -> owner_fixtures_run_row(case_idx)
-  // 7..8 -> owner_fixtures_run_wire(case_idx - 7)
+  // Signature: (u64) -> u64 !{} @{}
+  //   RDI: gap_idx (0 or 1)
+  //     0 -> _of_entry_zero      (128 B, all 0)
+  //     1 -> _of_entry_populated (128 B, all 0xFF)
+  //   RAX: 0 on pass (owner_col_owner_row_from_entry returned 0);
+  //        OF_ERR_ENTRY_GAP + (gap_idx + 9) on fail;
+  //        OF_ERR_BAD_CASE_IDX on out-of-range gap_idx.
+  //
+  // ls.ENH-008 (#28): the trip-wire for OwnerCol's honest owner-from-
+  // entry gap (sub-matrix C in this module's own doc). Both fixture
+  // records are 128 bytes / 16 u64 lanes -- PdxFsDirEntry-shaped, one
+  // all-zero, one saturated with 0xFF -- and owner_col_owner_row_from_
+  // entry must return 0 against both, since the kernel record it reads
+  // from carries no owner field at HEAD regardless of what bytes are
+  // actually in it.
+  //
+  // Register plan (non-leaf; one callee-save push to survive the
+  // nested call):
+  //   rbx = gap_idx (survives across the call for the error-return math)
+  //
+  // Alignment: 1 push = 8 bytes; entry rsp % 16 == 8; 8 + 8 = 16;
+  // 16 % 16 == 0 at the owner_col_owner_row_from_entry call site.
   // ==========================================================================
-  pub let owner_fixtures_run : (u64) -> u64 !{mem} @{} =
-    fn (case_idx: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "ls.M4-002 (#12): dispatch case 0..8 to the row or wire sub-verifier. 0..6 -> run_row; 7..8 -> run_wire(case_idx - 7). One callee-save push (rbx=case_idx); entry rsp %16==8; 1 push = 8; total 16; aligned. Bounds check case_idx >= 9 -> OF_ERR_BAD_CASE_IDX. paideia-as conformance: no test; cmp against 7/9 fits imm32. Labels prefixed ofr_.",
+  pub let owner_fixtures_run_entry_gap : (u64) -> u64 !{} @{} =
+    fn (gap_idx: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-008 (#28): run one entry-gap trip-wire case. Bounds-check gap_idx < 2 (OF_GAP_COUNT) -> OF_ERR_BAD_CASE_IDX. gap_idx selects the fixture record (_of_entry_zero or _of_entry_populated) via LEA into rdi, then calls owner_col_owner_row_from_entry -- a leaf ({} @{}), so this function's own effects stay {} too. Any non-zero return -> OF_ERR_ENTRY_GAP (0xFFFFEBD0) + gap_idx + 9 (shifted to the harness's case_idx numbering, matching owner_fixtures_run_wire's own '+7' convention). One callee-save push (rbx=gap_idx, survives the call); entry rsp %16==8; 1 push=8; 8+8=16; aligned at the call site. paideia-as conformance: no test mnemonic; largest cmp immediate is 2 (OF_GAP_COUNT); the 0xFFFFEBxx sentinels are mov rax, imm64. Labels prefixed ofeg_.",
       block: {
         push rbx;
         mov rbx, rdi;
 
-        cmp rbx, 9;                              // OF_CASE_COUNT
+        cmp rbx, 2;                              // OF_GAP_COUNT
+        jae ofeg_bad_idx;
+
+        cmp rbx, 0;
+        jne ofeg_populated;
+
+      ofeg_zero:
+        lea rdi, [rip + _of_entry_zero];
+        jmp ofeg_call;
+
+      ofeg_populated:
+        lea rdi, [rip + _of_entry_populated];
+
+      ofeg_call:
+        call owner_col_owner_row_from_entry;
+        cmp rax, 0;
+        jne ofeg_fail;
+
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      ofeg_fail:
+        mov rax, 0xFFFFEBD0;                     // OF_ERR_ENTRY_GAP
+        add rax, rbx;
+        add rax, 9;                              // shift to harness case idx
+        pop rbx;
+        ret;
+
+      ofeg_bad_idx:
+        mov rax, 0xFFFFEBCF;                     // OF_ERR_BAD_CASE_IDX
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // owner_fixtures_run(case_idx) -> u64
+  //
+  // 0..6  -> owner_fixtures_run_row(case_idx)
+  // 7..8  -> owner_fixtures_run_wire(case_idx - 7)
+  // 9..10 -> owner_fixtures_run_entry_gap(case_idx - 9)
+  // ==========================================================================
+  pub let owner_fixtures_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.M4-002 (#12) + ls.ENH-008 (#28): dispatch case 0..10 to the row, wire, or entry-gap sub-verifier. 0..6 -> run_row; 7..8 -> run_wire(case_idx - 7); 9..10 -> run_entry_gap(case_idx - 9). One callee-save push (rbx=case_idx); entry rsp %16==8; 1 push = 8; total 16; aligned. Bounds check case_idx >= 11 -> OF_ERR_BAD_CASE_IDX. paideia-as conformance: no test; cmp against 7/9/11 fits imm32. Labels prefixed ofr_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+
+        cmp rbx, 11;                             // OF_CASE_COUNT
         jae ofr_bad_idx;
 
         cmp rbx, 7;                              // OF_ROW_COUNT
-        jae ofr_wire;
+        jae ofr_wire_or_gap;
 
         call owner_fixtures_run_row;
         pop rbx;
         ret;
 
-      ofr_wire:
+      ofr_wire_or_gap:
+        cmp rbx, 9;                              // OF_ROW_COUNT + OF_WIRE_COUNT
+        jae ofr_gap;
+
         mov rdi, rbx;
         sub rdi, 7;
         call owner_fixtures_run_wire;
+        pop rbx;
+        ret;
+
+      ofr_gap:
+        mov rdi, rbx;
+        sub rdi, 9;
+        call owner_fixtures_run_entry_gap;
         pop rbx;
         ret;
 
@@ -537,19 +675,19 @@ module OwnerFixtures = structure {
   // ==========================================================================
   // owner_fixtures_verify_all() -> u64
   //
-  // Walk case_idx 0..8; first non-zero return propagates.
+  // Walk case_idx 0..10; first non-zero return propagates.
   // ==========================================================================
   pub let owner_fixtures_verify_all : () -> u64 !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "ls.M4-002 (#12): fail-fast walk of all 9 cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp %16==8; 8+24=32; aligned. paideia-as: no test; cmp against 9 fits imm32. Labels prefixed ofva_.",
+      justification: "ls.M4-002 (#12) + ls.ENH-008 (#28): fail-fast walk of all 11 cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp %16==8; 8+24=32; aligned. paideia-as: no test; cmp against 11 fits imm32. Labels prefixed ofva_.",
       block: {
         push rbx;
         push r12;
         sub rsp, 8;
 
         xor rbx, rbx;
-        mov r12, 9;                              // OF_CASE_COUNT
+        mov r12, 11;                             // OF_CASE_COUNT
 
       ofva_loop:
         cmp rbx, r12;

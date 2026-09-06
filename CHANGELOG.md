@@ -13,6 +13,76 @@ Post-1.1.8 items on the Enhancement v1.x wave
 (`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
 exit-code map, wire body shape, `caps.decl`) changes in this section.
 
+## [1.1.9] -- 2026-09-06 -- centralize the owner-row honest gap (ls.ENH-008) <a id="119"></a>
+
+**1.1.9.** `ls -l` and the semantic-pipe wire record still report owner
+row 0 for every entry -- that has NOT changed, and could not change
+without a kernel-side schema bump (see "Kernel schema state" below).
+What changed is that the three places that previously hardcoded the
+literal 0 inline (`Runner::runner_ls`'s `-l` text path,
+`SemanticEmit::sem_emit_entry`'s wire path, `SemanticEmit::
+sem_emit_wire_compose`'s compose-only sibling) now all call one named,
+documented, fixture-pinned function instead:
+`OwnerCol::owner_col_owner_row_from_entry`.
+
+### Added
+
+- **`OwnerCol::owner_col_owner_row_from_entry`** (`src/owner_col.pdx`)
+  -- an honest pass-through accessor: `(kernel_entry_ptr: u64) -> u64`,
+  leaf, effects `{}`, always returns 0. Same discipline as
+  `SortOptions::sort_options_by_mtime` / `sort_options_by_size`
+  (`src/sort_options.pdx`, ls.ENH-016) for the identical reason -- the
+  kernel's `PdxFsDirEntry` record is frozen at inode@0, kind@8,
+  name_len@16, name@24 (128 bytes total; see paideia-os
+  `src/kernel/core/cap/pdxfs_dir_iter.pdx` SECTION 1, "FROZEN LAYOUT
+  (unchanged since R42-PREP-008)") and carries no owner/uid field
+  anywhere. `kernel_entry_ptr` is accepted as a real argument (not
+  folded away) so the future upgrade -- `PdxFsDirEntry` growing an
+  owner field, or a `sys_pdxfs_stat_by_inode` follow-up call -- is a
+  one-function-body edit rather than a three-call-site
+  search-and-replace.
+- **`tests/owner_fixtures.pdx`** sub-matrix C (cases 9-10, new) --
+  trip-wire goldens pinning the honest gap: an all-zero 128-byte
+  kernel record AND a densely-populated one (every byte `0xFF`,
+  including bytes past where `name_len` would bound a real name) both
+  must return 0 from `owner_col_owner_row_from_entry`. The populated
+  case is what proves the function truly never dereferences
+  `kernel_entry_ptr` rather than coincidentally landing on 0 against a
+  blank fixture. `OF_CASE_COUNT` moves 9 -> 11.
+
+### Changed
+
+- **`Runner::runner_ls`** (`src/runner.pdx`, `rn_ls_render_long`) --
+  the `-l` text path's owner_row write into `_rn_lf_extra_scratch`
+  now calls `owner_col_owner_row_from_entry(&_rn_entry_buf)` instead of
+  `xor rax, rax`. The call runs before `kind_mode_flags` is built into
+  `r10` (a caller-save register that would otherwise be live across
+  it), using only caller-save registers so none of the function's six
+  callee-save carriers are disturbed.
+- **`SemanticEmit::sem_emit_entry`** / **`sem_emit_wire_compose`**
+  (`src/semantic_emit.pdx`) -- the `owner_target_ptr` qword at wire
+  offset 136 is now `owner_col_owner_row_from_entry(kernel_entry_ptr)`
+  instead of an inline placeholder. Both call sites were already
+  aligned for a nested call (`sem_emit_wire_compose`'s `sub rsp, 8` pad
+  existed specifically "for parity with sem_emit_entry" against this
+  exact future); no alignment padding needed to change.
+
+### Kernel schema state (honest gap, unchanged)
+
+`PdxFsDirEntry` -- the 128-byte record `sys_pdxfs_dir_readnext`
+(sysno 72) fills and every `ls` consumer reads -- does NOT carry a
+uid/owner field. Confirmed directly against paideia-os
+`src/kernel/core/cap/pdxfs_dir_iter.pdx` SECTION 1 at HEAD: the frozen
+layout is `inode@0` (u64), `kind@8` (u64), `name_len@16` (u64),
+`name@24` (u8[104]) -- exactly 128 bytes, nothing else. Retiring the
+owner placeholder for real needs either (a) that record growing an
+owner field, or (b) a `sys_pdxfs_stat_by_inode` syscall `ls` can call
+per entry -- both are paideia-os kernel work, tracked as this issue's
+own "kernel" dependency. This release does the honest, available half:
+replacing three scattered inline literals with one reviewable,
+documented, trip-wired function, so that future kernel-side landing is
+a one-function-body edit instead of a three-file search-and-replace.
+
 ## [1.1.8] -- 2026-09-06 -- multi-path listing, `ls a b c` (ls.ENH-014) <a id="118"></a>
 
 **1.1.8.** `ls a b c` now iterates every positional path argument
