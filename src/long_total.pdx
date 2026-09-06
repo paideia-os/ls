@@ -1,0 +1,344 @@
+// src/long_total.pdx -- ls.ENH-021 (paideia-os/ls#39)
+//
+// LongTotal module: the `-l` long-format pre-listing "total <N>" line
+// computation and the PdxLsSummaryRecord@0.1 wire-record composer.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Two entry points:
+//
+//   long_total_compute(entries_ptr, count) -> u64
+//     POSIX `ls -l` prefixes the listing with a `total <N>` line, N
+//     being the sum of 512-byte block counts (ceil(size_bytes / 512))
+//     across every emitted entry. Returns that sum.
+//
+//   long_total_summary_record_compose(entry_count, dir_count,
+//                                      file_count, dst_ptr, dst_cap)
+//     -> bytes_written | LT_ERR_OVERFLOW
+//     Composes the fixed-shape 32-byte PdxLsSummaryRecord@0.1 wire
+//     record into a caller-owned buffer. See "RECORD SHAPE" below.
+//
+// =============================================================================
+// THE HONEST GAP -- long_total_compute is a pass-through identity
+// =============================================================================
+//
+// The kernel's PdxFsDirEntry record (inode@0, kind@8, name_len@16,
+// name@24; see Runner::RN_ENT_OFF_* in src/runner.pdx) carries NO
+// size field at HEAD. This is the exact same substrate gap
+// SortOptions::sort_options_by_mtime / sort_options_by_size already
+// document (src/sort_options.pdx) for `-t` / `-S`: there is no size
+// value anywhere in the 128-byte record for any entry to contribute
+// to the sum, so `ceil(size_bytes / 512)` is definitionally 0 for
+// every entry, and the sum of zero over any `count` of entries is 0.
+//
+// Rather than ship a real-looking summation loop over entries_ptr
+// that would always execute zero meaningful arithmetic (dead weight
+// with no behavioural difference from a constant, and a needless
+// place to hide a future bug), long_total_compute is the literal
+// reduction of that loop: it returns 0 unconditionally, touching
+// neither entries_ptr nor count. This mirrors sort_options_by_mtime /
+// sort_options_by_size's own "honest pass-through identity" shape
+// verbatim (see that module's doc for the precedent this follows).
+//
+// The trip-wire: tests/long_total_fixtures.pdx cases 0-2 call this
+// function with varying entries_ptr / count (including a non-null
+// entries_ptr and a non-zero count) and all three assert the SAME
+// 0 result. A future round that threads a real size field through
+// PdxFsDirEntry and starts computing a genuine per-entry block count
+// has to touch this golden, making the behaviour change visible in
+// review exactly like SortOptionsFixtures cases 6-9 do for the
+// mtime/size sort gap.
+//
+// Runner (src/runner.pdx) calls this with placeholder (0, 0) args at
+// the `-l` total-line site -- no entries are buffered ahead of the
+// streaming per-entry loop, and the result is invariant under those
+// inputs anyway (see above), so there is nothing to buffer for.
+//
+// =============================================================================
+// RECORD SHAPE -- PdxLsSummaryRecord@0.1 (32 bytes)
+// =============================================================================
+//
+// paideia-os/ls#39's own scope note lists these fields: magic "PLSS"
+// (0x53534C50), version 0x0100, entry_count (u32), dir_count (u32),
+// file_count (u32), total_blocks (u64), reserved (8 bytes) -- but
+// summed literally that is 4+4+4+4+4+8+8 = 36 bytes, four bytes over
+// the same note's own declared 32-byte total. This module resolves
+// the conflict by honoring the 32-byte total (the more load-bearing
+// constraint -- it is the wire contract a consumer's fixed-size read
+// depends on) and shrinking `reserved` to 4 bytes, the only field the
+// issue text does not tie to a specific consumer-visible value:
+//
+//   offset   size   field          encoding
+//   ------   ----   -----          --------
+//   0        4      magic          "PLSS" -- bytes 0x50,0x4C,0x53,0x53
+//                                  (little-endian u32 0x53534C50)
+//   4        4      version        little-endian u32 0x00000100
+//   8        4      entry_count    little-endian u32 (low 32 bits of
+//                                  the caller's u64 arg)
+//   12       4      dir_count      little-endian u32 (ditto)
+//   16       4      file_count     little-endian u32 (ditto)
+//   20       8      total_blocks   little-endian u64, from
+//                                  long_total_compute(0, 0) (always 0
+//                                  at HEAD -- see the honest-gap
+//                                  section above)
+//   28       4      reserved       zero-filled
+//
+// entry_count / dir_count / file_count are honest placeholders on the
+// CALLER side, not in this primitive: Runner does not currently
+// accumulate a live per-kind tally across a listing (LS_ST_ENTRIES /
+// LS_ST_HIDDEN in src/ls.pdx are aggregate run counters, not
+// kind-partitioned), so Runner's only call site passes (0, 0, 0)
+// today. This function itself encodes WHATEVER values it is given
+// correctly -- a future round that threads real per-kind counters
+// through Runner's loop body is a one-line call-site change here, not
+// a rewrite of the composer, matching this tree's established
+// "placeholder on the caller side, real primitive underneath" idiom
+// (see SemanticEmit's owner_row / mtime_ns placeholders for the same
+// shape).
+//
+// Byte-exact goldens for three count combinations (all-zero, small
+// mixed values, and a multi-byte pattern that pins little-endian byte
+// order across all four bytes of a u32 field) plus the dst_cap
+// overflow path live in tests/long_total_fixtures.pdx.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`LongTotal`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediate
+//     is 32 (LT_RECORD_SIZE). LT_ERR_OVERFLOW (0xFFFFFFFFFFFFFFFF)
+//     stages into rax as a `mov rax, imm64` return, never a compare
+//     operand.
+//   - No byte reads anywhere in this module (long_total_compute
+//     touches no memory at all; the composer only WRITES bytes, via
+//     `mov_b [dst], reg` -- the #1248 mitigation is for narrow LOADS
+//     only and does not apply to stores).
+//   - r11 is scratch for LEA-equivalent address-holder staging (base
+//     + fixed offset computed into r11, then `mov_b [r11], reg` /
+//     `mov [r11], reg`), matching SemanticEmit's own convention for
+//     composing a multi-field record into a flat buffer.
+//   - long_total_compute is a true LEAF: no push/pop, no rsp
+//     adjustment, no nested call.
+//   - long_total_summary_record_compose is non-leaf (one nested call
+//     to long_total_compute). Four callee-save pushes (r12 =
+//     entry_count, r13 = dir_count, r14 = file_count, r15 = dst_ptr)
+//     + `sub rsp, 8` pad = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48;
+//     48 % 16 == 0 at the long_total_compute call site. The dst_cap
+//     overflow gate runs BEFORE any push (cheap early-out; matches
+//     Columns::columns_layout's count==0 / count>MAX early returns).
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   long_total_compute -- this module (long_total_summary_record_compose's
+//                          one nested call)
+
+module LongTotal = structure {
+
+  // ==========================================================================
+  // Return codes / constants
+  // ==========================================================================
+  pub let LT_OK              : u64 = 0
+  pub let LT_ERR_OVERFLOW    : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let LT_RECORD_SIZE     : u64 = 32
+
+  // ==========================================================================
+  // long_total_compute(entries_ptr, count) -> u64
+  //
+  // Signature: (u64, u64) -> u64 !{} @{}
+  //   RDI: entries_ptr (unused -- see module doc's honest-gap section)
+  //   RSI: count       (unused)
+  //   RAX: total_blocks -- always 0 at HEAD.
+  //
+  // Leaf; touches no memory at all (never dereferences entries_ptr).
+  // ==========================================================================
+  pub let long_total_compute : (u64, u64) -> u64 !{} @{} =
+    fn (entries_ptr: u64) (count: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-021 (#39): honest pass-through identity -- PdxFsDirEntry (inode@0, kind@8, name_len@16, name@24; see Runner::RN_ENT_OFF_* in src/runner.pdx) has no size field at HEAD, so `ceil(size_bytes/512)` is 0 for every entry and the sum over any `count` is 0 regardless of what entries_ptr points at. Identical rationale and shape to SortOptions::sort_options_by_mtime / sort_options_by_size (src/sort_options.pdx): rather than a summation loop whose body always contributes zero, this is the literal reduction of that loop. Leaf, effects {} because no memory is read or written -- entries_ptr is never dereferenced, count is never inspected. paideia-as conformance: no test mnemonic; no cmp; no branches. Labels: none needed.",
+      block: {
+        xor rax, rax;                       // total_blocks = 0 (honest gap)
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // long_total_summary_record_compose(entry_count, dir_count,
+  //                                    file_count, dst_ptr, dst_cap)
+  //   -> bytes_written | LT_ERR_OVERFLOW
+  //
+  // Signature: (u64, u64, u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI: entry_count  -- low 32 bits encoded LE at dst[8..12)
+  //   RSI: dir_count    -- low 32 bits encoded LE at dst[12..16)
+  //   RDX: file_count   -- low 32 bits encoded LE at dst[16..20)
+  //   RCX: dst_ptr      -- caller-owned destination buffer
+  //   R8:  dst_cap      -- destination capacity; must be >= 32
+  //   RAX (output): LT_RECORD_SIZE (32) on success; LT_ERR_OVERFLOW
+  //                 (dst untouched) when dst_cap < 32.
+  //
+  // See the module doc's "RECORD SHAPE" section for the full 32-byte
+  // layout. total_blocks (offset 20..28) comes from
+  // long_total_compute(0, 0) -- placeholder args, since no entries
+  // array is threaded through this call site either (see that
+  // function's own doc for why the result is invariant under its
+  // inputs regardless).
+  //
+  // Register plan (non-leaf; overflow gate runs before any push):
+  //   r12 = entry_count (survives the long_total_compute call)
+  //   r13 = dir_count   (survives)
+  //   r14 = file_count  (survives)
+  //   r15 = dst_ptr     (survives; base for every field store)
+  //   rax = long_total_compute's return (total_blocks); consumed
+  //         immediately at the total_blocks store site before any
+  //         further call could clobber it (there is none).
+  //   r11 = address-holder scratch: r15 + fixed_offset, computed
+  //         fresh before each `mov_b` / `mov` store (mov_b addressing
+  //         is [reg]-only in this dialect).
+  //
+  // Alignment: 4 pushes (r12..r15) = 32 bytes + `sub rsp, 8` pad = 40;
+  // entry rsp % 16 == 8; 8 + 40 = 48; 48 % 16 == 0 at the
+  // long_total_compute call site. Matched `add rsp, 8` + 4 pops
+  // before every ret past the overflow gate.
+  // ==========================================================================
+  pub let long_total_summary_record_compose
+    : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (entry_count: u64) (dir_count: u64) (file_count: u64)
+       (dst_ptr: u64) (dst_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-021 (#39): compose the fixed-shape 32-byte PdxLsSummaryRecord@0.1 wire record into dst_ptr. Overflow gate (cmp r8, 32; jb ltsrc_overflow -- unsigned compare, matching Render::render_dec_u64 / Columns::columns_layout's own dst_cap-bound convention) runs before any push -- a cheap early-out mirroring Columns::columns_layout's own pre-push bound checks -- and leaves dst untouched on refusal (LT_ERR_OVERFLOW, 0xFFFFFFFFFFFFFFFF). Four callee-save pushes (r12=entry_count, r13=dir_count, r14=file_count, r15=dst_ptr) + sub rsp,8 pad = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48; 48 % 16 == 0 at the one nested call (long_total_compute(0, 0), whose honest-gap identity always returns total_blocks = 0 at HEAD -- see that function's own doc). Field encoding: magic 'PLSS' and version 0x0100 are compile-time-constant little-endian u32s written as four individual mov_b byte stores each (mov_b truncates its source register to the low byte automatically, per Render::render_byte_write's own precedent -- no explicit `and reg, 0xFF` mask is needed before any store here); entry_count/dir_count/file_count are runtime u64 args, each LE-encoded via one direct low-byte store plus three shr-then-store steps (shr rax,8 / 16 / 24) reading from the callee-save-preserved r12/r13/r14 copies. total_blocks (offset 20, 8 bytes) is a single full-width `mov [r11], rax` qword store since rax still holds long_total_compute's return value at that point (nothing between the call and this store touches rax). reserved (offset 28..32) is four explicit zero mov_b stores. Every store address is computed fresh into r11 as r15 + fixed_offset immediately before the store (mov_b addressing is [reg]-only in this dialect, matching SemanticEmit::sem_emit_entry / sem_emit_wire_compose's own per-field addressing convention). paideia-as conformance: no test mnemonic; largest cmp immediate 32 (LT_RECORD_SIZE); LT_ERR_OVERFLOW is a mov rax, imm64 return, never a compare operand; no byte reads (write-only composer); r11 is the sole address-holder scratch. Effects {mem} only -- no capability invoked, matching long_total_compute's {} subset. Labels prefixed ltsrc_.",
+      block: {
+        // ---- overflow gate (before any push) --------------------------
+        cmp r8, 32;                          // LT_RECORD_SIZE
+        jb  ltsrc_overflow;
+
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // entry_count
+        mov r13, rsi;                        // dir_count
+        mov r14, rdx;                        // file_count
+        mov r15, rcx;                        // dst_ptr
+
+        // ---- total_blocks (honest-gap identity; placeholder args) ----
+        //
+        // Stored FIRST, immediately while rax still holds
+        // long_total_compute's return value -- every field write below
+        // this point reuses rax as scratch, so total_blocks would be
+        // clobbered if its store were deferred to its offset-20
+        // position in the byte layout. Store order does not affect the
+        // record's byte layout (offsets are computed independently via
+        // r15 + fixed_offset every time), only the layout comments
+        // below stay in offset order for readability.
+        xor rdi, rdi;
+        xor rsi, rsi;
+        call long_total_compute;
+        mov r11, r15; add r11, 20;           // offset 20..28: total_blocks
+        mov [r11], rax;                      // rax = total_blocks (0 at HEAD)
+
+        // ---- offset 0..4: magic "PLSS" (0x53534C50 LE) ----------------
+        mov r11, r15;
+        mov rax, 0x50;                       // 'P'
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 1;
+        mov rax, 0x4C;                       // 'L'
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 2;
+        mov rax, 0x53;                       // 'S'
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 3;
+        mov rax, 0x53;                       // 'S'
+        mov_b [r11], rax;
+
+        // ---- offset 4..8: version 0x00000100 LE ------------------------
+        mov r11, r15; add r11, 4;
+        xor rax, rax;
+        mov_b [r11], rax;                    // byte0 = 0x00
+        mov r11, r15; add r11, 5;
+        mov rax, 1;
+        mov_b [r11], rax;                    // byte1 = 0x01
+        mov r11, r15; add r11, 6;
+        xor rax, rax;
+        mov_b [r11], rax;                    // byte2 = 0x00
+        mov r11, r15; add r11, 7;
+        mov_b [r11], rax;                    // byte3 = 0x00
+
+        // ---- offset 8..12: entry_count (u32 LE from r12) ---------------
+        mov r11, r15; add r11, 8;
+        mov rax, r12;
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 9;
+        mov rax, r12; shr rax, 8;
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 10;
+        mov rax, r12; shr rax, 16;
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 11;
+        mov rax, r12; shr rax, 24;
+        mov_b [r11], rax;
+
+        // ---- offset 12..16: dir_count (u32 LE from r13) ----------------
+        mov r11, r15; add r11, 12;
+        mov rax, r13;
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 13;
+        mov rax, r13; shr rax, 8;
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 14;
+        mov rax, r13; shr rax, 16;
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 15;
+        mov rax, r13; shr rax, 24;
+        mov_b [r11], rax;
+
+        // ---- offset 16..20: file_count (u32 LE from r14) ---------------
+        mov r11, r15; add r11, 16;
+        mov rax, r14;
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 17;
+        mov rax, r14; shr rax, 8;
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 18;
+        mov rax, r14; shr rax, 16;
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 19;
+        mov rax, r14; shr rax, 24;
+        mov_b [r11], rax;
+
+        // (offset 20..28, total_blocks, was already stored right after
+        // the long_total_compute call above -- see that block's own
+        // comment for why the store could not be deferred to here.)
+
+        // ---- offset 28..32: reserved (zero-filled) ----------------------
+        mov r11, r15; add r11, 28;
+        xor rax, rax;
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 29;
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 30;
+        mov_b [r11], rax;
+        mov r11, r15; add r11, 31;
+        mov_b [r11], rax;
+
+        mov rax, 32;                         // LT_RECORD_SIZE
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      ltsrc_overflow:
+        mov rax, 0xFFFFFFFFFFFFFFFF;         // LT_ERR_OVERFLOW
+        ret
+      }
+    }
+}

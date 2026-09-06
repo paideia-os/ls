@@ -9,9 +9,69 @@ and stored under `pkgs.paideia-os/ls/<version>/`.
 
 ## [Unreleased]
 
-Post-1.1.6 items on the Enhancement v1.x wave
+Post-1.1.7 items on the Enhancement v1.x wave
 (`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
 exit-code map, wire body shape, `caps.decl`) changes in this section.
+
+## [1.1.7] -- 2026-09-06 -- `-l` total line + `PdxLsSummaryRecord@0.1` (ls.ENH-021) <a id="117"></a>
+
+**1.1.7.** `ls -l` now prefixes its listing with a POSIX-style
+`total <N>` line, and `ls -l --json` additionally appends one
+fixed-shape 32-byte `PdxLsSummaryRecord@0.1` wire record after the
+listing. Both additions land at single fall-through points in
+`Runner::runner_ls` -- no change to the per-entry dispatch or either
+buffered-vs-streaming path.
+
+### Added
+
+- **`LongTotal::long_total_compute`** (`src/long_total.pdx`, new
+  module) -- computes the `-l` total-line value (sum of
+  `ceil(size_bytes / 512)` across every emitted entry). Honest
+  pass-through identity, same shape and rationale as
+  `SortOptions::sort_options_by_mtime` / `sort_options_by_size`: the
+  kernel's `PdxFsDirEntry` record carries no size field at HEAD, so
+  the result is always 0 regardless of `entries_ptr` / `count`. Pinned
+  by `tests/long_total_fixtures.pdx` cases 0-2 (including a non-null
+  `entries_ptr` and a non-zero count) as the trip-wire for this gap.
+- **`LongTotal::long_total_summary_record_compose`**
+  (`src/long_total.pdx`) -- composes the fixed 32-byte
+  `PdxLsSummaryRecord@0.1` wire record (magic `"PLSS"`, version
+  `0x0100`, `entry_count`/`dir_count`/`file_count` as little-endian
+  u32s, `total_blocks` as a little-endian u64 from
+  `long_total_compute`, 4 bytes reserved) into a caller-owned buffer,
+  refusing with `LT_ERR_OVERFLOW` when `dst_cap < 32`. Byte-exact
+  goldens (including a multi-byte pattern that pins little-endian byte
+  order) plus the overflow path live in
+  `tests/long_total_fixtures.pdx` cases 3-6.
+- **`Runner::runner_ls`** -- at `rn_ls_pre_emit`, when `-l` is set,
+  composes and writes `"total <N>\n"` via the existing `tty_write`
+  trampoline before the read loop starts. At `rn_ls_success`, when
+  both `-l` and `--json` are set, composes and writes the
+  `PdxLsSummaryRecord@0.1` record verbatim through the same trampoline
+  -- reusing "the existing `--json` path" per the issue's own scope
+  note, rather than standing up a second semantic-pipe endpoint bind
+  ahead of the paideia-os/ls#30 schema-registry migration.
+- **`tests/long_total_fixtures.pdx`** (new, 7 cases) -- 3 honest-gap
+  trip-wire cases for `long_total_compute`, 3 byte-exact record
+  goldens and 1 overflow case for
+  `long_total_summary_record_compose`.
+
+### Known gaps (tracked, not regressions)
+
+- `total <N>` is always `total 0`: no kernel `PdxFsDirEntry` size
+  field exists to sum, the same substrate gap `-t`/`-S` already
+  document (ls.ENH-016, #34).
+- `entry_count`/`dir_count`/`file_count` in the summary record ship as
+  0 -- Runner does not accumulate a live per-kind tally across a
+  listing today. The composer itself is not a stub: it encodes
+  whatever values it is given correctly, so wiring real counters
+  through is a one-line call-site change in a future round.
+- The summary record travels over the same `KIND_TTY(write)` channel
+  as `--json`'s per-entry lines, not a dedicated semantic-pipe
+  `Binding::bind` slot -- `paideia-os/ls#30` (schema-registry
+  migration off the placeholder hash) is still the blocker for a real
+  second endpoint; `SemanticEmit::_se_summary_schema_name`'s deferred
+  literal and comment are left untouched by this landing.
 
 ## [1.1.6] -- 2026-09-06 -- multi-column default output (ls.ENH-018) <a id="116"></a>
 

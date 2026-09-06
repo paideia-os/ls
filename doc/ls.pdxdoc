@@ -43,9 +43,17 @@ real argument-to-cap correspondence is tracked separately]
 !section flags
 
   -l              Long format: kind mode owner size mtime name.
-                  [live at 1.1.0 -- see note below on the mode/size/
-                  mtime placeholder columns until the kernel readnext
-                  record grows the missing fields]
+                  Prefixed with a POSIX-style `total <N>` line before
+                  the first entry. [live at 1.1.0 -- see note below on
+                  the mode/size/mtime placeholder columns until the
+                  kernel readnext record grows the missing fields.
+                  `total` line live at 1.1.7 (ls.ENH-021): `<N>` is
+                  the sum of 512-byte block counts across the
+                  emitted entries, always `0` today for the same
+                  reason -- no size field exists to sum. `-l --json`
+                  additionally appends one 32-byte
+                  `PdxLsSummaryRecord@0.1` wire record after the
+                  listing; see the semantic pipe section below]
   -a              Include dot-prefix (hidden) entries. [live]
   -R              Recursive: after the directory listing, print one
                   "<path>/<name>:" header per subdirectory found
@@ -145,6 +153,22 @@ Send::send_record`; the ls compose path itself produces bytes
 0..143 only. Golden for the compose byte range lives in
 `tests/schema_golden.pdx`.
 
+!section summary record -- PdxLsSummaryRecord@0.1
+
+[live at 1.1.7, ls.ENH-021] `-l --json` appends one fixed 32-byte
+record after the listing: magic `"PLSS"`, version `0x0100`,
+`entry_count`/`dir_count`/`file_count` as little-endian `u32`s,
+`total_blocks` as a little-endian `u64`, 4 bytes reserved. Unlike
+`PdxFsDirEntry@0.1`, this record does NOT travel over a dedicated
+`libpdx-semantic-pipe` `Binding::bind` slot yet -- it is written
+verbatim through the same `KIND_TTY(write)` channel `--json`'s
+per-entry lines already use, an interim shape pending the
+paideia-os/ls#30 schema-registry migration. `entry_count` /
+`dir_count` / `file_count` ship as `0`: Runner does not accumulate a
+live per-kind tally across a listing yet. See
+`LongTotal::long_total_summary_record_compose` in
+`src/long_total.pdx`.
+
 !section audit
 
 `DirListRecord` opened via `libpdx-audit` BEFORE the first
@@ -216,10 +240,17 @@ semantic_emit.pdx
 
 !example
 $ ls -l
+total 0
 - 644 u:0 12103 ns:1755808140000000000 argv_surface.pdx
 - 644 u:0 22163 ns:1755841640000000000 runner.pdx
 - 644 u:0 27731 ns:1755870660000000000 semantic_emit.pdx
 !end-example
+
+The `total <N>` line always reads `total 0` today: `<N>` is the sum
+of `ceil(size_bytes / 512)` across the emitted entries, and the
+kernel's `PdxFsDirEntry` record carries no size field to sum (the
+same substrate gap `-t`/`-S` document for their own sort keys). See
+`LongTotal::long_total_compute` in `src/long_total.pdx`.
 
 Columns are `kind mode owner size mtime name`, single-space
 separated with no column padding. `kind` is one letter from the

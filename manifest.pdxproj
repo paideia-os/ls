@@ -20,7 +20,7 @@
 # a new PAIDEIA_AS_VER KV record.
 
 name        = ls
-version     = 1.1.6
+version     = 1.1.7
 kind        = tool
 entry       = Dispatch::ls_dispatch
 output      = build-out/ls
@@ -41,6 +41,8 @@ caps_decl   = caps.decl
 #   M3-002 lands: (semantic_emit extended in place -- 144-byte record).
 #   M3-003 lands: audit_shim (DirListRecord begin/commit around Runner body).
 #   M4-003 lands: exit_map (0xFFFFEBxx -> I4 exit-code vocabulary).
+#   ls.ENH-021 (#39) lands: long_total (-l "total N" line +
+#     PdxLsSummaryRecord@0.1 composer).
 sources:
   - src/ls.pdx                    # M1-001 KIND mirrors + error band + stats
   - src/argv_surface.pdx          # M1-002 flag-bit recogniser
@@ -64,6 +66,7 @@ sources:
   - src/recurse_header.pdx        # 1.1.4 ENH-017 (#35) -R "<path>/<name>:" header composer
   - src/sort_options.pdx          # 1.1.5 ENH-016 (#34) -t/-S/-r sort comparators
   - src/columns.pdx               # 1.1.6 ENH-018 (#36) multi-column fitted layout
+  - src/long_total.pdx            # 1.1.7 ENH-021 (#39) -l total line + PdxLsSummaryRecord@0.1
 
 # --- Library dependencies -----------------------------------------------
 # ls consumes four libraries at 1.0.1+ (ls.ENH-013, #22: the phantom
@@ -99,6 +102,7 @@ tests:
   - tests/recurse_header_fixtures.pdx # 1.1.4 ENH-017 (#35) 5 recurse_header_compose cases
   - tests/sort_options_fixtures.pdx   # 1.1.5 ENH-016 (#34) 10 sort_options_by_{name,mtime,size} cases
   - tests/multicol_fixtures.pdx       # 1.1.6 ENH-018 (#36) 5 columns_layout cases
+  - tests/long_total_fixtures.pdx     # 1.1.7 ENH-021 (#39) 7 long_total_compute / long_total_summary_record_compose cases
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49/R50 tool observes and every M1

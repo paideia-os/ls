@@ -1,0 +1,439 @@
+// tests/long_total_fixtures.pdx -- ls.ENH-021 (paideia-os/ls#39)
+//
+// LongTotalFixtures module: byte-exact goldens for
+// LongTotal::long_total_compute and
+// LongTotal::long_total_summary_record_compose (src/long_total.pdx).
+// Follows the M4 fixture convention documented in tests/README.md and
+// the "one fixture module dispatches across every SUT function its
+// source file exports, via a per-case `target` selector" precedent
+// SortOptionsFixtures set (tests/sort_options_fixtures.pdx).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Seven cases, dispatched by a per-case `target` selector (0 =
+// long_total_compute, 1 = long_total_summary_record_compose):
+//
+//   idx  target   inputs                                        expected
+//   -----------------------------------------------------------------------
+//    0   compute  entries_ptr=0,               count=0          0
+//    1   compute  entries_ptr=&_ltf_dummy_ent,  count=5          0
+//    2   compute  entries_ptr=&_ltf_dummy_ent,  count=64         0
+//    3   compose  entry=0, dir=0, file=0,       dst_cap=32       32, golden A
+//    4   compose  entry=3, dir=1, file=2,       dst_cap=32       32, golden B
+//    5   compose  entry=0x01020304, dir=0, file=0, dst_cap=32    32, golden C
+//    6   compose  entry=0, dir=0, file=0,       dst_cap=31       LT_ERR_OVERFLOW
+//
+// Cases 0-2 are the trip-wire for LongTotal's documented honest gap:
+// even with a non-null entries_ptr and a non-zero count (5, then the
+// RN_GDF_MAX_ENTRIES-adjacent boundary 64), the result stays 0,
+// because the kernel's PdxFsDirEntry record carries no size field at
+// HEAD (see src/long_total.pdx's own module doc for the full
+// rationale). A future round that threads a real size field through
+// PdxFsDirEntry and starts computing a genuine block-count sum has to
+// touch this golden, making the behaviour change visible in review --
+// exactly the same discipline SortOptionsFixtures cases 6-9 pin for
+// the sibling mtime/size sort gap.
+//
+// Cases 3-5 pin the PdxLsSummaryRecord@0.1 byte layout: case 3 is the
+// all-zero baseline (only the constant magic/version bytes are
+// non-zero); case 4 exercises small mixed count values across all
+// three u32 count fields; case 5 (`entry_count = 0x01020304`) pins
+// little-endian byte order across all four bytes of a single u32
+// field -- a byte-swapped encoder would produce a completely
+// different (and wrong) golden here.
+//
+// Case 6 pins the dst_cap overflow sentinel (dst_cap = 31, one byte
+// short of LT_RECORD_SIZE = 32): the compose call must return
+// LT_ERR_OVERFLOW without a byte-diff (mirrors
+// JsonLineFixtures case 6's own "sentinel return, byte-diff skipped"
+// shape for JsonLine::json_line_render's overflow path).
+//
+// =============================================================================
+// RECORD SHAPE (mirror src/long_total.pdx's own doc)
+// =============================================================================
+//
+// 32 bytes / 4 u64 lanes, packed little-endian per this repo's
+// existing table convention (see SortOptionsFixtures's own
+// "packed little-endian lane" note):
+//
+//   lane 0 (bytes 0..8)   = magic "PLSS" (bytes 0..4) + version
+//                           0x00000100 LE (bytes 4..8)
+//                         = 0x0000010053534C50
+//   lane 1 (bytes 8..16)  = entry_count LE (bytes 8..12) +
+//                           dir_count LE (bytes 12..16)
+//   lane 2 (bytes 16..24) = file_count LE (bytes 16..20) +
+//                           total_blocks low 4 bytes (bytes 20..24)
+//   lane 3 (bytes 24..32) = total_blocks high 4 bytes (bytes 24..28)
+//                           + reserved (bytes 28..32, always 0)
+//
+// total_blocks is always 0 at HEAD (LongTotal's own honest-gap
+// identity), so lane 2's high half and all of lane 3 are 0 in every
+// golden below.
+//
+// =============================================================================
+// PUBLIC ENTRY POINTS
+// =============================================================================
+//
+//   long_total_fixtures_case_count() -> u64
+//   long_total_fixtures_run(case_idx) -> u64      -- 0 pass; err+idx on fail
+//   long_total_fixtures_verify_all() -> u64       -- fail-fast walk
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`LongTotalFixtures`).
+//   - No `test` mnemonic; every zero-check / bound-check uses `cmp
+//     reg, 0` or `cmp reg, reg`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates:
+//     7 (case cap), 4 (byte-diff loop bound). The LTF_ERR_* sentinels
+//     are `mov rax, imm64` stores; LT_ERR_OVERFLOW (compared against
+//     the compose call's own return) is loaded into a register first
+//     since it does not fit a signed imm32 compare.
+//   - No byte reads/writes in the harness itself -- every table
+//     element and every diffed record slot is a full u64 lane, loaded
+//     via `[base + index * 8]`.
+//   - r8 / r9 / r10 / r11 are scratch. Labels prefixed ltfr_.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called:
+//   long_total_compute                    -- LongTotal (src/long_total.pdx)
+//   long_total_summary_record_compose     -- LongTotal (src/long_total.pdx)
+
+module LongTotalFixtures = structure {
+
+  // ==========================================================================
+  // Return codes
+  // ==========================================================================
+  pub let LTF_OK                    : u64 = 0
+  pub let LTF_ERR_COMPUTE_MISMATCH  : u64 = 0xFFFFEB61    // + case_idx (0..2)
+  pub let LTF_ERR_RECORD_MISMATCH   : u64 = 0xFFFFEB62    // + case_idx (3..6)
+  pub let LTF_ERR_BAD_CASE_IDX      : u64 = 0xFFFFEB6F
+
+  pub let LTF_CASE_COUNT            : u64 = 7
+
+  // ==========================================================================
+  // Per-case metadata.
+  //
+  // _ltf_target : 0 = long_total_compute, 1 = long_total_summary_
+  //               record_compose.
+  // _ltf_arg_a  : compute -> entries_ptr selector (0 = null,
+  //               1 = &_ltf_dummy_entries); compose -> entry_count.
+  // _ltf_arg_b  : compute -> count; compose -> dir_count.
+  // _ltf_arg_c  : unused (0) for compute; compose -> file_count.
+  // _ltf_dst_cap: unused (0) for compute; compose -> dst_cap.
+  // _ltf_expect_ret : expected RAX from the dispatched call.
+  // _ltf_golden_lane: lane offset into _ltf_golden_all (compose,
+  //                   has-golden cases only).
+  // _ltf_has_golden : 1 -> run the 4-lane byte-diff after the return
+  //                   check; 0 -> skip (compute cases and the
+  //                   overflow case).
+  // ==========================================================================
+  pub let _ltf_target : [u64; 7] = [
+      0, 0, 0,     // cases 0-2: long_total_compute
+      1, 1, 1, 1   // cases 3-6: long_total_summary_record_compose
+  ]
+
+  pub let _ltf_arg_a : [u64; 7] = [
+      0, 1, 1,                  // compute: entries_ptr selector
+      0, 3, 0x01020304, 0       // compose: entry_count
+  ]
+
+  pub let _ltf_arg_b : [u64; 7] = [
+      0, 5, 64,                 // compute: count
+      0, 1, 0, 0                // compose: dir_count
+  ]
+
+  pub let _ltf_arg_c : [u64; 7] = [
+      0, 0, 0,                  // unused for compute
+      0, 2, 0, 0                // compose: file_count
+  ]
+
+  pub let _ltf_dst_cap : [u64; 7] = [
+      0, 0, 0,                  // unused for compute
+      32, 32, 32, 31            // compose: dst_cap (case 6 = overflow)
+  ]
+
+  pub let _ltf_expect_ret : [u64; 7] = [
+      0, 0, 0,                              // compute: always 0
+      32, 32, 32, 0xFFFFFFFFFFFFFFFF        // compose: LT_RECORD_SIZE or
+                                             // LT_ERR_OVERFLOW (case 6)
+  ]
+
+  pub let _ltf_golden_lane : [u64; 7] = [
+      0, 0, 0,     // unused for compute
+      0, 4, 8, 0   // compose: lane offset into _ltf_golden_all
+  ]
+
+  pub let _ltf_has_golden : [u64; 7] = [
+      0, 0, 0,     // compute: no golden to diff
+      1, 1, 1, 0   // compose: cases 3-5 diff; case 6 (overflow) does not
+  ]
+
+  // ==========================================================================
+  // Golden PdxLsSummaryRecord@0.1 bytes for cases 3-5, 4 lanes each
+  // (12 lanes total). See the file header's "RECORD SHAPE" section for
+  // the per-lane byte packing.
+  // ==========================================================================
+  pub let _ltf_golden_all : [u64; 12] = [
+      // case 3 (lanes 0..4): entry=0, dir=0, file=0, total_blocks=0
+      0x0000010053534C50, 0, 0, 0,
+
+      // case 4 (lanes 4..8): entry=3, dir=1, file=2, total_blocks=0
+      0x0000010053534C50, 0x0000000100000003, 0x0000000000000002, 0,
+
+      // case 5 (lanes 8..12): entry=0x01020304, dir=0, file=0,
+      // total_blocks=0 -- pins little-endian byte order across all
+      // four bytes of the entry_count field.
+      0x0000010053534C50, 0x0000000001020304, 0, 0
+  ]
+
+  // ==========================================================================
+  // .bss scratch.
+  //
+  // _ltf_dummy_entries -- a valid, never-dereferenced 128-byte buffer
+  // used as the "non-null entries_ptr" argument for compute cases 1-2
+  // (long_total_compute never touches this memory -- see its own doc
+  // -- but a real address, rather than an arbitrary constant, is used
+  // anyway so an accidental future dereference reads zeroed .bss
+  // instead of faulting).
+  //
+  // _ltf_scratch -- 32-byte (4 u64 lane) destination for
+  // long_total_summary_record_compose.
+  // ==========================================================================
+  pub let mut _ltf_dummy_entries : [u64; 16] = uninit @align(8)
+  pub let mut _ltf_scratch       : [u64; 4]  = uninit @align(8)
+
+  // ==========================================================================
+  // long_total_fixtures_case_count() -> u64
+  //
+  // Leaf.
+  // ==========================================================================
+  pub let long_total_fixtures_case_count : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "ls.ENH-021 (#39): return LTF_CASE_COUNT (7) for a harness iterating via long_total_fixtures_run. Leaf pure function. paideia-as conformance: no test mnemonic; no cmp. Labels prefixed ltfcc_.",
+      block: {
+        mov rax, 7;                              // LTF_CASE_COUNT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // long_total_fixtures_run(case_idx) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI: case_idx (0..6)
+  //   RAX: 0 on pass; LTF_ERR_COMPUTE_MISMATCH + case_idx,
+  //        LTF_ERR_RECORD_MISMATCH + case_idx, or
+  //        LTF_ERR_BAD_CASE_IDX on out-of-range / mismatch.
+  //
+  // Sequence:
+  //   (1) Bounds check case_idx < 7.
+  //   (2) Load target (r12), arg_a (r13), arg_b (r14), arg_c (r15),
+  //       dst_cap (rbp) from the five per-case tables.
+  //   (3) target == 0 -> long_total_compute(entries_ptr, count) where
+  //       entries_ptr is 0 or &_ltf_dummy_entries per arg_a.
+  //       target == 1 -> long_total_summary_record_compose(arg_a,
+  //       arg_b, arg_c, &_ltf_scratch, dst_cap).
+  //   (4) Compare the call's RAX against _ltf_expect_ret[case_idx];
+  //       mismatch -> the target-appropriate sentinel + case_idx.
+  //   (5) If target == 1 and _ltf_has_golden[case_idx] != 0, word-diff
+  //       _ltf_scratch[0..4) against _ltf_golden_all at the case's
+  //       lane offset; first mismatch -> LTF_ERR_RECORD_MISMATCH +
+  //       case_idx.
+  //
+  // Register plan (six callee-save pushes, mirroring
+  // SortOptionsFixtures::sort_options_fixtures_run's own widest-case
+  // register plan):
+  //   rbx = case_idx (survives; also the sentinel-offset addend)
+  //   r12 = target (survives; the dispatch + fail-sentinel selector)
+  //   r13 = arg_a (survives)
+  //   r14 = arg_b (survives)
+  //   r15 = arg_c (survives)
+  //   rbp = dst_cap (survives)
+  //
+  // Alignment: 6 pushes = 48 bytes + sub rsp,8 pad = 56; entry
+  // rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at both call sites.
+  // Matched add rsp,8 + 6 pops via the shared ltfr_done epilogue.
+  // ==========================================================================
+  pub let long_total_fixtures_run : (u64) -> u64 !{mem} @{} =
+    fn (case_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-021 (#39): run one LongTotal boundary/behaviour case, dispatching on target (0 = long_total_compute, 1 = long_total_summary_record_compose). Bounds-check case_idx < 7 -> LTF_ERR_BAD_CASE_IDX. Loads target/arg_a/arg_b/arg_c/dst_cap from five per-case tables at index rbx. Compute dispatch: arg_a selects entries_ptr (0 -> null, else -> &_ltf_dummy_entries via LEA), arg_b is count. Compose dispatch: arg_a/arg_b/arg_c map directly to entry_count/dir_count/file_count, dst_ptr is fixed at &_ltf_scratch, dst_cap comes from rbp. Both branches funnel into the shared ltfr_check_ret return-value check (cmp rax against _ltf_expect_ret[case_idx], loaded fresh via r10) so the failure-sentinel selection (r12 == 0 -> LTF_ERR_COMPUTE_MISMATCH, else LTF_ERR_RECORD_MISMATCH) is the only target-conditional logic after dispatch. The golden byte-diff (ltfr_diff_loop) runs only when target == 1 AND _ltf_has_golden[case_idx] != 0 -- compute cases have no wire record to diff, and case 6's overflow return has no golden (the destination is documented as untouched on refusal, but this harness does not additionally assert that -- it is out of scope for the record-shape pin this fixture exists to provide). Six callee-save pushes (rbx=case_idx, r12=target, r13=arg_a, r14=arg_b, r15=arg_c, rbp=dst_cap) + sub rsp,8 pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at both the long_total_compute and long_total_summary_record_compose call sites. Matched add rsp,8 + 6 pops via the shared ltfr_done epilogue (single exit point, unlike SortOptionsFixtures's per-branch epilogues -- both are valid paideia-as shapes; this one mirrors Runner::runner_ls's own shared rn_ls_epilogue idiom). paideia-as: no test mnemonic; largest cmp immediate 7 (LTF_CASE_COUNT) / 4 (diff-loop bound); LT_ERR_OVERFLOW (0xFFFFFFFFFFFFFFFF) is staged into r10 via mov before the compare since it does not fit a signed imm32. No byte reads -- every table element and every diffed slot is a full u64 lane. Labels prefixed ltfr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // case_idx
+
+        cmp rbx, 7;                               // LTF_CASE_COUNT
+        jae ltfr_bad_idx;
+
+        lea r11, [rip + _ltf_target];
+        mov r12, [r11 + rbx * 8];                 // target
+
+        lea r11, [rip + _ltf_arg_a];
+        mov r13, [r11 + rbx * 8];                 // arg_a
+
+        lea r11, [rip + _ltf_arg_b];
+        mov r14, [r11 + rbx * 8];                 // arg_b
+
+        lea r11, [rip + _ltf_arg_c];
+        mov r15, [r11 + rbx * 8];                 // arg_c
+
+        lea r11, [rip + _ltf_dst_cap];
+        mov rbp, [r11 + rbx * 8];                 // dst_cap
+
+        cmp r12, 0;
+        je  ltfr_compute;
+
+        // ---- compose dispatch ----------------------------------------
+        mov rdi, r13;                              // entry_count
+        mov rsi, r14;                              // dir_count
+        mov rdx, r15;                              // file_count
+        lea r11, [rip + _ltf_scratch];
+        mov rcx, r11;                              // dst_ptr
+        mov r8, rbp;                                // dst_cap
+        call long_total_summary_record_compose;
+        jmp ltfr_check_ret;
+
+      ltfr_compute:
+        // ---- compute dispatch ------------------------------------------
+        cmp r13, 0;
+        je  ltfr_compute_null;
+        lea r11, [rip + _ltf_dummy_entries];
+        mov rdi, r11;
+        jmp ltfr_compute_call;
+
+      ltfr_compute_null:
+        xor rdi, rdi;
+
+      ltfr_compute_call:
+        mov rsi, r14;                              // count
+        call long_total_compute;
+
+      ltfr_check_ret:
+        lea r11, [rip + _ltf_expect_ret];
+        mov r10, [r11 + rbx * 8];                  // expected return
+        cmp rax, r10;
+        jne ltfr_ret_fail;
+
+        cmp r12, 0;
+        je  ltfr_ok;                                // compute: nothing further
+
+        lea r11, [rip + _ltf_has_golden];
+        mov r10, [r11 + rbx * 8];
+        cmp r10, 0;
+        je  ltfr_ok;                                // overflow case: no golden
+
+        lea r11, [rip + _ltf_golden_lane];
+        mov r9, [r11 + rbx * 8];                    // golden lane offset
+
+        lea r10, [rip + _ltf_golden_all];
+        lea r11, [rip + _ltf_scratch];
+        xor rcx, rcx;                               // lane idx = 0
+
+      ltfr_diff_loop:
+        cmp rcx, 4;
+        jae ltfr_ok;
+
+        mov rax, [r11 + rcx * 8];                   // actual lane
+        mov r8, r9;
+        add r8, rcx;                                 // expected lane index
+        mov rdx, [r10 + r8 * 8];                     // expected lane
+        cmp rax, rdx;
+        jne ltfr_diff_fail;
+
+        add rcx, 1;
+        jmp ltfr_diff_loop;
+
+      ltfr_ok:
+        xor rax, rax;
+        jmp ltfr_done;
+
+      ltfr_diff_fail:
+        mov rax, 0xFFFFEB62;                        // LTF_ERR_RECORD_MISMATCH
+        add rax, rbx;
+        jmp ltfr_done;
+
+      ltfr_ret_fail:
+        cmp r12, 0;
+        je  ltfr_compute_fail;
+        mov rax, 0xFFFFEB62;                        // LTF_ERR_RECORD_MISMATCH
+        add rax, rbx;
+        jmp ltfr_done;
+
+      ltfr_compute_fail:
+        mov rax, 0xFFFFEB61;                        // LTF_ERR_COMPUTE_MISMATCH
+        add rax, rbx;
+        jmp ltfr_done;
+
+      ltfr_bad_idx:
+        mov rax, 0xFFFFEB6F;                        // LTF_ERR_BAD_CASE_IDX
+
+      ltfr_done:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // long_total_fixtures_verify_all() -> u64
+  //
+  // Walk case_idx 0..6; first non-zero return propagates.
+  //
+  // Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24;
+  // entry rsp % 16 == 8; 8 + 24 = 32; aligned at
+  // long_total_fixtures_run's call site.
+  // ==========================================================================
+  pub let long_total_fixtures_verify_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-021 (#39): fail-fast walk of all 7 LongTotal boundary/behaviour cases. Two callee-save pushes (rbx=idx, r12=cap) + sub rsp,8 pad = 24; entry rsp % 16 == 8; 8 + 24 = 32; aligned at long_total_fixtures_run's call site. Matched add rsp,8 + 2 pops. paideia-as: no test mnemonic; cmp against 7 fits imm32. Labels prefixed ltfva_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        xor rbx, rbx;
+        mov r12, 7;                                // LTF_CASE_COUNT
+
+      ltfva_loop:
+        cmp rbx, r12;
+        jae ltfva_ok;
+
+        mov rdi, rbx;
+        call long_total_fixtures_run;
+        cmp rax, 0;
+        jne ltfva_out;
+
+        add rbx, 1;
+        jmp ltfva_loop;
+
+      ltfva_ok:
+        xor rax, rax;
+      ltfva_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
