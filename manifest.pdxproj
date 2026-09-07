@@ -20,11 +20,24 @@
 # a new PAIDEIA_AS_VER KV record.
 
 name        = ls
-version     = 1.1.10
+version     = 1.1-A
 kind        = tool
 entry       = Dispatch::ls_dispatch
 output      = build-out/ls
 caps_decl   = caps.decl
+
+# v1.1-A retires the M1-001 STUB body of Runner (which called
+# sys_pdxfs_dir_readnext (sysno 72) on a pre-narrowed KIND_PDXFS_FILE
+# cap that shell.M2's InitCap handoff never populated -- every call
+# returned LS_ERR_READDIR at HEAD) and replaces it with a real
+# path-addressed body wired through sys_stat (77) + sys_open (2) +
+# sys_getdents (78) + sys_close (3), writing each name to fd 1 via
+# TtyWrite::tty_write (sysno 1, UART fast-path). Argv is read
+# through Dispatch's existing per-positional loop (default "." when
+# pos_count == 0). One-per-line output; no color / -l / -a / column
+# layout at v1.1-A (see src/runner.pdx §SCOPE for the full deferral
+# list; every deferred flag re-engages as a use-site Runner-body
+# edit against the pre-v1.1-A modules still in-tree).
 
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). -----------------
@@ -46,7 +59,10 @@ caps_decl   = caps.decl
 sources:
   - src/ls.pdx                    # M1-001 KIND mirrors + error band + stats
   - src/argv_surface.pdx          # M1-002 flag-bit recogniser
-  - src/runner.pdx                # M1-003 + M3-001 + M3-003 runner_ls body
+  - src/runner.pdx                # v1.1-A path-addressed runner_ls body
+                                  # (retires the M1-M4 cap-slot STUB)
+  - src/posix_shim.pdx            # v1.1-A sys_open/close/stat/getdents
+                                  # trampolines (sysnos 2/3/77/78)
   - src/dispatch.pdx              # M1-003 ls_dispatch composition
   - src/long_format.pdx           # M2-001 -l line renderer
   - src/owner_col.pdx             # M2-002 owner column: u:<row>; ls.ENH-008

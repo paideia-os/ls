@@ -1,2426 +1,360 @@
-// src/runner.pdx -- ls.M1-003 + ls.M3-001 + ls.M3-003 (paideia-os/ls#3 + #8 + #10)
+// src/runner.pdx -- ls v1.1-A (paideia-os/ls M1-001 STUB retirement)
 //
-// Runner module: the operation body -- iterate a held KIND_PDXFS_FILE
-// (directory) cap via sys_pdxfs_dir_readnext (sysno 72), write each
-// entry's name to KIND_TTY(write) one per line, and emit one typed
-// PdxFsDirEntry record per entry to the stdout semantic-pipe endpoint.
-// At M3-003 the whole body is wrapped in a libpdx-audit begin/commit
-// pair (DirListRecord frame) so the D3 audit-first invariant holds:
-// no user-visible byte on KIND_TTY or the stdout endpoint is emitted
-// before the audit frame is open.
-//
-// =============================================================================
-// SCOPE
-// =============================================================================
-//
-// At ls.M3-001 (#8) Runner FLIPS from LS_RUN_STUB to a real iteration
-// body. The M1 STUB shape is preserved on unreachable paths (the
-// path-argument gates still return the same LS_ERR_BAD_PATH they did
-// at M1 for the empty-string reject) so the M4 correctness matrix
-// keeps its M1 vocabulary; the LS_RUN_STUB return retires at M3 --
-// every well-formed argv now resolves through the real syscall path
-// to either LS_OK or one of the substrate-error sub-band codes:
-//
-//   LS_OK              (0xFFFFEB00)  entries iterated and emitted
-//   LS_ERR_BAD_PATH    (0xFFFFEB21)  path_ptr != 0 && byte0 == 0
-//   LS_ERR_READDIR     (0xFFFFEB22)  sys_pdxfs_dir_readnext returned -errno
-//   LS_ERR_TTY_WRITE   (0xFFFFEB23)  sys_write (fd 1) returned -errno
-//   LS_ERR_EMIT_BIND   (0xFFFFEB24)  libpdx-semantic-pipe bind refused
-//   LS_ERR_EMIT_SEND   (0xFFFFEB25)  send_record refused
-//   LS_ERR_AUDIT       (0xFFFFEB26)  libpdx-audit audit_begin refused (M3-003)
+// Runner module: the ls operation body. v1.1-A REPLACES the M1-M4
+// ceremonial cap-based body -- which called sys_pdxfs_dir_readnext
+// (sysno 72) on a pre-narrowed KIND_PDXFS_FILE cap slot that
+// shell.M2's InitCap handoff never actually populated, so every
+// invocation refused with LS_ERR_READDIR (-EBADF from the kernel) --
+// with a REAL end-to-end body that reaches the filesystem through
+// the path-addressed POSIX-compat primitives sys_stat (77) /
+// sys_open (2) / sys_getdents (78) / sys_close (3), and writes each
+// name to fd 1 via the existing TtyWrite::tty_write trampoline
+// (sysno 1, UART fast-path per src/kernel/core/syscall/dispatch.pdx
+// L515).
 //
 // =============================================================================
-// -R RECURSIVE LISTING (ls.ENH-017, #35)
+// SCOPE OF v1.1-A (deliberately narrow)
 // =============================================================================
 //
-// When AS_BIT_R_REC is set, runner_ls buffers every recursion-
-// candidate entry it encounters (directory-kind, excluding "." and
-// ".."; RecurseFilter::recurse_should_descend is the exact predicate)
-// during the single pass it already makes over the held directory
-// cap -- the same "forward-only cap, buffer during the one pass"
-// constraint GDF (ls.ENH-020) already works under. Once the primary
-// listing is fully emitted, a second phase (ahead of rn_ls_done's
-// success return) walks that buffer in encounter order and writes
-// one "<path>/<name>:" header line per candidate via RecurseHeader::
-// recurse_header_compose.
+// One name per line. No column layout. No color. No -l long format.
+// No -a hidden-file gating (every entry the kernel hands back is
+// written, including dot-prefixed ones -- a proper -a/-A split
+// lands with v1.2 when the flag_bits path re-engages). No -R
+// recursion. No --json. No semantic-pipe emission. No audit frame.
+// No sort. No -F suffix. No group-directories-first.
 //
-// This is a REAL, observable, testable change to `ls -R`'s output --
-// it is not merely an inert argv-recognised bit -- but it is also
-// NOT full recursive descent. No header is followed by that
-// subdirectory's own listing, because no capability exists for a
-// held read-only tool to mint a cap for a named child of an already-
-// held directory cap: `PdxfsShim::pdxfs_open_dir` mints only from a
-// KIND_MEMORY parent carrying RIGHT_MINT (ls never holds one), and
-// no kernel `pdxfs_dir_open_at`-shaped trampoline (open-by-name
-// against an already-held directory cap) exists at HEAD. Real
-// descent additionally needs paideia-os/ls#29 (path-argument-to-cap
-// resolution) so a recursion step even knows what path string to
-// hand the shell/kernel for the child. Both gaps are tracked, not
-// silently worked around -- the absent listing after each header is
-// the honest signal, matching this repo's "no silent wrong output"
-// discipline (see paideia-os/ls#29's own framing). RN_R_MAX_DEPTH
-// (16) is a reserved constant for the real controller's future call-
-// depth guard; nothing branches on it today because nothing recurses
-// past depth 1 yet.
+// This is the "just make ls actually enumerate a directory"
+// deliverable the user's dev loop has been asking for since the
+// M1-M4 wave completed. Every one of the deferred features above
+// lands as a use-site edit against THIS Runner body in a later
+// round -- the pre-v1.1-A modules (LongFormat, JsonLine, ColorPicker,
+// Columns, HiddenFilter, HumanSize, OwnerCol, SemanticEmit,
+// AuditShim, GroupSort, SortOptions, RecurseFilter, RecurseHeader,
+// SchemaDump, LongTotal) are still in-tree exactly as they were, so
+// their re-engagement is a Runner-body edit rather than a
+// re-declare. Dispatch's --schema short-circuit (which never went
+// through Runner) is unaffected.
 //
 // =============================================================================
-// -t / -S / -r SORT OPTIONS (ls.ENH-016, #34)
+// FLOW
 // =============================================================================
 //
-// AS_BIT_T / AS_BIT_S / AS_BIT_R_REV already parse in ArgvSurface
-// (commit 52e14a7); this landing wires the Runner side. The held
-// directory cap is forward-only (same constraint GDF and -R already
-// work under), so any requested sort reuses GDF's buffered-listing
-// machinery (_rn_gdf_buf / _rn_gdf_collect / _rn_gdf_emit_next)
-// rather than inventing a second buffer: `_rn_sort_mode` (computed
-// once at entry, alongside `_rn_gdf_mode`) is OR'd into the "take the
-// buffered path instead of streaming" decision at both the initial
-// dispatch (right before the main loop) and at `rn_ls_continue` (the
-// "advance to the next entry" seam) -- so `ls -t` with neither -R nor
-// --group-directories-first still gets buffered, exactly as the issue
-// asks.
+//   (1) Default path: if path_ptr == 0 (the pos_count-0 case
+//       Dispatch passes through as the _as_path_ptr sentinel), use
+//       the local _rn_default_path (".\0").
 //
-// The actual sort runs inside `rn_ls_gdf_partition`, BEFORE the
-// existing GDF kind-extraction + `group_sort_partition` step (or, if
-// GDF was not requested, before a trivial identity-permutation fill
-// that keeps `rn_ls_gdf_emit_next`'s order-buffer-driven emission
-// loop uniform across every combination of GDF/sort/neither): if
-// `_rn_sort_mode` is set, flag_bits selects one of
-// SortOptions::sort_options_by_mtime (AS_BIT_T),
-// SortOptions::sort_options_by_size (AS_BIT_S), or
-// SortOptions::sort_options_by_name (neither -- the default
-// lexicographic sort, which is also what bare `-r` alone reverses),
-// passing AS_BIT_R_REV as the `reverse` argument. Running the sort
-// BEFORE the GDF partition matters: `group_sort_partition` is a
-// STABLE two-pass scan, so a buffer sorted first keeps that order
-// within each of the two (directory / non-directory) groups the
-// partition produces -- `ls -t --group-directories-first` groups
-// directories first and orders each group by mtime, matching GNU
-// ls's own "within each group, sorted by whatever the existing sort
-// discipline is" behaviour.
+//   (2) sys_stat(path_ptr, RN_STAT_PATH_HINT, &_rn_stat_buf). Any
+//       non-zero return (missing path, kernel-half VA, ...) is
+//       LS_ERR_BAD_PATH (0xFFFFEB21). This costs one syscall per
+//       invocation but keeps the LS_ERR_BAD_PATH sub-band the M1
+//       tests/exit_matrix.pdx fixture already pins meaningful --
+//       LS_ERR_READDIR gets reserved for enumeration failures on a
+//       path that DID resolve.
 //
-// SortOptions::sort_options_by_mtime and sort_options_by_size are
-// honest pass-through identities, not real comparators: the kernel's
-// PdxFsDirEntry record (see RN_ENT_OFF_* below) carries no mtime or
-// size field at HEAD, the same gap LongFormat's own `-l` columns
-// already placeholder at 0. See src/sort_options.pdx's module doc for
-// the full rationale and the pinned fixture golden.
+//   (3) sys_open(path_ptr, 0 /*O_RDONLY*/, 0 /*mode*/) -> fd. Any
+//       negative-errno return (bit 63 set; caller detects via
+//       `cmp rax, 0; jl`) -> LS_ERR_READDIR (same sub-band the
+//       downstream getdents-time failures use; open-vs-enumerate
+//       distinction is not part of the v1.1-A external vocabulary).
 //
-// =============================================================================
-// MULTI-COLUMN DEFAULT OUTPUT (ls.ENH-018, #36)
-// =============================================================================
-//
-// AS_BIT_ONE / AS_BIT_C_MAJ already parse in ArgvSurface (-1 / -C).
-// This landing wires Runner + the new Columns::columns_layout primitive
-// (src/columns.pdx) so bare `ls` can render entries in a fitted
-// multi-column grid instead of one name per line.
-//
-// `_rn_multicol_mode` is computed once at entry, right alongside the
-// GDF/sort/-R mode flags, as the OFF-unless-earned decision:
-//
-//   OFF (one-per-line, the pre-#36 default) when any of AS_BIT_L,
-//   AS_BIT_JSON, or AS_BIT_ONE (-1) is set -- these already force a
-//   specific per-entry text shape or explicit one-per-line, and none
-//   of `-l`/`--json`/`-1` was ever going to share a line with another
-//   entry. Also OFF when AS_BIT_F or AS_BIT_COLOR is set: a v1 scope
-//   cut, not a silent gap -- `columns_layout` computes column widths
-//   from raw byte lengths, and both `-F`'s type-indicator suffix and
-//   `--color`'s ANSI SGR escapes would change a cell's BYTE length
-//   without changing its VISUAL width, corrupting the fit. Rather than
-//   ship a column layout that miscounts, both flags simply keep the
-//   existing one-per-line renderer (which already handles -F/--color
-//   correctly) until a future landing threads a "display width" concept
-//   through Columns separate from byte length.
-//
-//   ON when AS_BIT_C_MAJ (-C) is explicit -- unconditional, the one
-//   real live path this v1 landing ships (see below for why "ON over
-//   TTY" cannot be made real yet). ON, absent -C, when
-//   TtyWrite::tty_probe_is_tty() reports a TTY -- which it honestly
-//   does not do yet (see that function's own doc): no cap-bound fd 1
-//   and no ioctl/ttywinsize/isatty syscall exist in paideia-os at HEAD
-//   (confirmed absent from design/user/syscall-table.md), the same
-//   substrate gap ls.ENH-023's AS_BIT_COLOR_AUTO probe already
-//   documents. Bare `ls` therefore keeps its pre-#36 one-per-line
-//   default until that sub-blocker clears -- landing the scaffolding
-//   now means the auto path activates by flipping tty_probe_is_tty's
-//   single instruction, with no change to Runner's gate or to
-//   columns_layout itself.
-//
-// When multicol mode is on, Runner forces the SAME buffered-listing
-// path GDF/sort already use (`_rn_multicol_mode` widens the
-// rn_ls_pre_emit branch alongside `_rn_gdf_mode` / `_rn_sort_mode`) --
-// multicol therefore always renders the ALREADY-sorted/grouped buffer,
-// laid out column-major; it never re-derives its own order. Once the
-// order buffer is finalized (`rn_ls_order_ready`), multicol mode
-// redirects to `rn_ls_multicol_collect` instead of the per-entry
-// `rn_ls_gdf_emit_next` cursor: a dedicated pass walks the order
-// buffer, applies `hidden_filter_accept` and the same -R
-// recursion-candidate detection `rn_ls_render_dispatch` runs per entry
-// (so `-R` header candidates are still captured even though the
-// per-entry dispatch itself is bypassed for the primary listing),
-// calls `sem_emit_entry` per accepted entry (semantic-pipe emission is
-// unchanged across every render path, multicol included), and appends
-// each accepted entry's name pointer/length into `_rn_col_name_ptrs` /
-// `_rn_col_name_lens`. `rn_ls_multicol_render` then calls
-// `Columns::columns_layout` once against the whole collected array and
-// `tty_write`s the composed grid in a single call, before falling into
-// the same `rn_ls_done` label (and its -R header-emission phase)
-// everything else uses.
-//
-// =============================================================================
-// -l TOTAL LINE + PdxLsSummaryRecord@0.1 (ls.ENH-021, #39)
-// =============================================================================
-//
-// Two independent additions, both gated on flag_bits, both landing at
-// single-fall-through points in runner_ls's body (no change to the
-// per-entry dispatch or either buffered-vs-streaming path):
-//
-//   (1) `-l` total line. Right after the emit prelude succeeds
-//       (rn_ls_pre_emit, before rbx is loaded for the read loop --
-//       this label runs exactly once per call, see its own comment),
-//       when RN_BIT_L_MASK is set: LongTotal::long_total_compute(0, 0)
-//       -> total_blocks, composed as "total <N>\n" into _rn_line_buf
-//       and written via the existing tty_write trampoline. Gated on
-//       RN_BIT_L_MASK alone (not JSON) -- POSIX `ls -l` always prints
-//       this line regardless of any other flag. The placeholder (0, 0)
-//       args are safe because long_total_compute's result is invariant
-//       under them: the kernel's PdxFsDirEntry record has no size
-//       field at HEAD, so the sum is always 0 (see LongTotal's own
-//       module doc, src/long_total.pdx, for the full honest-gap
-//       rationale and the trip-wire fixture pinning it).
-//
-//   (2) PdxLsSummaryRecord@0.1 emission. At rn_ls_success (reached
-//       only after the primary listing, and any -R header phase, has
-//       fully completed), when BOTH RN_BIT_L_MASK and RN_BIT_JSON_MASK
-//       are set: LongTotal::long_total_summary_record_compose(0, 0, 0,
-//       dst, 256) composes the fixed 32-byte wire record into
-//       _rn_line_buf, written verbatim via the same tty_write
-//       trampoline -- "the existing --json path" the issue's scope
-//       note calls for, rather than a new semantic-pipe endpoint bind.
-//       paideia-os/ls#30's schema-registry migration (SemanticEmit's
-//       PdxFsDirEntry stdout bind onto libpdx-semantic-pipe::Registry::
-//       bind_by_name) landed separately from this and does not itself
-//       stand up a second bind slot for PdxLsSummaryRecord@0.1 -- that
-//       remains its own follow-up; see SemanticEmit::_se_summary_
-//       schema_name's own deferred-comment marker in src/semantic_
-//       emit.pdx, left untouched by this landing. entry_count/dir_
-//       count/file_count ship as 0 --
-//       Runner does not accumulate a live per-kind tally across a
-//       listing today; the composer itself encodes whatever it is
-//       given correctly, so wiring real counters through is a one-line
-//       call-site change in a future round (see LongTotal's own doc).
-//
-// =============================================================================
-// MULTI-PATH LISTING HEADER (ls.ENH-014, #32)
-// =============================================================================
-//
-// `ls a b c` -- Dispatch (src/dispatch.pdx) now calls runner_ls once
-// per positional path argument when more than one was given on argv,
-// folding the worst exit code across every call through ExitMap.
-// Runner's own body is single-path as ever; the only new surface it
-// exposes is a per-call header-emit request carried in two flag_bits
-// bits that Dispatch ORs in and that are NEVER argv-recognised (see
-// ArgvSurface's own "RESERVED: 0x8000 and 0x10000" note):
-//
-//   RN_BIT_HEADER_MASK (0x8000)       -- emit a "<path>:" header for
-//                                        this call. Dispatch sets this
-//                                        on every call when
-//                                        pos_count > 1; never on the
-//                                        pos_count <= 1 path (0 or 1
-//                                        explicit arguments stays
-//                                        byte-identical to pre-#32
-//                                        output).
-//   RN_BIT_HEADER_BLANK_MASK (0x10000) -- also prefix the header with
-//                                        a blank line. Dispatch sets
-//                                        this on every call AFTER the
-//                                        first in its per-positional
-//                                        loop (GNU ls convention: a
-//                                        blank line separates two
-//                                        consecutive per-path blocks;
-//                                        none precedes the first).
-//
-// Both bits are read once, at rn_ls_pre_emit, right after the emit-
-// bind check succeeds and before the (unrelated) "-l total N" line --
-// this is the correct D3 ordering seam: the audit frame is already
-// open (rn_ls_audit_open ran first) so the header byte is not the
-// first user-visible byte ahead of the audit commit, and the header
-// belongs to the SAME per-call block as everything else this call
-// emits. The header itself is composed by RecurseHeader::
-// multipath_header_compose (src/recurse_header.pdx) -- reusing that
-// module's "scan-or-default path, clamp at RH_PATH_MAX, two-pass
-// compose" discipline rather than duplicating it, per the issue's own
-// direction -- into _rn_line_buf, then written with the same
-// tty_write trampoline every other render path in this function uses.
-//
-// What this does NOT change: the actual directory read. Runner still
-// reads through the single pre-handed LS_DIR_CAP_SLOT (2) regardless
-// of which positional this call is for -- the shell's InitCap handoff
-// does not yet narrow a distinct cap per positional argument
-// (paideia-os/ls#29). Every call in a multi-path invocation therefore
-// gets its own correct "<path>:" header, but the SAME underlying
-// directory's entries under each one, until the shell grows a multi-
-// slot handoff. This is the exact interim shape paideia-os/ls#32
-// itself authorizes (see its own Deps note), not a silent regression.
-//
-// =============================================================================
-// PRE-OPENED DIR CAP CONVENTION
-// =============================================================================
-//
-// The kernel's sys_pdxfs_open (sysno 71) is a MINT operation whose
-// parent argument must be a KIND_MEMORY cap carrying RIGHT_MINT (see
-// paideia-os src/kernel/core/syscall/handlers/sys_pdxfs_open.pdx §
-// pdxfs_file_cap_mint_inner requirements). ls does NOT hold such a
-// parent -- read-only tools cannot mint filesystem caps. Instead,
-// shell.M2 will hand ls a pre-narrowed KIND_PDXFS_FILE(read, <arg-
-// path>) at exec time via the InitCap sidecar per r49-r50-plan.md
-// §4.4 ("the tool's cap request narrows to exactly the argument
-// path"). The M3-001 Runner therefore does NOT call sys_pdxfs_open;
-// it calls sys_pdxfs_dir_readnext on the pre-handed cap slot pinned
-// at LS_DIR_CAP_SLOT (2).
-//
-// LS_DIR_CAP_SLOT = 2 is chosen to match the caps.decl order:
-//   slot 0: KIND_USER
-//   slot 1: KIND_TTY(write)
-//   slot 2: KIND_PDXFS_FILE(read, <arg-path>)   <-- Runner reads here
-//   slot 3: KIND_IPC_ENDPOINT                    <-- SemanticEmit uses this
-//
-// At M3, when ls runs without shell.M2 having populated the cap_table
-// yet, sys_pdxfs_dir_readnext returns -EBADF and Runner surfaces
-// LS_ERR_READDIR -- correct substrate-wiring behaviour; the emission
-// path lights up in a live end-to-end run once shell.M2 lands. This
-// matches the "substrate wiring shipped, live behavior gated on the
-// cap-handoff round" idiom every M3 R49 tool uses.
-//
-// =============================================================================
-// FLOW (M3-001 + M3-003)
-// =============================================================================
-//
-//   (1) Gate path_ptr as at M1 (empty string -> LS_ERR_BAD_PATH; null
-//       path is legal at M3 and means "default to the pre-opened
-//       LS_DIR_CAP_SLOT cap" -- the shell narrows to the concrete arg
-//       path at exec, so ls does not resolve paths itself at M3).
-//   (1b) M3-003: audit_ls_begin(path_ptr, flag_bits) -- open the
-//       DirListRecord audit frame BEFORE any user-visible byte is
-//       emitted (D3 invariant). On refusal return LS_ERR_AUDIT
-//       without touching KIND_TTY or the semantic-pipe endpoint.
-//   (2) sem_emit_reset() -- imprint the PdxFsDirEntry@0.1 schema id
-//       into _se_pdxfsdirentry_hash (ls.ENH-010, #27: real
-//       spipe_schema_id_from_name fold, not a stub). Diagnostic only
-//       since #30 -- the imprinted value feeds tests/schema_golden.pdx,
-//       not the bind in step (3).
-//   (3) sem_emit_bind_stdout() -- bind LS_STDOUT_ENDPOINT_SLOT to
-//       PdxFsDirEntry@0.1 via libpdx-semantic-pipe::Registry::
-//       bind_by_name(fd, name_ptr, name_len) (ls.R90-XREPO.012.M4-002,
-//       #30: migrated off ls's own hand-paired hash-then-bind
-//       sequence). On refusal return LS_ERR_EMIT_BIND.
 //   (4) Loop:
-//       (a) pdxfs_dir_readnext(LS_DIR_CAP_SLOT, &_rn_entry_buf) -> rc
-//       (b) rc == 1 -> entry written; proceed.
-//           rc == 0 -> end-of-directory; break.
-//           other  -> LS_ERR_READDIR (propagate).
-//       (c) Extract name_ptr = _rn_entry_buf + PDXFS_DIR_ENT_OFF_NAME
-//           and name_len = *(_rn_entry_buf + PDXFS_DIR_ENT_OFF_NAME_LEN)
-//       (d) hidden_filter_accept(name_ptr, flag_bits & AS_BIT_A):
-//           reject -> ls_note(LS_ST_HIDDEN); continue loop.
-//           accept -> proceed.
-//       (e) Compose name + '\n' into _rn_line_buf (name_len + 1 bytes);
-//           tty_write(&_rn_line_buf, name_len + 1). On refusal
-//           return LS_ERR_TTY_WRITE.
-//       (f) sem_emit_entry(&_rn_entry_buf). On refusal return
-//           LS_ERR_EMIT_SEND.
-//       (g) ls_note(LS_ST_ENTRIES); continue loop.
-//   (5) Return LS_OK.
+//         (a) sys_getdents(fd, &_rn_getdents_buf,
+//                          RN_GD_BUF_CAP=4096) -> rax.
+//         (b) rax == 0 -> end-of-directory; break.
+//             rax  < 0 -> close fd + LS_ERR_READDIR (propagate).
+//             rax  > 0 -> proceed to record walk.
+//         (c) Walk records from cursor = base to end = base + rax:
+//               name_len_u16 = *(u64)(cursor + 8) & 0xFFFF
+//               (the u64 load spans name_len@8 + type@10 +
+//                reserved@11 + name[0..4]; the mask isolates
+//                name_len -- avoids needing a mov_w mnemonic
+//                paideia-as's encoder does not yet expose to userspace).
+//               if name_len == 0 -> terminator; fetch next batch.
+//               tty_write(cursor + 12, name_len)
+//               tty_write(&_rn_newline, 1)
+//               cursor += 12 + name_len
+//               continue.
 //
-// Every ret path (except the pre-audit LS_ERR_BAD_PATH branch) flows
-// through rn_ls_epilogue which calls audit_ls_commit(exit_code)
-// before unwinding. audit_ls_commit is safe to call on the pre-audit
-// path too -- it gates internally on _au_id != 0 -- so the epilogue
-// unification is unconditional.
+//   (5) sys_close(fd). Return LS_OK (0xFFFFEB00).
+//
+// Dispatch's per-positional loop (src/dispatch.pdx §ls.ENH-014
+// section) is unchanged: it still folds every Runner return
+// through ExitMap immediately and returns the worst code. Because
+// v1.1-A is path-addressed, `ls a b c` now actually reads three
+// distinct directories (in the pre-v1.1-A cap body every call
+// read through the same LS_DIR_CAP_SLOT).
 //
 // =============================================================================
-// AS_BIT_A DEPENDENCY
+// FLAG BITS
 // =============================================================================
 //
-// Runner reads bit 1 of flag_bits (AS_BIT_A per ArgvSurface). Value
-// mirrored locally as RN_BIT_A_MASK = 0x2 so this file does not have
-// to import ArgvSurface's constants -- the bit position is stable
-// across the R49 wave (see design/architecture.md §3.1 bit table).
+// v1.1-A IGNORES flag_bits entirely. Both the substantive user
+// flags (-l / -a / -h / --color / --json / -R / -t / -S / -r /
+// -1 / -C / -F / --group-directories-first) and the
+// Dispatch<->Runner header bits (RN_BIT_HEADER_MASK /
+// RN_BIT_HEADER_BLANK_MASK) are read-past. The rsi argument is
+// still declared in the signature so Dispatch's call site does not
+// have to change. Flag re-engagement is scoped to v1.2 (columns +
+// header lines), v1.3 (color / -l / -a), and beyond -- see the
+// SCOPE section for the full deferral list.
 //
 // =============================================================================
 // PAIDEIA-AS CONFORMANCE
 // =============================================================================
 //
-//   - Module name PascalCase basename (`Runner`), no directory prefix.
+//   - Module basename PascalCase (`Runner`), no directory prefix
+//     (same module name as the pre-v1.1-A body -- Dispatch's
+//     `call runner_ls` is a symbol reference that resolves against
+//     THIS file after rebuild).
 //   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
-//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Immediates in this
-//     module: 0 (null-check), 1 (readnext-entry discriminator), 2
-//     (RN_BIT_A_MASK), 16 (PDXFS_DIR_ENT_OFF_NAME_LEN), 24
-//     (PDXFS_DIR_ENT_OFF_NAME), 104 (PDXFS_DIR_NAME_MAX + 1 line-cap
-//     bound). The 0xFFFFEB2x error returns are `mov rax, imm64`
-//     emissions, not compares.
-//   - Byte reads (name-copy loop into _rn_line_buf) use `xor rax;
-//     mov_b rax, [ptr]` per #1248.
-//   - Byte writes (name-copy loop tail + '\n' terminator) use
-//     `mov_b [dst], reg`.
-//   - r11 is scratch; r10 is scratch (both used as ephemeral address
-//     holders in the copy loop).
-//   - Non-leaf; many nested calls. Six callee-save pushes (rbx =
-//     dir_cap_slot copy for pipeline stability across readnext + tty_
-//     write + sem_emit_entry, r12 = path_ptr, r13 = flag_bits, r14 =
-//     name_len for the current entry, r15 = _rn_line_buf base, rbp =
-//     name_ptr) + `sub rsp, 8` pad = 56 bytes; entry rsp % 16 == 8;
-//     8 + 56 = 64; 64 % 16 == 0 at every nested-call site. Every ret
-//     path unwinds through rn_ls_epilogue which does the 6 pops + the
-//     rsp restore in one place.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Immediates in
+//     this module: 0 (null-check + EOD-check + name_len terminator
+//     + O_RDONLY flag), 12 (record header size), 255
+//     (RN_STAT_PATH_HINT), 4096 (getdents buffer cap), 0xFFFF
+//     (name_len mask); every larger value (LS_OK /
+//     LS_ERR_BAD_PATH / LS_ERR_READDIR) is a `mov rax, imm64`
+//     emission, not a compare.
+//   - No byte reads (the u64 load + mask pattern for name_len
+//     sidesteps the mov_w gap; the record's name payload is passed
+//     by pointer to tty_write, never loaded byte-by-byte here).
+//   - r11 is scratch (paideia-as reserved); r10 is scratch (used
+//     transiently for the name_len extraction).
+//   - Non-leaf: 5 callee-save pushes (rbx=fd, r12=cursor,
+//     r13=end-cursor, r14=buf-base, rbp=path_ptr) => 40 bytes; entry
+//     rsp % 16 == 8; 8 + 40 = 48; 48 % 16 == 0 at every nested-call
+//     site (sys_stat, sys_open, sys_getdents, sys_close, tty_write).
+//     No `sub rsp, 8` pad needed -- the 5-push count already
+//     restores 16-byte alignment. Matched 5 pops via the single
+//     shared rn_ls_epilogue label every ret path converges on.
 //
 // =============================================================================
 // CROSS-MODULE SYMBOLS
 // =============================================================================
 //
 // Called:
-//   ls_note                -- Ls (src/ls.pdx)
-//   pdxfs_dir_readnext     -- PdxfsShim (src/pdxfs_shim.pdx)
-//   tty_write              -- TtyWrite (src/tty_write.pdx)
-//   hidden_filter_accept   -- HiddenFilter (src/hidden_filter.pdx)
-//   sem_emit_reset         -- SemanticEmit (src/semantic_emit.pdx)
-//   sem_emit_bind_stdout   -- SemanticEmit (src/semantic_emit.pdx)
-//   sem_emit_entry         -- SemanticEmit (src/semantic_emit.pdx)
-//   audit_ls_begin         -- AuditShim (src/audit_shim.pdx) -- M3-003
-//   audit_ls_commit        -- AuditShim (src/audit_shim.pdx) -- M3-003
-//   long_format_line       -- LongFormat (src/long_format.pdx) -- v1.1.0 ENH-002
-//   json_line_render       -- JsonLine (src/json_line.pdx) -- v1.1.0 ENH-007
-//   color_pick             -- ColorPicker (src/color_picker.pdx) -- v1.1.0 ENH-005
-//   color_sgr_prefix       -- ColorPicker (src/color_picker.pdx) -- v1.1.0 ENH-005
-//   color_sgr_suffix       -- ColorPicker (src/color_picker.pdx) -- v1.1.0 ENH-005
-//   group_sort_partition   -- GroupSort (src/group_sort.pdx) -- ls.ENH-020 (#38)
-//   sort_options_by_name   -- SortOptions (src/sort_options.pdx) -- ls.ENH-016 (#34)
-//   sort_options_by_mtime  -- SortOptions (src/sort_options.pdx) -- ls.ENH-016 (#34)
-//   sort_options_by_size   -- SortOptions (src/sort_options.pdx) -- ls.ENH-016 (#34)
-//   recurse_should_descend -- RecurseFilter (src/recurse_filter.pdx) -- ls.ENH-017 (#35)
-//   recurse_header_compose -- RecurseHeader (src/recurse_header.pdx) -- ls.ENH-017 (#35)
-//   multipath_header_compose -- RecurseHeader (src/recurse_header.pdx) -- ls.ENH-014 (#32)
-//   columns_layout          -- Columns (src/columns.pdx) -- ls.ENH-018 (#36)
-//   tty_probe_is_tty        -- TtyWrite (src/tty_write.pdx) -- ls.ENH-018 (#36)
-//   long_total_compute      -- LongTotal (src/long_total.pdx) -- ls.ENH-021 (#39)
-//   long_total_summary_record_compose
-//                           -- LongTotal (src/long_total.pdx) -- ls.ENH-021 (#39)
-//   owner_col_owner_row_from_entry
-//                           -- OwnerCol (src/owner_col.pdx) -- ls.ENH-008 (#28)
+//   sys_stat, sys_open, sys_close, sys_getdents  -- PosixShim
+//                                                   (src/posix_shim.pdx)
+//   tty_write                                     -- TtyWrite
+//                                                   (src/tty_write.pdx)
 
 module Runner = structure {
 
   // ==========================================================================
-  // Constants (locally mirrored so this file does not depend on
-  // ArgvSurface's bit vocabulary; the M4 smoke matrix catches drift).
+  // Return-code sentinels (mirror Ls's error band -- see src/ls.pdx
+  // §Return-code band 0xFFFFEBxx). Redeclared as u64 locals so this
+  // file does not have to import Ls; the M4 smoke matrix catches any
+  // drift between the mirrors here and the authoritative Ls values.
   // ==========================================================================
-
-  // ArgvSurface AS_BIT_A mask (mirrored -- see design/architecture.md §3.1)
-  pub let RN_BIT_A_MASK           : u64 = 0x2
-  // ls.ENH-002 (#24) v1.1.0: -l long-format mask (AS_BIT_L). Runner
-  // routes accepted entries through LongFormat::long_format_line when
-  // set; otherwise the default name+suffix+LF path stays.
-  pub let RN_BIT_L_MASK           : u64 = 0x1
-  // ls.ENH-002 (#24) v1.1.0: -h human size mask (AS_BIT_H). Forwarded
-  // into long_format_line's kind_mode_flags[13] (human_size_flag).
-  pub let RN_BIT_H_MASK           : u64 = 0x4
-  // ls.ENH-007 (#26) v1.1.0: --json mask (AS_BIT_JSON). Runner
-  // replaces the KIND_TTY text branch with JsonLine emission when set.
-  pub let RN_BIT_JSON_MASK        : u64 = 0x8
-  // ls.ENH-005 (#25) v1.1.0: --color mask (AS_BIT_COLOR). Runner
-  // wraps text-branch content with ANSI SGR prefix/suffix when set
-  // AND the color-auto probe (if AS_BIT_COLOR_AUTO also set) resolves
-  // to KIND_TTY. --json disables color regardless.
-  pub let RN_BIT_COLOR_MASK       : u64 = 0x20
-  // ls.ENH-023 (#41) v1.1.0: --color=auto mask (AS_BIT_COLOR_AUTO).
-  // Runner probes stdout KIND when set alongside AS_BIT_COLOR.
-  pub let RN_BIT_COLOR_AUTO_MASK  : u64 = 0x4000
-  // ls.ENH-019 (#37): -F type-indicator suffix mask (AS_BIT_F).
-  pub let RN_BIT_F_MASK           : u64 = 0x1000
-  // ls.ENH-020 (#38): --group-directories-first mask (AS_BIT_GDF).
-  // Runner buffers the whole directory when this bit is set (the held
-  // dir cap has no rewind primitive -- see the GDF collect-phase
-  // comment below) and reorders emission through
-  // GroupSort::group_sort_partition.
-  pub let RN_BIT_GDF_MASK         : u64 = 0x2000
-  // ls.ENH-020 (#38): static cap on the GDF buffer. See the
-  // collect-phase comment for the overflow policy rationale (today's
-  // kernel readnext is a fixed small stub -- design/enhancement-plan.md
-  // §1.1 -- so this bound is unreachable at HEAD; it exists so a
-  // future real substrate fails loudly rather than silently once a
-  // directory outgrows a static buffer).
-  pub let RN_GDF_MAX_ENTRIES      : u64 = 64
-  // ls.ENH-016 (#34): -t / -S / -r sort-option masks (AS_BIT_T /
-  // AS_BIT_S / AS_BIT_R_REV). Any one of the three routes the
-  // buffered listing through SortOptions before GDF's own partition
-  // step (or, absent GDF, before a trivial identity order fill) --
-  // see the file-header "-t / -S / -r SORT OPTIONS" section.
-  pub let RN_BIT_T_MASK           : u64 = 0x40
-  pub let RN_BIT_S_MASK           : u64 = 0x80
-  pub let RN_BIT_R_REV_MASK       : u64 = 0x100
-  // ls.ENH-017 (#35): --recursive / -R mask (AS_BIT_R_REC, parsed at
-  // src/argv_surface.pdx since commit 9fb4b98). Runner buffers every
-  // recursion-candidate entry (directory-kind, not "." or "..", per
-  // RecurseFilter::recurse_should_descend) alongside the GDF-style
-  // machinery this bit shares its shape with, then walks the buffer
-  // once the primary listing is done and writes one "<path>/<name>:"
-  // header per candidate via RecurseHeader::recurse_header_compose.
-  // See the -R phase comment ahead of runner_ls's rn_ls_done label for
-  // the full scope, and RecurseHeader's own module doc for exactly why
-  // no listing follows each header (paideia-os/ls#29 + the still-
-  // missing pdxfs_dir_open_at kernel primitive).
-  pub let RN_BIT_R_MASK           : u64 = 0x200
-  // Static cap on the -R candidate buffer, mirroring RN_GDF_MAX_
-  // ENTRIES's own rationale verbatim: today's kernel readnext is a
-  // fixed small stub (design/enhancement-plan.md §1.1), so this bound
-  // is unreachable at HEAD; it exists so a future real substrate fails
-  // loudly (LS_ERR_READDIR, the same refusal GDF's overflow uses) at
-  // the same seam rather than silently truncating the header list.
-  pub let RN_R_MAX_ENTRIES        : u64 = 64
-  // Reserved call-depth bound for the eventual REAL multi-level
-  // descent controller (once paideia-os/ls#29 and a kernel
-  // pdxfs_dir_open_at-shaped trampoline exist and Runner can actually
-  // recurse into a named child instead of only detecting it). Not
-  // wired into any branch today -- the current -R phase only ever
-  // reaches depth 1 (the immediate children of the single directory
-  // cap ls holds), because no capability exists to go deeper. Landed
-  // now, alongside AS_BIT_R_REC's own precedent of shipping a named
-  // constant ahead of the logic that will consume it, so the real
-  // controller's depth guard does not have to invent a bound under
-  // review pressure later.
-  pub let RN_R_MAX_DEPTH          : u64 = 16
-  // ls.ENH-018 (#36): multi-column default-output masks (AS_BIT_ONE /
-  // AS_BIT_C_MAJ, already parsed at HEAD -- src/argv_surface.pdx). -1
-  // forces one-per-line; -C forces multi-column unconditionally. See
-  // the "MULTI-COLUMN DEFAULT OUTPUT" file-header section and
-  // src/columns.pdx's module doc for the fitting algorithm.
-  pub let RN_BIT_ONE_MASK         : u64 = 0x400
-  pub let RN_BIT_C_MAJ_MASK       : u64 = 0x800
-  // Terminal width used by the multi-column layout. No live TTY-width
-  // query exists at HEAD (no cap-bound fd 1, no ioctl/ttywinsize
-  // syscall -- see TtyWrite::tty_probe_is_tty's own doc for the
-  // confirmed-absent kernel primitive), so this is a fixed fallback
-  // constant, mirroring Columns::COL_DEFAULT_WIDTH (re-declared locally
-  // per this tree's "no cross-module numeric-constant import"
-  // convention -- see SortOptions's own module doc for that rule).
-  pub let RN_COL_TERM_WIDTH       : u64 = 80
-  // ls.ENH-014 (#32): multi-path "<path>:" header masks. Private to
-  // the Dispatch<->Runner boundary -- never argv-recognised, never
-  // set in _as_flag_bits (see ArgvSurface's own "RESERVED: 0x8000 and
-  // 0x10000" note in src/argv_surface.pdx). See the file-header
-  // "MULTI-PATH LISTING HEADER" section for the full flow.
-  pub let RN_BIT_HEADER_MASK       : u64 = 0x8000
-  pub let RN_BIT_HEADER_BLANK_MASK : u64 = 0x10000
-
-  // Destination scratch capacity for a rendered multi-column grid:
-  // worst case is RN_R_MAX_ENTRIES (64) rows of 1 column each (the
-  // narrow-terminal / very-wide-entry fallback), each row at most
-  // RN_COL_TERM_WIDTH (80) content bytes + 1 newline = 81; 64 * 81 =
-  // 5184, rounded up with headroom.
-  pub let RN_COL_RENDER_BUF_CAP   : u64 = 5280
-  // ls.ENH-019 (#37): kind-nibble offset inside the 128-byte kernel
-  // PdxFsDirEntry record. See paideia-os
-  // src/kernel/core/cap/pdxfs_dir_iter.pdx §1 (inode@0, kind@8,
-  // name_len@16, name[104]@24). The kind qword's low 4 bits carry the
-  // PdxFS-v1 file-type nibble (0x4=dir, 0x8=file, 0xA=symlink, ...).
-  pub let RN_ENT_OFF_KIND         : u64 = 8
-  // ls.ENH-007 (#26) v1.1.0: inode field offset (record byte 0). Read
-  // into json_line_render as the "inode" numeric.
-  pub let RN_ENT_OFF_INODE        : u64 = 0
-
-  // Kernel PdxFsDirEntry offsets (mirror paideia-os
-  // src/kernel/core/cap/pdxfs_dir_iter.pdx §1).
-  pub let RN_ENT_OFF_NAME_LEN     : u64 = 16
-  pub let RN_ENT_OFF_NAME         : u64 = 24
-  pub let RN_ENT_NAME_MAX         : u64 = 104
-  pub let RN_ENT_SIZE             : u64 = 128
-
-  // ls.ENH-015 (#33): kind-nibble placeholder used by
-  // rn_compose_file_entry for the file-as-path single-row fallback.
-  // Hardcoded (not read from any cap) because tmpfs mints only
-  // VNODE_TYPE_REG=1 / VNODE_TYPE_DIR=2 at HEAD (no symlink vnode
-  // type exists yet -- src/kernel/core/fs/tmpfs/vops.pdx) and no
-  // cap-kind-query trampoline is exposed to userspace to tell a file
-  // cap from a future symlink cap apart. See rn_ls_file_fallback for
-  // the full rationale.
-  pub let RN_ENT_KIND_FILE        : u64 = 8
-
-  // Pre-opened directory cap slot (see file header).
-  pub let LS_DIR_CAP_SLOT         : u64 = 2
-
-  // sys_pdxfs_dir_readnext discriminators.
-  pub let RN_READNEXT_ENTRY       : u64 = 1
-  pub let RN_READNEXT_EOD         : u64 = 0
-
-  // Stat slot ids (mirror Ls; kept as local constants so this file
-  // does not have to import Ls's slot names).
-  pub let RN_STAT_RUNS            : u64 = 2
-  pub let RN_STAT_ENTRIES         : u64 = 3
-  pub let RN_STAT_ERRORS          : u64 = 4
-  pub let RN_STAT_HIDDEN          : u64 = 5
+  pub let LS_OK             : u64 = 0xFFFFEB00
+  pub let LS_ERR_BAD_PATH   : u64 = 0xFFFFEB21
+  pub let LS_ERR_READDIR    : u64 = 0xFFFFEB22
 
   // ==========================================================================
-  // .bss
+  // Constants used by the record walk.
   // ==========================================================================
-  //
-  // _rn_entry_buf -- 128-byte scratch that sys_pdxfs_dir_readnext
-  // writes into (one entry at a time). 16 u64 lanes.
-  //
-  // _rn_line_buf -- text composition buffer for the tty_write call.
-  // v1.1.0 (ENH-002/#24 + ENH-007/#26): grown from 14 u64 to 32 u64
-  // (256 bytes) so LongFormat's max line (kind + mode + owner + size
-  // + mtime + name + optional " -> <link:target-unknown>" + LF ~
-  // 200 bytes) and JsonLine's max line (30-byte fixed + name 104 +
-  // digits 22 = 156 bytes) fit without a per-renderer buffer split.
-  // The default name+suffix+LF path uses well under 105 bytes; the
-  // growth is a strict superset.
-  //
-  // _rn_lf_extra_scratch -- 16-byte scratch for long_format_line's
-  // extra_ptr (mtime_ns at [0..8), owner_row at [8..16)). Both fields
-  // are placeholder 0 at v1.1.0 -- see ENH-008 (owner) and the plan
-  // doc §7 for the kernel readnext-record growth (mtime, mode_bits,
-  // size). 2 u64 lanes.
-  //
-  // _rn_sgr_prefix_scratch -- 8-byte scratch for a color SGR prefix
-  // emit ("ESC [ N N m" max 6 bytes; 1 u64 lane leaves headroom).
-  //
-  // _rn_sgr_suffix_scratch -- 8-byte scratch for the fixed 4-byte
-  // color SGR suffix ("ESC [ 0 m").
-  pub let mut _rn_entry_buf          : [u64; 16] = uninit @align(8)
-  pub let mut _rn_line_buf           : [u64; 32] = uninit @align(8)
-  pub let mut _rn_lf_extra_scratch   : [u64; 2]  = uninit @align(8)
-  pub let mut _rn_sgr_prefix_scratch : [u64; 1]  = uninit @align(8)
-  pub let mut _rn_sgr_suffix_scratch : [u64; 1]  = uninit @align(8)
 
-  // ls.ENH-020 (#38): GDF (--group-directories-first) buffering state.
+  // Bytes to skip past the fixed record header (ino@0 u64 +
+  // name_len@8 u16 + type@10 u8 + reserved@11 u8 = 12 bytes) to reach
+  // name[0]. Frozen at paideia-os src/kernel/core/syscall/
+  // sys_getdents.pdx §Record layout for R56.M3.
+  pub let RN_REC_HDR_BYTES  : u64 = 12
+  // Mask that isolates name_len from a u64 load at (cursor + 8).
+  // The load spans name_len (2 bytes) + type (1) + reserved (1) +
+  // name[0..4] (4); the mask keeps only the two low bytes.
+  pub let RN_NAME_LEN_MASK  : u64 = 0xFFFF
+  // Directory getdents batch size. Fixed at one page; see PosixShim's
+  // PSH_GETDENTS_BUF_CAP for the rationale.
+  pub let RN_GD_BUF_CAP     : u64 = 4096
+  // sys_stat path_len_hint. Fixed at 255 -- see PosixShim's
+  // PSH_PATH_HINT_DEFAULT and design/user/syscall-table.md row 85 for
+  // the walker-CAP convention.
+  pub let RN_STAT_PATH_HINT : u64 = 255
+
+  // ==========================================================================
+  // Immutable defaults (.rodata).
   //
-  // _rn_gdf_mode  -- non-zero for the whole call when AS_BIT_GDF was
-  //                  set on flag_bits (computed once at entry).
-  // _rn_gdf_count -- entries buffered into _rn_gdf_buf so far (collect
-  //                  phase) / total buffered (emit phase).
-  // _rn_gdf_idx   -- emission cursor into _rn_gdf_order_buf (emit phase).
-  // _rn_gdf_buf   -- up to RN_GDF_MAX_ENTRIES (64) 128-byte
-  //                  PdxFsDirEntry records, packed (64*16 = 1024 u64
-  //                  lanes = 8192 bytes).
-  // _rn_gdf_kinds_buf  -- one low-nibble kind code per buffered entry
-  //                       (GroupSort::group_sort_partition's input).
-  // _rn_gdf_order_buf  -- GroupSort::group_sort_partition's output: a
-  //                       permutation of 0.._rn_gdf_count-1, dirs
-  //                       first, stable within each group.
-  pub let mut _rn_gdf_mode        : u64 = uninit @align(8)
-  pub let mut _rn_gdf_count       : u64 = uninit @align(8)
-  pub let mut _rn_gdf_idx         : u64 = uninit @align(8)
-  pub let mut _rn_gdf_buf         : [u64; 1024] = uninit @align(8)
-  pub let mut _rn_gdf_kinds_buf   : [u64; 64]   = uninit @align(8)
-  pub let mut _rn_gdf_order_buf   : [u64; 64]   = uninit @align(8)
-
-  // ls.ENH-016 (#34): non-zero for the whole call when any of
-  // AS_BIT_T / AS_BIT_S / AS_BIT_R_REV was set on flag_bits (computed
-  // once at entry, mirrors _rn_gdf_mode). OR'd alongside _rn_gdf_mode
-  // at every "take the buffered path" decision point so a sort-only
-  // request (no -R, no --group-directories-first) still buffers --
-  // see the file-header "-t / -S / -r SORT OPTIONS" section. Reuses
-  // _rn_gdf_buf / _rn_gdf_count / _rn_gdf_idx / _rn_gdf_order_buf;
-  // no dedicated buffer of its own.
-  pub let mut _rn_sort_mode       : u64 = uninit @align(8)
-
-  // ls.ENH-017 (#35): -R (recursive) buffering state. Same shape as
-  // the GDF state above, for the same reason: the held dir cap is
-  // forward-only, so every recursion candidate has to be captured
-  // during the single pass over the directory and replayed afterward.
+  // _rn_default_path -- ".\0" (0x2E 0x00). Used when path_ptr == 0
+  //   at Runner entry (the pos_count-0 case Dispatch passes through
+  //   as the _as_path_ptr sentinel). Explicit NUL terminator so
+  //   sys_open's user_read_str_via_walk halts inside the two-byte
+  //   footprint rather than reading into the next .rodata symbol.
   //
-  // _rn_r_mode     -- non-zero for the whole call when AS_BIT_R_REC
-  //                   was set (computed once at entry, mirrors
-  //                   _rn_gdf_mode).
-  // _rn_r_path_ptr -- path_ptr stashed at entry, BEFORE the GDF
-  //                   partition phase permanently repurposes r12 as a
-  //                   scratch count (see rn_ls_gdf_partition's own
-  //                   comment) -- r12 is therefore not a reliable
-  //                   carrier of path_ptr by the time the -R header
-  //                   phase runs at rn_ls_done, regardless of whether
-  //                   GDF mode was also requested.
-  // _rn_r_count    -- entries buffered into _rn_r_buf so far.
-  // _rn_r_idx      -- header-emission cursor (rn_ls_done's -R phase).
-  // _rn_r_buf      -- up to RN_R_MAX_ENTRIES (64) 128-byte
-  //                   PdxFsDirEntry records, packed identically to
-  //                   _rn_gdf_buf (64*16 = 1024 u64 lanes).
-  pub let mut _rn_r_mode          : u64 = uninit @align(8)
-  pub let mut _rn_r_path_ptr      : u64 = uninit @align(8)
-  pub let mut _rn_r_count         : u64 = uninit @align(8)
-  pub let mut _rn_r_idx           : u64 = uninit @align(8)
-  pub let mut _rn_r_buf           : [u64; 1024] = uninit @align(8)
+  // _rn_newline -- 0x0A. Written after each directory entry name so
+  //   the output stays one-name-per-line without a per-call
+  //   composition step.
+  // ==========================================================================
+  pub let _rn_default_path : [u8; 2] = [0x2E, 0x00]
+  pub let _rn_newline      : [u8; 1] = [0x0A]
 
-  // ls.ENH-015 (#33): non-zero once rn_ls_file_fallback has composed
-  // and dispatched the single synthetic entry for a non-directory cap.
-  // rn_ls_continue checks this BEFORE the GDF check so the loop
-  // terminates after exactly one entry instead of calling
-  // pdxfs_dir_readnext again (which would re-hit the same -EBADF and
-  // spin forever on a file cap).
-  pub let mut _rn_single_file_mode : u64 = uninit @align(8)
-
-  // ls.ENH-018 (#36): multi-column default-output buffering state. Same
-  // "compute once, stash in .bss" shape as _rn_gdf_mode / _rn_sort_mode
-  // / _rn_r_mode above -- see the file-header "MULTI-COLUMN DEFAULT
-  // OUTPUT" section for the full flow.
+  // ==========================================================================
+  // .bss scratch.
   //
-  // _rn_multicol_mode  -- non-zero for the whole call when multi-column
-  //                       rendering applies (computed once at entry;
-  //                       see the gate's own comment block for the
-  //                       exact on/off decision table).
-  // _rn_col_count      -- accepted (non-hidden) entries collected so
-  //                       far into _rn_col_name_ptrs / _rn_col_name_lens.
-  // _rn_col_cursor     -- walk cursor over _rn_gdf_order_buf during the
-  //                       collection pass (rn_ls_multicol_collect); a
-  //                       dedicated cursor, NOT _rn_gdf_idx, so the two
-  //                       buffered-emission strategies (per-entry vs.
-  //                       multicol) never share mutable cursor state.
-  // _rn_col_name_ptrs  -- up to RN_R_MAX_ENTRIES (64) name-byte
-  //                       pointers, interior into _rn_gdf_buf's already-
-  //                       buffered records (no copy -- the records
-  //                       outlive the collection pass).
-  // _rn_col_name_lens  -- parallel array of clamped name lengths.
-  // _rn_col_render_buf -- RN_COL_RENDER_BUF_CAP (5280) byte destination
-  //                       Columns::columns_layout renders the whole
-  //                       grid into before a single tty_write.
-  pub let mut _rn_multicol_mode    : u64 = uninit @align(8)
-  pub let mut _rn_col_count        : u64 = uninit @align(8)
-  pub let mut _rn_col_cursor       : u64 = uninit @align(8)
-  pub let mut _rn_col_name_ptrs    : [u64; 64]  = uninit @align(8)
-  pub let mut _rn_col_name_lens    : [u64; 64]  = uninit @align(8)
-  pub let mut _rn_col_render_buf   : [u64; 660] = uninit @align(8)
+  // _rn_getdents_buf -- 4096-byte user scratch sys_getdents writes
+  //   into (one batch at a time). 513 u64 lanes @align(8): the
+  //   first 512 (= 4096 bytes = RN_GD_BUF_CAP) are the syscall
+  //   destination; the trailing 8-byte lane is unused headroom the
+  //   record walk relies on. The walk's name_len extraction does a
+  //   u64 load at (cursor + 8); when the last live record sits
+  //   flush against the batch tail the cursor advances into the
+  //   12-byte terminator header, and the load at
+  //   (terminator_start + 8) reads 4 bytes past the terminator's
+  //   own name_len field. Without the headroom lane, an exactly-
+  //   full 4096-byte return (kernel guarantees a terminator so this
+  //   is the tight worst case) would overread the last 4 bytes
+  //   into whatever .bss symbol the linker packed next -- benign
+  //   if it is also .bss, but a fault risk if the next page were
+  //   unmapped. The pad lane keeps the overread strictly within
+  //   this symbol.
+  //
+  // _rn_stat_buf -- 64-byte user scratch sys_stat writes into.
+  //   8 u64 lanes @align(8). v1.1-A only uses the buffer as an
+  //   existence-check sink -- no field is inspected -- but the
+  //   allocation is real so the syscall does not fault on a null
+  //   write pointer.
+  // ==========================================================================
+  pub let mut _rn_getdents_buf : [u64; 513] = uninit @align(8)
+  pub let mut _rn_stat_buf     : [u64; 8]   = uninit @align(8)
 
   // ==========================================================================
   // runner_ls(path_ptr, flag_bits) -> u64
   //
-  // Signature: (u64, u64) -> u64 !{mem, sysreg} @{cap}
-  //   RDI (input): path_ptr   -- NUL-terminated path (informational at
-  //                              M3 -- shell narrows the dir cap at
-  //                              exec; kept in the signature for the
-  //                              R51+ path-multiplex round).
-  //   RSI (input): flag_bits  -- OR of ArgvSurface::AS_BIT_*.
-  //   RAX (output): LS_OK on success; one of the substrate-error
-  //                 sub-band codes (see file header) on refusal.
+  // Signature: (u64, u64) -> u64 !{mem, sysreg} @{}
+  //   RDI (input): path_ptr  -- NUL-terminated user path; 0 -> "."
+  //   RSI (input): flag_bits -- IGNORED at v1.1-A (see file header)
+  //   RAX (output): LS_OK on success, LS_ERR_BAD_PATH if the path
+  //                 does not resolve, LS_ERR_READDIR if enumeration
+  //                 fails after the path resolves.
   //
-  // See file header §Flow for the step-by-step body.
+  // Register plan (non-leaf, 5 callee-save pushes -- see file
+  // header §PAIDEIA-AS CONFORMANCE for the alignment arithmetic):
+  //   rbx = fd (from sys_open; held across the getdents loop and
+  //             the close call).
+  //   r12 = record cursor (moves through the getdents batch).
+  //   r13 = record end (base + bytes returned by the last
+  //         sys_getdents call).
+  //   r14 = _rn_getdents_buf base (loaded once via lea).
+  //   rbp = path_ptr (saved from the initial rdi; sys_stat and
+  //         sys_open both consume rdi so we cannot leave it live
+  //         in-place).
+  //   r10 = scratch (name_len extraction; not preserved across
+  //         calls, refreshed per record).
+  //   r11 = scratch (LEA base for .rodata reaches; not preserved).
   // ==========================================================================
-  pub let runner_ls : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+  pub let runner_ls : (u64, u64) -> u64 !{mem, sysreg} @{} =
     fn (path_ptr: u64) (flag_bits: u64) -> unsafe {
-      effects: {mem, sysreg}, capabilities: {cap},
-      justification: "ls.M3-001 (#8) + ls.M3-003 (#10): Runner flips from LS_RUN_STUB to a real iteration body, wrapped in a libpdx-audit DirListRecord frame (D3 audit-first). Uses pdxfs_dir_readnext (sysno 72) against a pre-handed KIND_PDXFS_FILE(read, <arg-path>) at LS_DIR_CAP_SLOT (2, per caps.decl order). Bumps LS_ST_RUNS on entry unconditionally so the counter records every ATTEMPT. Argument gates preserve the M1 shape: null path_ptr resolves through the read loop with the pre-handed cap (informational path; shell narrowed the cap already); non-null path_ptr with byte0 == 0 refuses with LS_ERR_BAD_PATH. M3-003 audit-open: audit_ls_begin(path_ptr, flag_bits) called AFTER the path gate and BEFORE sem_emit_reset -- this is the boundary the D3 invariant pins (no user-visible byte until the audit frame is open). Refusal returns LS_ERR_AUDIT (0xFFFFEB26). Emit prelude: sem_emit_reset + sem_emit_bind_stdout must succeed before the read loop; bind refusal returns LS_ERR_EMIT_BIND. Loop: pdxfs_dir_readnext(LS_DIR_CAP_SLOT, &_rn_entry_buf); rc == 1 -> proceed; rc == 0 -> break; else LS_ERR_READDIR. Per-entry: extract name_len (offset 16) + name_ptr (offset 24) from the 128-byte record; hidden_filter_accept(name_ptr, flag_bits & AS_BIT_A) -- rejects bump LS_ST_HIDDEN and loop; accepts compose name + '\\n' in _rn_line_buf (byte copy loop with #1248 mitigation) and tty_write; tty_write refusal (negative rax) -> LS_ERR_TTY_WRITE; then sem_emit_entry (144-byte record over the bound stdout endpoint, M3-002 shape with owner Cap wire) -> LS_ERR_EMIT_SEND on refusal; bump LS_ST_ENTRIES; continue. Every ret path (except the pre-audit LS_ERR_BAD_PATH -- but that too goes through the same epilogue because audit_ls_commit is a no-op on _au_id == 0) flows through rn_ls_epilogue which saves exit_code in r13 (dead at epilogue -- flag_bits done), calls audit_ls_commit, then restores rax and unwinds. Six callee-save pushes (rbx = LS_DIR_CAP_SLOT copy; r12 = path_ptr; r13 = flag_bits then exit_code carry; r14 = name_len for the current entry; r15 = _rn_line_buf base for the tty_write call; rbp = name_ptr for the tty_write + hidden_filter_accept chain) + sub rsp,8 pad = 56 bytes; entry rsp % 16 == 8; 8 + 56 = 64; 64 % 16 == 0 at every nested-call site (ls_note, audit_ls_begin, sem_emit_reset, sem_emit_bind_stdout, pdxfs_dir_readnext, hidden_filter_accept, tty_write, sem_emit_entry, audit_ls_commit). Matched add rsp,8 + 6 pops before every ret via the shared rn_ls_epilogue label. paideia-as conformance: r11 + r10 for LEA + byte-address scratch; no test mnemonic; largest cmp immediate 128 (RN_ENT_SIZE) fits imm32; the 0xFFFFEB2x return sentinels are mov rax, imm64 emissions, not compares. Effects widened to !{mem, sysreg} @{cap} matching the union of the callees (pdxfs_dir_readnext + tty_write + sem_emit_entry + audit_ls_begin + audit_ls_commit all carry {mem, sysreg}; pdxfs_dir_readnext + sem_emit_entry + audit_ls_begin + audit_ls_commit carry @{cap}). ls.ENH-017 (#35): -R adds two seams, both using only caller-save registers (rax, rcx, rdx, rdi, rsi, r8, r9, r10, r11) so none of the six callee-save carriers above are disturbed. (1) At rn_ls_render_dispatch's entry (per-entry, after hidden_filter_accept has already run), gated on _rn_r_mode: RecurseFilter::recurse_should_descend(kind_nibble, name_ptr) decides candidacy; a qualifying entry is bulk-copied (16-lane loop, identical shape to the GDF collect-copy loop) into _rn_r_buf at slot _rn_r_count, which is bumped after. Overflow (more than RN_R_MAX_ENTRIES=64 buffered) refuses via the existing rn_ls_readdir_fail_real target (LS_ERR_READDIR), mirroring GDF's own overflow discipline verbatim -- unreachable at HEAD for the same 'kernel readnext is a fixed small stub' reason GDF's bound is. (2) At rn_ls_done, gated on the same _rn_r_mode flag: a second loop (rn_ls_recurse_emit_loop) walks _rn_r_buf via _rn_r_idx, extracting name_len + name_ptr per buffered record and calling RecurseHeader::recurse_header_compose(path_ptr, name_ptr, name_len, dst_ptr, dst_cap) with path_ptr read from _rn_r_path_ptr (stashed at function entry, BEFORE rn_ls_gdf_partition permanently repurposes r12 -- see that label's own comment -- so r12 is not a reliable path_ptr carrier by rn_ls_done regardless of whether GDF mode also ran) and dst_ptr/dst_cap set to _rn_line_buf/256 (the same scratch buffer the per-entry render dispatch already uses, now free since that loop has drained). The composed header is written via the existing tty_write trampoline; both recurse_header_compose's overflow sentinel and tty_write's negative-errno return collapse through the existing rn_ls_tty_fail path (LS_ERR_TTY_WRITE), matching every other tty_write call site in this function. r14 is reused post-loop as the composed-header byte count (safe: the per-entry dispatch that owns r14 as 'name_len for the current entry' has fully drained by rn_ls_done). Neither recurse_should_descend ({mem} @{}) nor recurse_header_compose ({mem} @{}) widens this function's own {mem, sysreg} @{cap} declaration -- both are subsets. ls.ENH-018 (#36): a multicol mode gate (rn_ls_mc_on/rn_ls_mc_off, right after the -R state init, using only caller-save r10/r11 plus one call to tty_probe_is_tty) computes _rn_multicol_mode once at entry -- OFF when AS_BIT_L/AS_BIT_JSON/AS_BIT_ONE/AS_BIT_F/AS_BIT_COLOR is set, else ON when AS_BIT_C_MAJ is explicit or tty_probe_is_tty() (TtyWrite, src/tty_write.pdx; honestly always 0 today, see its own doc) reports a TTY. _rn_multicol_mode widens rn_ls_pre_emit's buffered-path branch alongside _rn_gdf_mode/_rn_sort_mode, and rn_ls_order_ready redirects to rn_ls_multicol_collect (instead of rn_ls_gdf_emit_next) when set: a dedicated walk over the already-finalized _rn_gdf_order_buf that runs hidden_filter_accept and the same -R recursion-candidate copy rn_ls_render_dispatch performs per entry (rbx = record_ptr, rbp = name_ptr, r14 = clamped name_len -- the same two roles rn_ls_have_entry assigns rbp/r14, reused here since neither is live across this alternate path), appends every accepted entry's name_ptr/name_len into _rn_col_name_ptrs/_rn_col_name_lens (capped at 64, overflow -> rn_ls_readdir_fail_real, mirroring every other buffered-listing cap in this file), and calls sem_emit_entry per accepted entry (unchanged across every render path). rn_ls_multicol_render then calls Columns::columns_layout (src/columns.pdx) once against the whole collected array with RN_COL_TERM_WIDTH (80, the only width available absent a real TTY-width query) and RN_COL_RENDER_BUF_CAP (5280) into _rn_col_render_buf, tty_writes the composed grid in one call (overflow -> rn_ls_tty_fail, matching long_format_line/json_line_render's own overflow-sentinel convention), then jumps into the same rn_ls_done label (and its -R header-emission phase) every other path converges on. Neither tty_probe_is_tty ({} @{}) nor columns_layout ({mem} @{}) widens this function's own {mem, sysreg} @{cap} declaration. ls.ENH-021 (#39): two more additions, both using only caller-save registers plus the r13 flag_bits copy that is already guaranteed live at both insertion points (rn_ls_pre_emit runs before r13 is ever repurposed; rn_ls_success runs before rn_ls_epilogue's r13 reuse as exit_code carry). (1) At rn_ls_pre_emit, right after the bind check and before rbx is loaded for the read loop (this label is reached exactly once per call -- no other jump targets it), a gate on RN_BIT_L_MASK calls LongTotal::long_total_compute(0, 0) (placeholder args; the honest-gap result is invariant under them -- see that function's own doc) and composes 'total <N>\\n' into _rn_line_buf via direct mov_b literal stores for the six-byte 'total ' prefix, Render::render_dec_u64 for the decimal, and one more mov_b for the trailing LF, then tty_write's it; tty_write's negative-errno return collapses through the existing rn_ls_tty_fail path like every other tty_write call site in this function. r12/r14/r15/rbp are all dead at this exact point (r12's own 'dead by this point' comment already covers it; r14/r15/rbp are not assigned until rn_ls_have_entry, much later) so this block freely uses r14 as a total_blocks/digit-count carrier across the render_dec_u64 call without any spill -- render_dec_u64 is documented callee-save-preserving (its own module doc: 'four callee-save pushes for pipeline stability') so r13 (flag_bits) and r14 both survive the call intact. (2) At rn_ls_success, before the LS_OK return, a gate on RN_BIT_L_MASK AND RN_BIT_JSON_MASK (both read from the still-live r13) calls LongTotal::long_total_summary_record_compose(0, 0, 0, dst=&_rn_line_buf, 256) and tty_write's the composed 32-byte record verbatim -- reusing the same buffer and trampoline every --json line already goes through, per the issue's own 'via the existing --json path' scope note, rather than standing up a second semantic-pipe endpoint bind (paideia-os/ls#30's schema-registry migration -- SemanticEmit's PdxFsDirEntry stdout bind onto Registry::bind_by_name -- is a separate landing and does not itself provide that second bind slot; see SemanticEmit::_se_summary_schema_name's own deferred-comment marker). Both new call sites keep this function's own effects {mem, sysreg} @{cap} unchanged: long_total_compute is {} @{} and long_total_summary_record_compose is {mem} @{}, both strict subsets. ls.ENH-014 (#32): one more addition at rn_ls_pre_emit, right after the bind check and BEFORE the -l total-line gate (so a header always precedes any content this call emits) -- gated on RN_BIT_HEADER_MASK (0x8000, read from the still-live r13; a Dispatch-private bit, never argv-parsed, see ArgvSurface's own 'RESERVED' note), composes '[\\n]<path>:\\n' via RecurseHeader::multipath_header_compose(path_ptr=r12, leading_blank, dst=&_rn_line_buf, 256) -- leading_blank is 1 when RN_BIT_HEADER_BLANK_MASK (0x10000) is also set (every call after the first in Dispatch's per-positional loop), else 0 -- and writes it via the same tty_write trampoline every other render path in this function uses; both the composer's overflow sentinel and tty_write's negative-errno return collapse through the existing rn_ls_tty_fail path, matching every other tty_write call site here. Uses only caller-save registers (rdi, rsi, rdx, rcx, r10, r11, rax) plus the already-live r12/r13, so none of the six callee-save carriers are disturbed. multipath_header_compose is {mem} @{}, a strict subset of this function's own {mem, sysreg} @{cap}. ls.ENH-008 (#28): at rn_ls_render_long's entry, BEFORE kind_mode_flags is built into r10 (r10 is caller-save and would otherwise be live across the call), a call to OwnerCol::owner_col_owner_row_from_entry(&_rn_entry_buf) populates _rn_lf_extra_scratch's owner_row lane (offset 8) via a named honest-gap accessor instead of an inline `xor rax, rax` -- same discipline as the sem_emit_entry / sem_emit_wire_compose call sites in src/semantic_emit.pdx. Uses only caller-save registers (rdi, rax, r11); none of the six callee-save carriers are disturbed. owner_col_owner_row_from_entry is {} @{}, a strict subset of this function's own {mem, sysreg} @{cap}. Labels prefixed rn_ls_.",
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "ls v1.1-A: real path-addressed body replacing the M1-M4 cap-slot STUB (which called sys_pdxfs_dir_readnext (sysno 72) on a pre-narrowed KIND_PDXFS_FILE cap that shell.M2's InitCap handoff never populated -- every invocation returned LS_ERR_READDIR at HEAD). Flow: default path_ptr to _rn_default_path (\".\\0\") when 0 (the pos_count-0 case Dispatch passes as the _as_path_ptr sentinel); sys_stat as an existence check that surfaces missing-path as LS_ERR_BAD_PATH ahead of the more expensive open+enumerate path; sys_open (O_RDONLY=0, mode=0) -> fd; loop sys_getdents with a 4096-byte .bss buffer until it returns 0 (EOD); walk each returned batch record-by-record extracting name_len via a u64 load + 0xFFFF mask at cursor+8 (avoids needing a mov_w mnemonic paideia-as's encoder does not yet expose to userspace) and calling tty_write per name and per newline; sys_close on the way out. Every error path (open failure, getdents failure) drains fd via sys_close before returning LS_ERR_READDIR so the fd table does not leak. flag_bits is read-past at v1.1-A (see file-header §FLAG BITS) -- the substantive user flags (-l/-a/-h/--color/--json/-R/-t/-S/-r/-1/-C/-F/--group-directories-first) and the Dispatch<->Runner header bits (RN_BIT_HEADER_MASK / RN_BIT_HEADER_BLANK_MASK) all defer to later rounds. Non-leaf: 5 callee-save pushes (rbx=fd, r12=cursor, r13=end, r14=buf-base, rbp=path_ptr) = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48; 48 % 16 == 0 at every nested-call site (sys_stat, sys_open, sys_getdents, sys_close, tty_write). No `sub rsp, 8` pad needed -- the 5-push count already restores 16-byte alignment. Matched 5 pops via the single shared rn_ls_epilogue label. paideia-as conformance: no test mnemonic (every zero-check via cmp reg, 0); every cmp reg, imm uses imm <= 0x7FFFFFFF (0, 12, 255, 4096, 0xFFFF; every larger sentinel is a mov rax, imm64 emission). No byte reads (the u64 load + mask sidesteps mov_w; name payload is passed by pointer to tty_write, never inspected byte-wise here). r10 and r11 both scratch. Labels prefixed rn_ls_.",
       block: {
-        // ---- 6-push prologue + 8-byte alignment pad ------------------
         push rbx;
         push r12;
         push r13;
         push r14;
-        push r15;
         push rbp;
-        sub rsp, 8;                              // rsp % 16 == 0 for nested calls
-
-        mov r12, rdi;                            // path_ptr
-        mov r13, rsi;                            // flag_bits
-
-        // ---- Bump LS_ST_RUNS -----------------------------------------
-        mov rdi, 2;                              // RN_STAT_RUNS
-        call ls_note;
-
-        // ---- ls.ENH-020 (#38): GDF mode + collect-state init ----------
-        //
-        // Compute AS_BIT_GDF membership once and stash it in .bss --
-        // every callee-save register is already committed for the
-        // rest of this function (see the file-header register plan),
-        // so there is no free register to carry a mode flag across
-        // the whole body. Zero the buffered-entry bookkeeping
-        // unconditionally; only the GDF path reads it, but a clean
-        // start costs nothing on the non-GDF path.
-        mov r10, r13;                            // flag_bits copy
-        mov r11, 0x2000;                         // RN_BIT_GDF_MASK
-        and r10, r11;
-        lea r11, [rip + _rn_gdf_mode];
-        mov [r11], r10;
-        lea r11, [rip + _rn_gdf_count];
-        mov r10, 0;
-        mov [r11], r10;
-        lea r11, [rip + _rn_gdf_idx];
-        mov [r11], r10;
-
-        // ---- ls.ENH-016 (#34): sort mode init --------------------------
-        //
-        // Same "compute once, stash in .bss" rationale as the GDF
-        // block above. RN_BIT_T_MASK | RN_BIT_S_MASK | RN_BIT_R_REV_
-        // MASK = 0x40 | 0x80 | 0x100 = 0x1C0.
-        mov r10, r13;                            // flag_bits copy
-        mov r11, 0x1C0;                          // T | S | R_REV masks
-        and r10, r11;
-        lea r11, [rip + _rn_sort_mode];
-        mov [r11], r10;
-
-        // ---- ls.ENH-017 (#35): -R mode + state init -------------------
-        //
-        // Same "compute once, stash in .bss" rationale as the GDF block
-        // above -- every callee-save register is already committed.
-        // _rn_r_path_ptr MUST be captured here, before rn_ls_gdf_
-        // partition (reached only when GDF mode is also on) permanently
-        // repurposes r12 as a scratch count; r12 is otherwise still
-        // holding the original path_ptr at this exact point (right
-        // after the prologue, before the path-arg gate).
-        mov r10, r13;                            // flag_bits copy
-        mov r11, 0x200;                          // RN_BIT_R_MASK
-        and r10, r11;
-        lea r11, [rip + _rn_r_mode];
-        mov [r11], r10;
-        lea r11, [rip + _rn_r_count];
-        mov r10, 0;
-        mov [r11], r10;
-        lea r11, [rip + _rn_r_idx];
-        mov [r11], r10;
-        lea r11, [rip + _rn_r_path_ptr];
-        mov [r11], r12;                          // stash path_ptr
-
-        // ls.ENH-015 (#33): clear the single-file-fallback flag every
-        // call -- only rn_ls_file_fallback ever sets it.
-        lea r11, [rip + _rn_single_file_mode];
-        mov r10, 0;
-        mov [r11], r10;
-
-        // ---- ls.ENH-018 (#36): multicol mode gate ---------------------
-        //
-        // See the file-header "MULTI-COLUMN DEFAULT OUTPUT" section for
-        // the full decision table. Default OFF; a disabling flag short-
-        // circuits to OFF; absent any of those, -C forces ON, else the
-        // (today always-false) tty_probe_is_tty() probe decides.
-        lea r11, [rip + _rn_multicol_mode];
-        mov r10, 0;
-        mov [r11], r10;
-        lea r11, [rip + _rn_col_count];
-        mov [r11], r10;
-        lea r11, [rip + _rn_col_cursor];
-        mov [r11], r10;
-
-        mov r10, r13;
-        mov r11, 0x1;                            // AS_BIT_L
-        and r10, r11;
-        cmp r10, 0;
-        jne rn_ls_mc_off;
-
-        mov r10, r13;
-        mov r11, 0x8;                            // AS_BIT_JSON
-        and r10, r11;
-        cmp r10, 0;
-        jne rn_ls_mc_off;
-
-        mov r10, r13;
-        mov r11, 0x400;                          // AS_BIT_ONE
-        and r10, r11;
-        cmp r10, 0;
-        jne rn_ls_mc_off;
-
-        mov r10, r13;
-        mov r11, 0x1000;                         // AS_BIT_F
-        and r10, r11;
-        cmp r10, 0;
-        jne rn_ls_mc_off;
-
-        mov r10, r13;
-        mov r11, 0x20;                           // AS_BIT_COLOR
-        and r10, r11;
-        cmp r10, 0;
-        jne rn_ls_mc_off;
-
-        mov r10, r13;
-        mov r11, 0x800;                          // AS_BIT_C_MAJ
-        and r10, r11;
-        cmp r10, 0;
-        jne rn_ls_mc_on;
-
-        call tty_probe_is_tty;
-        cmp rax, 0;
-        je  rn_ls_mc_off;
-
-      rn_ls_mc_on:
-        mov r10, 1;
-        lea r11, [rip + _rn_multicol_mode];
-        mov [r11], r10;
-
-      rn_ls_mc_off:
-        // ---- Path arg gate (empty-string reject preserved from M1) --
-        cmp r12, 0;
-        je  rn_ls_audit_open;                    // null path -> proceed
-        xor rax, rax;
-        mov_b rax, [r12];
-        cmp rax, 0;
-        je  rn_ls_bad_path;
-
-      rn_ls_audit_open:
-        // ---- M3-003: open DirListRecord audit frame (D3) -------------
-        //
-        // MUST happen before any user-visible byte reaches KIND_TTY
-        // or the semantic-pipe endpoint. On refusal, we return
-        // LS_ERR_AUDIT via the epilogue -- audit_ls_commit is a no-op
-        // when _au_id == 0 (which it stays on refusal), so the
-        // unified epilogue is safe.
-        mov rdi, r12;                            // path_ptr
-        mov rsi, r13;                            // flag_bits
-        call audit_ls_begin;
-        cmp rax, 0;                              // AU_OK
-        jne rn_ls_audit_fail;
-
-      rn_ls_pre_emit:
-        // ---- Emit prelude: schema-imprint + bind ---------------------
-        call sem_emit_reset;
-        call sem_emit_bind_stdout;
-        cmp rax, 0;                              // SE_OK
-        jne rn_ls_bind_fail;
-
-        // ---- ls.ENH-014 (#32): multi-path "<path>:" header ------------
-        //
-        // See the file-header "MULTI-PATH LISTING HEADER" section for
-        // the full flow. Gated on RN_BIT_HEADER_MASK (Dispatch-private,
-        // read from r13 -- flag_bits, still live and unchanged since
-        // entry). RN_BIT_HEADER_BLANK_MASK additionally requests the
-        // leading blank line Dispatch sets for every call after the
-        // first in its per-positional loop. r12 (path_ptr) is still
-        // live here -- the GDF partition phase that later repurposes
-        // it has not run yet.
-        mov r10, r13;
-        mov r11, 0x8000;                         // RN_BIT_HEADER_MASK
-        and r10, r11;
-        cmp r10, 0;
-        je  rn_ls_header_skip;
-
-        mov rdi, r12;                            // path_ptr (0 => ".")
-
-        mov r10, r13;
-        mov r11, 0x10000;                        // RN_BIT_HEADER_BLANK_MASK
-        and r10, r11;
-        cmp r10, 0;
-        je  rn_ls_header_no_blank;
-        mov rsi, 1;                              // leading_blank = 1
-        jmp rn_ls_header_compose;
-
-      rn_ls_header_no_blank:
-        mov rsi, 0;                              // leading_blank = 0
-
-      rn_ls_header_compose:
-        lea r11, [rip + _rn_line_buf];
-        mov rdx, r11;                            // dst_ptr
-        mov rcx, 256;                            // dst_cap
-        call multipath_header_compose;
-        mov r11, 0xFFFFFFFFFFFFFFFF;
-        cmp rax, r11;
-        je  rn_ls_tty_fail;                      // header too long -- reuse
-
-        lea r11, [rip + _rn_line_buf];
-        mov rdi, r11;
-        mov rsi, rax;                            // bytes composed
-        call tty_write;
-        cmp rax, 0;
-        jl  rn_ls_tty_fail;
-
-      rn_ls_header_skip:
-        // ---- ls.ENH-021 (#39): "-l" pre-listing "total N" line --------
-        //
-        // Reached exactly once per call (rn_ls_pre_emit is never a
-        // jump target -- only fallen into, right after the bind check
-        // above). r12/r14/r15/rbp are all dead here (see the file
-        // header's own liveness notes), so this block is free to use
-        // r14 as scratch without spilling anything; r13 (flag_bits) is
-        // read-only here and stays live for the rest of the function.
-        mov r10, r13;                             // flag_bits copy
-        mov r11, 1;                               // RN_BIT_L_MASK
-        and r10, r11;
-        cmp r10, 0;
-        je  rn_ls_total_skip;
-
-        // entries_ptr = 0, count = 0 -- placeholder args; the result is
-        // invariant under them (see LongTotal::long_total_compute's
-        // own doc).
-        xor rdi, rdi;                             // entries_ptr = 0
-        xor rsi, rsi;                             // count = 0
-        call long_total_compute;
-        mov r14, rax;                             // total_blocks (0 at HEAD)
-
-        // Compose "total " (6 literal bytes) into _rn_line_buf[0..6).
-        lea r11, [rip + _rn_line_buf];
-        mov rax, 0x74;                            // 't'
-        mov_b [r11], rax;
-
-        lea r11, [rip + _rn_line_buf]; add r11, 1;
-        mov rax, 0x6F;                            // 'o'
-        mov_b [r11], rax;
-
-        lea r11, [rip + _rn_line_buf]; add r11, 2;
-        mov rax, 0x74;                            // 't'
-        mov_b [r11], rax;
-
-        lea r11, [rip + _rn_line_buf]; add r11, 3;
-        mov rax, 0x61;                            // 'a'
-        mov_b [r11], rax;
-
-        lea r11, [rip + _rn_line_buf]; add r11, 4;
-        mov rax, 0x6C;                            // 'l'
-        mov_b [r11], rax;
-
-        lea r11, [rip + _rn_line_buf]; add r11, 5;
-        mov rax, 0x20;                            // ' '
-        mov_b [r11], rax;
-
-        // Render the decimal total at _rn_line_buf[6..], cap 32 --
-        // ample headroom inside the 256-byte _rn_line_buf for a u64's
-        // max 20 digits.
-        lea r11, [rip + _rn_line_buf];
-        add r11, 6;
-        mov rdi, r11;
-        mov rsi, 32;
-        mov rdx, r14;                             // total_blocks
-        call render_dec_u64;
-        mov r11, 0xFFFFFFFFFFFFFFFF;
-        cmp rax, r11;
-        je  rn_ls_tty_fail;                       // unreachable (32 >> 20
-                                                   // digits) but honest
-        mov r14, rax;                             // digits written
-
-        // Append '\n' right after the digits.
-        lea r11, [rip + _rn_line_buf];
-        add r11, 6;
-        add r11, r14;
-        mov rax, 0x0A;                            // '\n'
-        mov_b [r11], rax;
-
-        // total_len = 6 ("total ") + digits + 1 ('\n')
-        mov r10, 6;
-        add r10, r14;
-        add r10, 1;
-
-        lea r11, [rip + _rn_line_buf];
-        mov rdi, r11;
-        mov rsi, r10;
-        call tty_write;
-        cmp rax, 0;
-        jl  rn_ls_tty_fail;
-
-      rn_ls_total_skip:
-        // ---- Load LS_DIR_CAP_SLOT into rbx for the loop --------------
-        mov rbx, 2;                              // LS_DIR_CAP_SLOT
-
-        // ---- ls.ENH-020 (#38) + ls.ENH-016 (#34) + ls.ENH-018 (#36):
-        // GDF, a requested sort, or multicol mode all branch to the same
-        // collect phase -- multicol always renders the buffered (and,
-        // if requested, already-sorted/grouped) listing column-major,
-        // never the live streaming order. -----------------------------
-        lea r11, [rip + _rn_gdf_mode];
-        mov r10, [r11];
-        cmp r10, 0;
-        jne rn_ls_gdf_collect;
-        lea r11, [rip + _rn_sort_mode];
-        mov r10, [r11];
-        cmp r10, 0;
-        jne rn_ls_gdf_collect;
-        lea r11, [rip + _rn_multicol_mode];
-        mov r10, [r11];
-        cmp r10, 0;
-        jne rn_ls_gdf_collect;
-        // Neither GDF, sort, nor multicol requested: fall through to
-        // the unchanged streaming loop.
-
-      rn_ls_loop:
-        // ---- pdxfs_dir_readnext(LS_DIR_CAP_SLOT, &_rn_entry_buf) ----
-        mov rdi, rbx;                            // dir_cap_slot
-        lea r11, [rip + _rn_entry_buf];
-        mov rsi, r11;                            // entry_buf_va
-        call pdxfs_dir_readnext;
-
-        // rc discriminate.
-        cmp rax, 1;                              // RN_READNEXT_ENTRY
-        je  rn_ls_have_entry;
-        cmp rax, 0;                              // RN_READNEXT_EOD
-        je  rn_ls_done;
-
-        // Any other value -> negative-errno; propagate as LS_ERR_READDIR.
-        jmp rn_ls_readdir_fail;
-
-        // ==============================================================
-        // ls.ENH-020 (#38): GDF (--group-directories-first) phases.
-        //
-        // The held KIND_PDXFS_FILE dir cap is forward-only -- no
-        // rewind/reopen primitive exists in PdxfsShim (src/pdxfs_shim.pdx
-        // exposes only pdxfs_open_dir and pdxfs_dir_readnext) -- so
-        // grouping directories ahead of files requires buffering every
-        // entry before any of them is rendered or emitted. Three phases:
-        //
-        //   rn_ls_gdf_collect      -- drain the directory into
-        //     _rn_gdf_buf (one 128-byte record per slot, up to
-        //     RN_GDF_MAX_ENTRIES). Reuses _rn_entry_buf as the
-        //     pdxfs_dir_readnext scratch target, then bulk-copies it
-        //     into the next free _rn_gdf_buf slot.
-        //   rn_ls_gdf_partition    -- ls.ENH-016 (#34): first, if
-        //     _rn_sort_mode is set, calls the requested SortOptions
-        //     comparator on _rn_gdf_buf in place. Then, if AS_BIT_GDF
-        //     is set, extracts one kind-nibble per buffered record
-        //     into _rn_gdf_kinds_buf and calls
-        //     GroupSort::group_sort_partition to compute a dirs-first,
-        //     stable-within-group emission order into
-        //     _rn_gdf_order_buf; otherwise fills _rn_gdf_order_buf
-        //     with the identity permutation (0..count-1) so the
-        //     buffered-mode emission loop below is uniform regardless
-        //     of which of GDF/sort/-R triggered buffering.
-        //   rn_ls_gdf_emit_next    -- the buffered-mode replacement for
-        //     rn_ls_loop's "get the next entry" step: copies the
-        //     buffered record at the next order-buffer index into
-        //     _rn_entry_buf, advances the cursor, then falls into the
-        //     UNCHANGED per-entry body at rn_ls_have_entry. Every
-        //     "continue" edge in that body now runs through
-        //     rn_ls_continue (above), which redirects here instead of
-        //     rn_ls_loop when GDF mode is on.
-        //
-        // Overflow (more than RN_GDF_MAX_ENTRIES entries): refuses via
-        // the existing rn_ls_readdir_fail path (LS_ERR_READDIR). This
-        // is a real, documented substrate-resource-limit refusal, not
-        // a silent truncation of the grouped listing -- consistent
-        // with this tool's D3 audit-first / no-silent-wrong-output
-        // discipline. Today's kernel readnext is a fixed small stub
-        // (design/enhancement-plan.md §1.1), so this bound is
-        // unreachable at HEAD.
-        //
-        // Symlink-to-directory promotion is NOT implemented. GNU ls
-        // groups a symlink whose target is a directory alongside real
-        // directories; doing that here needs the target's type, which
-        // needs a stat-follow syscall PdxfsShim does not expose. A
-        // symlink entry (kind 0xA) is buffered and partitioned like
-        // any other non-directory entry -- see GroupSort's module doc
-        // comment (src/group_sort.pdx) for the full rationale and the
-        // tracked follow-up.
-        // ==============================================================
-      rn_ls_gdf_collect:
-        mov rdi, rbx;                            // LS_DIR_CAP_SLOT
-        lea r11, [rip + _rn_entry_buf];
-        mov rsi, r11;
-        call pdxfs_dir_readnext;
-
-        cmp rax, 1;                              // RN_READNEXT_ENTRY
-        je  rn_ls_gdf_have_raw;
-        cmp rax, 0;                              // RN_READNEXT_EOD
-        je  rn_ls_gdf_partition;
-
-        jmp rn_ls_readdir_fail;
-
-      rn_ls_gdf_have_raw:
-        // Overflow guard -- reject before writing past _rn_gdf_buf.
-        lea r11, [rip + _rn_gdf_count];
-        mov r14, [r11];                          // current count
-        cmp r14, 64;                             // RN_GDF_MAX_ENTRIES
-        jae rn_ls_readdir_fail;
-
-        // dst_lane_base = count * 16 (16 u64 lanes per 128-byte record)
-        mov r9, r14;
-        shl r9, 4;
-
-        lea r15, [rip + _rn_entry_buf];          // src base
-        lea r8,  [rip + _rn_gdf_buf];             // dst table base
-
-        xor rcx, rcx;                             // lane idx = 0
-
-      rn_ls_gdf_copy_loop:
-        cmp rcx, 16;
-        jae rn_ls_gdf_copy_done;
-
-        mov rax, [r15 + rcx * 8];
-        mov r10, r9;
-        add r10, rcx;                             // absolute dst lane index
-        mov [r8 + r10 * 8], rax;
-
-        add rcx, 1;
-        jmp rn_ls_gdf_copy_loop;
-
-      rn_ls_gdf_copy_done:
-        add r14, 1;
-        lea r11, [rip + _rn_gdf_count];
-        mov [r11], r14;
-        jmp rn_ls_gdf_collect;
-
-      rn_ls_gdf_partition:
-        // r12 (path_ptr) is dead by this point -- the only use of
-        // path_ptr was the M1 empty-string gate at function entry --
-        // so it is safe to repurpose here as the buffered count, for
-        // both the sort step below and the existing GDF partition.
-        lea r11, [rip + _rn_gdf_count];
-        mov r12, [r11];                          // count
-
-        // ============================================================
-        // ls.ENH-016 (#34): apply the requested sort_options
-        // comparator to the buffered _rn_gdf_buf record array BEFORE
-        // any GDF partition (or the identity-fill fallback) runs --
-        // see the file-header "-t / -S / -r SORT OPTIONS" section for
-        // why the ordering matters. r13 (flag_bits) is untouched
-        // since function entry, so it is safe to read here.
-        // ============================================================
-        lea r11, [rip + _rn_sort_mode];
-        mov r10, [r11];
-        cmp r10, 0;
-        je  rn_ls_sort_done;
-
-        // reverse (rdx, staged ahead of the mode dispatch since none
-        // of the AS_BIT_T / AS_BIT_S checks below touch rdx) =
-        // (flag_bits & AS_BIT_R_REV) != 0.
-        mov rax, r13;
-        mov r10, 0x100;                          // AS_BIT_R_REV
-        and rax, r10;
-        cmp rax, 0;
-        je  rn_ls_sort_no_rev;
-        mov rdx, 1;
-        jmp rn_ls_sort_dispatch;
-
-      rn_ls_sort_no_rev:
-        mov rdx, 0;
-
-      rn_ls_sort_dispatch:
-        // AS_BIT_T takes precedence over AS_BIT_S when both are set
-        // (`ls -tS`, an unspecified combination) -- a fixed, documented
-        // tiebreak rather than the "last flag on the command line
-        // wins" GNU ls uses, which the OR'd flag_bits vocabulary this
-        // argv surface builds cannot distinguish (see ArgvSurface's
-        // own module doc for why the bit-OR shape was chosen).
-        mov rax, r13;
-        mov r10, 0x40;                           // AS_BIT_T
-        and rax, r10;
-        cmp rax, 0;
-        jne rn_ls_sort_call_mtime;
-
-        mov rax, r13;
-        mov r10, 0x80;                           // AS_BIT_S
-        and rax, r10;
-        cmp rax, 0;
-        jne rn_ls_sort_call_size;
-
-        // Neither -t nor -S: default lexicographic sort (also what
-        // bare -r alone reverses).
-        lea r11, [rip + _rn_gdf_buf];
-        mov rdi, r11;
-        mov rsi, r12;                            // count
-        call sort_options_by_name;
-        jmp rn_ls_sort_done;
-
-      rn_ls_sort_call_mtime:
-        lea r11, [rip + _rn_gdf_buf];
-        mov rdi, r11;
-        mov rsi, r12;
-        call sort_options_by_mtime;
-        jmp rn_ls_sort_done;
-
-      rn_ls_sort_call_size:
-        lea r11, [rip + _rn_gdf_buf];
-        mov rdi, r11;
-        mov rsi, r12;
-        call sort_options_by_size;
-
-      rn_ls_sort_done:
-        // ============================================================
-        // ls.ENH-020 (#38): directories-first partition, only when
-        // AS_BIT_GDF was actually requested. This label is reached
-        // only when _rn_gdf_mode or _rn_sort_mode (or both) is set --
-        // see the branch at rn_ls_pre_emit -- so "GDF not requested
-        // here" always means "sort-only" (a bare -R with neither GDF
-        // nor a sort flag never buffers through this path at all; it
-        // uses the unchanged streaming loop plus its own -R side-
-        // buffer). Fill _rn_gdf_order_buf with the identity permutation
-        // in the sort-only case so rn_ls_gdf_emit_next's cursor-driven
-        // read stays uniform across every combination.
-        // ============================================================
-        lea r11, [rip + _rn_gdf_mode];
-        mov r10, [r11];
-        cmp r10, 0;
-        je  rn_ls_order_identity;
-
-        // Extract one kind-nibble per buffered record into
-        // _rn_gdf_kinds_buf, then call GroupSort::group_sort_partition.
-        xor rcx, rcx;                             // idx = 0
-
-      rn_ls_gdf_kinds_loop:
-        cmp rcx, r12;
-        jae rn_ls_gdf_kinds_done;
-
-        mov r9, rcx;
-        shl r9, 4;                                // idx * 16
-        add r9, 1;                                // + kind-lane offset
-                                                   // (RN_ENT_OFF_KIND byte
-                                                   // 8 = lane 1)
-        lea r11, [rip + _rn_gdf_buf];
-        mov rax, [r11 + r9 * 8];
-        and rax, 0xF;                             // low nibble -- kind code
-
-        lea r11, [rip + _rn_gdf_kinds_buf];
-        mov [r11 + rcx * 8], rax;
-
-        add rcx, 1;
-        jmp rn_ls_gdf_kinds_loop;
-
-      rn_ls_gdf_kinds_done:
-        lea r11, [rip + _rn_gdf_kinds_buf];
-        mov rdi, r11;
-        mov rsi, r12;                             // count
-        lea r11, [rip + _rn_gdf_order_buf];
-        mov rdx, r11;
-        call group_sort_partition;
-        jmp rn_ls_order_ready;
-
-      rn_ls_order_identity:
-        // ls.ENH-016 (#34): order_buf[i] = i for i in 0..count -- no
-        // GDF partition requested, so emission order is simply the
-        // (possibly already sort_options-reordered) buffer order.
-        xor rcx, rcx;                             // idx = 0
-
-      rn_ls_order_identity_loop:
-        cmp rcx, r12;
-        jae rn_ls_order_ready;
-
-        lea r11, [rip + _rn_gdf_order_buf];
-        mov [r11 + rcx * 8], rcx;
-
-        add rcx, 1;
-        jmp rn_ls_order_identity_loop;
-
-      rn_ls_order_ready:
-        lea r11, [rip + _rn_gdf_idx];
-        mov r10, 0;
-        mov [r11], r10;
-
-        // ls.ENH-018 (#36): multicol mode renders the whole buffered
-        // grid in one shot instead of walking the per-entry emit
-        // cursor -- redirect to the dedicated collect/render phases.
-        lea r11, [rip + _rn_multicol_mode];
-        mov r10, [r11];
-        cmp r10, 0;
-        jne rn_ls_multicol_collect;
-
-        jmp rn_ls_gdf_emit_next;
-
-      rn_ls_gdf_emit_next:
-        lea r11, [rip + _rn_gdf_idx];
-        mov r10, [r11];                           // emit cursor
-        lea r11, [rip + _rn_gdf_count];
-        mov r9, [r11];                            // total buffered
-        cmp r10, r9;
-        jae rn_ls_done;                           // all buffered entries emitted
-
-        // idx = _rn_gdf_order_buf[cursor]
-        lea r11, [rip + _rn_gdf_order_buf];
-        mov rax, [r11 + r10 * 8];                 // original buffer index
-
-        // Copy the 128-byte record at _rn_gdf_buf[idx] into
-        // _rn_entry_buf so the UNCHANGED per-entry body below sees it
-        // exactly like a live pdxfs_dir_readnext result.
-        mov r9, rax;
-        shl r9, 4;                                // idx * 16 (src lane base)
-
-        lea r15, [rip + _rn_gdf_buf];             // src table base
-        lea r8,  [rip + _rn_entry_buf];            // dst base
-
-        xor rcx, rcx;                              // lane idx = 0
-
-      rn_ls_gdf_emit_copy_loop:
-        cmp rcx, 16;
-        jae rn_ls_gdf_emit_copy_done;
-
-        mov r11, r9;
-        add r11, rcx;                              // absolute src lane index
-        mov rax, [r15 + r11 * 8];
-        mov [r8 + rcx * 8], rax;
-
-        add rcx, 1;
-        jmp rn_ls_gdf_emit_copy_loop;
-
-      rn_ls_gdf_emit_copy_done:
-        // Advance the cursor BEFORE falling into the shared per-entry
-        // body -- rn_ls_continue routes every "next entry" edge back
-        // here, so the cursor must already point at the next slot.
-        lea r11, [rip + _rn_gdf_idx];
-        mov r10, [r11];
-        add r10, 1;
-        mov [r11], r10;
-
-        jmp rn_ls_have_entry;
-
-      rn_ls_have_entry:
-        // ---- Load name_len (offset 16) and name_ptr (offset 24) ------
-        lea r11, [rip + _rn_entry_buf];
-        mov r14, [r11 + 16];                     // name_len
-
-        lea r11, [rip + _rn_entry_buf];
-        add r11, 24;                             // name_ptr = &entry + 24
-        mov rbp, r11;                            // rbp = name_ptr
-
-        // ---- hidden_filter_accept(name_ptr, flag_bits & AS_BIT_A) ---
+        // rsp % 16 == 0 at every nested-call site.
+
+        // Stash path_ptr; default to _rn_default_path when 0.
+        mov rbp, rdi;
+        cmp rbp, 0;
+        jne rn_ls_have_path;
+        lea rbp, [rip + _rn_default_path];
+
+      rn_ls_have_path:
+        // ---- (2) sys_stat(path, 255, &_rn_stat_buf) ---------------
         mov rdi, rbp;
-        mov rsi, r13;
-        mov r10, 2;                              // RN_BIT_A_MASK
-        and rsi, r10;                            // show_hidden = flag_bits & AS_BIT_A
-        call hidden_filter_accept;
-
+        mov rsi, 255;                            // RN_STAT_PATH_HINT
+        lea rdx, [rip + _rn_stat_buf];
+        call sys_stat;
         cmp rax, 0;
-        je  rn_ls_hidden;                        // filtered out
+        jne rn_ls_bad_path;                      // non-zero -> BAD_PATH
 
-      rn_ls_render_dispatch:
-        // ls.ENH-015 (#33): shared re-entry point for the file-as-
-        // path fallback (rn_ls_file_fallback jumps directly here,
-        // BYPASSING the hidden_filter_accept call above -- an explicit
-        // path argument is never dot-filtered under POSIX ls
-        // semantics, only directory-walk entries are). Requires r14 =
-        // name_len and rbp = name_ptr already loaded, exactly as the
-        // fall-through from a real directory entry leaves them.
-        //
-        // ---- ls.ENH-017 (#35): -R recursion-candidate detection -----
-        //
-        // Runs for every accepted entry (the file-fallback synthetic
-        // row included -- rn_compose_file_entry always hardcodes
-        // RN_ENT_KIND_FILE (8) for its kind, so recurse_should_descend
-        // rejects it on the kind check alone, no special-casing
-        // needed). Gated on _rn_r_mode (computed once at entry); a
-        // qualifying entry (directory-kind, not "." or "..") is copied
-        // whole into _rn_r_buf so its name survives past this
-        // iteration's _rn_entry_buf being overwritten by the next
-        // readnext call. Uses only caller-save registers (rax, rcx,
-        // rdx, r8, r9, r10, r11, rdi, rsi) -- rbx/r12/r13/r14/r15/rbp
-        // all carry values this function's later code still depends
-        // on and must not be touched here.
-        lea r11, [rip + _rn_r_mode];
-        mov r10, [r11];
-        cmp r10, 0;
-        je  rn_ls_no_recurse_check;
-
-        lea r11, [rip + _rn_entry_buf];
-        mov rdi, [r11 + 8];                      // kind qword
-        and rdi, 0xF;                             // low nibble
-        mov rsi, rbp;                             // name_ptr
-        call recurse_should_descend;
-        cmp rax, 0;
-        je  rn_ls_no_recurse_check;
-
-        // Overflow guard -- reject before writing past _rn_r_buf,
-        // mirroring the GDF collect-copy loop's own discipline
-        // exactly (refuse loudly via the existing LS_ERR_READDIR
-        // path rather than silently truncate the header list).
-        lea r11, [rip + _rn_r_count];
-        mov r10, [r11];                           // current count
-        cmp r10, 64;                              // RN_R_MAX_ENTRIES
-        jae rn_ls_readdir_fail_real;
-
-        mov r9, r10;                               // dst_lane_base = count * 16
-        shl r9, 4;
-
-        xor rcx, rcx;                              // lane idx = 0
-
-      rn_ls_recurse_copy_loop:
-        cmp rcx, 16;
-        jae rn_ls_recurse_copy_done;
-
-        lea r11, [rip + _rn_entry_buf];
-        mov rax, [r11 + rcx * 8];
-
-        mov r11, r9;
-        add r11, rcx;                              // absolute dst lane index
-        lea r8, [rip + _rn_r_buf];
-        mov [r8 + r11 * 8], rax;
-
-        add rcx, 1;
-        jmp rn_ls_recurse_copy_loop;
-
-      rn_ls_recurse_copy_done:
-        add r10, 1;
-        lea r11, [rip + _rn_r_count];
-        mov [r11], r10;
-
-      rn_ls_no_recurse_check:
-        // ---- v1.1.0: Renderer dispatch ------------------------------
-        //
-        // Priority: AS_BIT_JSON > AS_BIT_L > default. JSON wins over
-        // -l per the "--json is a full wire replacement" rule the user
-        // constraint pinned this session (JSON swaps the text branch;
-        // any text-formatting flags are ignored when JSON is on so a
-        // downstream JSON consumer never sees mixed shapes). Default
-        // path (bare `ls`) falls through unchanged.
-        //
-        // r10 = flag_bits & mask; r11 = mask constant staged.
-        mov r10, r13;
-        mov r11, 0x8;                            // AS_BIT_JSON
-        and r10, r11;
-        cmp r10, 0;
-        jne rn_ls_render_json;
-
-        mov r10, r13;
-        mov r11, 0x1;                            // AS_BIT_L
-        and r10, r11;
-        cmp r10, 0;
-        jne rn_ls_render_long;
-
-        // ---- Compose _rn_line_buf: copy name bytes + '\n' -----------
-        //
-        // Bound the name copy at min(name_len, RN_ENT_NAME_MAX) so a
-        // corrupt name_len from a broken upstream cannot overflow
-        // _rn_line_buf.
-        mov rcx, r14;                            // name_len
-        mov r10, 104;                            // RN_ENT_NAME_MAX
-        cmp rcx, r10;
-        jbe rn_ls_len_ok;
-        mov rcx, r10;                            // clamp
-
-      rn_ls_len_ok:
-        // r14 = actual bytes-to-copy (clamped)
-        mov r14, rcx;
-
-        lea r15, [rip + _rn_line_buf];           // dst base
-
-        // Byte-copy loop: rax = index 0..rcx (using rcx as remaining).
-        // We use a fresh index r10 inside the loop; r14 holds the
-        // authoritative clamped length.
-        xor r10, r10;                            // idx = 0
-
-      rn_ls_copy_head:
-        cmp r10, r14;                            // idx < len ?
-        jae rn_ls_copy_done;
-
-        mov r11, rbp;                            // &src[0]
-        add r11, r10;                            // &src[idx]
-        xor rax, rax;                            // #1248 mitigation
-        mov_b rax, [r11];
-
-        mov r11, r15;                            // &dst[0]
-        add r11, r10;                            // &dst[idx]
-        mov_b [r11], rax;
-
-        add r10, 1;
-        jmp rn_ls_copy_head;
-
-      rn_ls_copy_done:
-        // ---- ls.ENH-019 (#37): -F type-indicator suffix -----------
-        //
-        // When AS_BIT_F is set in flag_bits, inspect the entry's kind
-        // nibble at record offset 8 and append a single suffix byte
-        // before the '\n':
-        //   nibble 0x4 (dir)     -> '/'
-        //   nibble 0xA (symlink) -> '@'
-        //   nibble 0x8 (file)    -> no suffix at v1.1 (exec '*' awaits
-        //                           the kernel record growing a mode
-        //                           field via sys_pdxfs_stat_by_inode --
-        //                           tracked as follow-up, aligned with
-        //                           ENH-008 owner deferral).
-        //   other                -> no suffix.
-        //
-        // r10 = suffix byte, rax = kind qword scratch.
-        mov r10, r13;                            // r10 = flag_bits copy
-        mov r11, 0x1000;                         // RN_BIT_F_MASK
-        and r10, r11;
-        cmp r10, 0;
-        je  rn_ls_no_suffix;
-        // Load kind at offset 8.
-        lea r11, [rip + _rn_entry_buf];
-        mov rax, [r11 + 8];                      // RN_ENT_OFF_KIND
-        and rax, 0xF;                            // low 4 bits = nibble
-        cmp rax, 0x4;
-        je  rn_ls_suffix_dir;
-        cmp rax, 0xA;
-        je  rn_ls_suffix_sym;
-        jmp rn_ls_no_suffix;
-
-      rn_ls_suffix_dir:
-        mov r10, 0x2F;                           // '/'
-        jmp rn_ls_suffix_emit;
-
-      rn_ls_suffix_sym:
-        mov r10, 0x40;                           // '@'
-        jmp rn_ls_suffix_emit;
-
-      rn_ls_suffix_emit:
-        // dst[len] = suffix; len++
-        mov r11, r15;
-        add r11, r14;
-        mov_b [r11], r10;
-        add r14, 1;
-
-      rn_ls_no_suffix:
-        // ---- Append '\n' -----------------------------------------
-        mov r11, r15;
-        add r11, r14;                            // &dst[len]
-        mov rax, 0x0A;                           // '\n'
-        mov_b [r11], rax;
-        add r14, 1;                              // r14 = bytes including LF
-
-        // Fall through to the shared emit (v1.1.0: shared with
-        // rn_ls_render_long + rn_ls_render_json).
-        jmp rn_ls_emit_wire;
-
-        // ==========================================================
-        // v1.1.0 ENH-002 (#24): -l long-format render path.
-        //
-        // Calls LongFormat::long_format_line with the entry's fields
-        // packed into kind_mode_flags:
-        //   [3:0]  = kind_nibble (from _rn_entry_buf[8] low 4 bits)
-        //   [12:4] = mode_bits   = 0 (kernel readnext record has no
-        //                          mode column at v1.x -- the
-        //                          paideia-os follow-up tracks the
-        //                          fix)
-        //   [13]   = human_size_flag (from AS_BIT_H)
-        // Size is similarly a 0 placeholder (kernel-blocked per plan
-        // doc §7). extra_ptr points at _rn_lf_extra_scratch: mtime_ns
-        // @0 is still a raw 0 placeholder (same kernel-blocked gap),
-        // but owner_row @8 is now populated via OwnerCol::owner_col_
-        // owner_row_from_entry (ls.ENH-008, #28) -- a named, documented,
-        // fixture-pinned honest-gap accessor rather than an inline
-        // literal, even though the returned value is still 0 today. See
-        // that function's own doc for why (PdxFsDirEntry has no owner
-        // field; see paideia-os pdxfs_dir_iter.pdx SECTION 1).
-        //
-        // dst = _rn_line_buf (256 bytes); returns bytes composed in
-        // rax (or LF_ERR_OVERFLOW). name_ptr is in rbp; name is
-        // implicitly NUL-terminated by the readnext record (name_len
-        // bytes followed by zero fill inside the 104-byte name field).
-        // ==========================================================
-      rn_ls_render_long:
-        // ls.ENH-008 (#28): owner_row @8 of _rn_lf_extra_scratch --
-        // delegate to OwnerCol::owner_col_owner_row_from_entry (honest
-        // -gap accessor; PdxFsDirEntry carries no owner field at HEAD,
-        // see that function's own doc) rather than an inline hardcoded
-        // 0. Runs BEFORE kind_mode_flags is built into r10 below
-        // because r10 is caller-save and would otherwise be at risk
-        // across the call; this call site uses only caller-save
-        // registers (rdi, rax, r11) so none of this function's six
-        // callee-save carriers (rbx/r12/r13/r14/r15/rbp) are disturbed.
-        lea rdi, [rip + _rn_entry_buf];
-        call owner_col_owner_row_from_entry;
-        lea r11, [rip + _rn_lf_extra_scratch];
-        mov [r11 + 8], rax;                      // owner_row (0 today)
-        xor rax, rax;
-        mov [r11], rax;                          // mtime_ns placeholder (still 0)
-
-        // Compute kind_mode_flags into a scratch register (r10).
-        //   nibble = _rn_entry_buf[8] & 0xF
-        //   human  = (flag_bits & AS_BIT_H) ? 0x2000 : 0
-        //   kmf    = nibble | human
-        lea r11, [rip + _rn_entry_buf];
-        mov rax, [r11 + 8];                      // RN_ENT_OFF_KIND qword
-        and rax, 0xF;                            // low 4 bits
-        mov r10, rax;                            // r10 = kmf accumulator
-
-        mov rax, r13;                            // flag_bits copy
-        mov r11, 0x4;                            // AS_BIT_H
-        and rax, r11;
-        cmp rax, 0;
-        je  rn_ls_lf_no_h;
-        mov r11, 0x2000;                         // bit 13
-        or  r10, r11;
-
-      rn_ls_lf_no_h:
-        // _rn_lf_extra_scratch already populated above (mtime_ns @0,
-        // owner_row @8) -- both branches into this join point converge
-        // here with nothing left to do for the scratch buffer.
-
-        // Marshal args:
-        //   rdi = dst_ptr    = _rn_line_buf
-        //   rsi = dst_cap    = 256
-        //   rdx = name_ptr   = rbp
-        //   rcx = kind_mode_flags = r10
-        //   r8  = size_bytes = 0 (placeholder)
-        //   r9  = extra_ptr  = _rn_lf_extra_scratch
-        lea r11, [rip + _rn_line_buf];
-        mov rdi, r11;
-        mov r15, r11;                            // remember dst for emit
-        mov rsi, 256;
-        mov rdx, rbp;
-        mov rcx, r10;
-        xor r8, r8;                              // size placeholder
-        lea r11, [rip + _rn_lf_extra_scratch];
-        mov r9, r11;
-        call long_format_line;
-
-        // Refuse on overflow (long_format returns 0xFFFFFFFFFFFFFFFF).
-        mov r11, 0xFFFFFFFFFFFFFFFF;
-        cmp rax, r11;
-        je  rn_ls_tty_fail;                      // reuse existing fail path
-
-        // Bump LS_ST_LONG counter (slot 6) so the tool's stats record
-        // how many -l lines were rendered.
-        mov r14, rax;                            // save bytes-written
-        mov rdi, 6;                              // RN_STAT_LONG
-        call ls_note;
-
-        jmp rn_ls_emit_wire;
-
-        // ==========================================================
-        // v1.1.0 ENH-007 (#26): --json render path.
-        //
-        // Calls JsonLine::json_line_render with the six fields packed
-        // by the 6-register cap:
-        //   rdi = dst_ptr    = _rn_line_buf
-        //   rsi = dst_cap    = 256
-        //   rdx = name_ptr   = rbp
-        //   rcx = name_len   = r14
-        //   r8  = kind_nibble (from _rn_entry_buf[8] low 4 bits)
-        //   r9  = inode      = _rn_entry_buf[0]
-        // ==========================================================
-      rn_ls_render_json:
-        lea r11, [rip + _rn_line_buf];
-        mov rdi, r11;
-        mov r15, r11;
-        mov rsi, 256;
-        mov rdx, rbp;
-        mov rcx, r14;                            // name_len
-
-        lea r11, [rip + _rn_entry_buf];
-        mov rax, [r11 + 8];                      // kind qword
-        and rax, 0xF;
-        mov r8, rax;
-        lea r11, [rip + _rn_entry_buf];
-        mov rax, [r11];                          // inode qword
-        mov r9, rax;
-
-        call json_line_render;
-
-        mov r11, 0xFFFFFFFFFFFFFFFF;
-        cmp rax, r11;
-        je  rn_ls_tty_fail;
-
-        mov r14, rax;                            // bytes composed
-        // Fall through to shared emit -- JSON path deliberately
-        // SKIPS color wrap regardless of AS_BIT_COLOR (structured
-        // output must not carry ANSI escapes).
-        jmp rn_ls_emit_wire_no_color;
-
-        // ==========================================================
-        // v1.1.0 ENH-005 (#25) + ENH-023 (#41): shared emit path.
-        //
-        // On entry:
-        //   r15 = buf_ptr  (bytes to write)
-        //   r14 = bytes    (total bytes in buf)
-        //
-        // Color decision:
-        //   * If AS_BIT_JSON set -> jump was already routed to
-        //     rn_ls_emit_wire_no_color (structured branch).
-        //   * If AS_BIT_COLOR unset -> no color.
-        //   * If AS_BIT_COLOR set and AS_BIT_COLOR_AUTO unset -> color.
-        //   * If AS_BIT_COLOR set and AS_BIT_COLOR_AUTO set -> probe
-        //     stdout KIND; today fd 1 has no cap-slot binding (M3
-        //     compat shim; see tty_write.pdx §TW_KIND_TTY note), so
-        //     the probe reduces to "not a TTY" -> no color.
-        //
-        // When color is on:
-        //   1. color_pick(kind_nibble, mode=0, schema=0) -> palette
-        //   2. color_sgr_prefix into _rn_sgr_prefix_scratch (<= 6 B)
-        //   3. tty_write prefix
-        //   4. tty_write content
-        //   5. color_sgr_suffix into _rn_sgr_suffix_scratch (4 B)
-        //   6. tty_write suffix
-        // Each tty_write's negative-errno collapses via the shared
-        // rn_ls_tty_fail label.
-        //
-        // sem_emit_entry (semantic-pipe emission) is UNCHANGED across
-        // every render path -- the wire record is always the 144-byte
-        // PdxFsDirEntry@0.1 (SemanticEmit's contract).
-        // ==========================================================
-      rn_ls_emit_wire:
-        // Gate: AS_BIT_COLOR set?
-        mov r10, r13;
-        mov r11, 0x20;                           // AS_BIT_COLOR
-        and r10, r11;
-        cmp r10, 0;
-        je  rn_ls_emit_wire_no_color;
-
-        // AS_BIT_COLOR_AUTO set? If so, probe -> today: no color.
-        mov r10, r13;
-        mov r11, 0x4000;                         // AS_BIT_COLOR_AUTO
-        and r10, r11;
-        cmp r10, 0;
-        jne rn_ls_emit_wire_no_color;            // auto -> off today
-
-        // ---- Color ON path: pick palette + wrap ---------------
-        //
-        // rdi = kind_nibble (from _rn_entry_buf[8] low 4)
-        // rsi = mode_bits    = 0 placeholder
-        // rdx = schema_id    = 0 (schema-registry lookup awaits ENH-010
-        //                         at libpdx-schema-registry.M1)
-        lea r11, [rip + _rn_entry_buf];
-        mov rax, [r11 + 8];
-        and rax, 0xF;
-        mov rdi, rax;
+        // ---- (3) sys_open(path, 0 /*O_RDONLY*/, 0 /*mode*/) ------
+        mov rdi, rbp;
         xor rsi, rsi;
         xor rdx, rdx;
-        call color_pick;
-
-        // rax = palette_id. If palette == 0 (CP_PAL_NONE), skip color
-        // wrap and emit content directly. r10 holds palette across
-        // the prefix/content/suffix trio.
-        mov r10, rax;
-        cmp r10, 0;
-        je  rn_ls_emit_wire_no_color;
-
-        // Compose SGR prefix into _rn_sgr_prefix_scratch (max 6 B).
-        lea r11, [rip + _rn_sgr_prefix_scratch];
-        mov rdi, r11;
-        mov rsi, 8;                              // scratch cap
-        mov rdx, r10;                            // palette_id
-        call color_sgr_prefix;
-
-        // rax = prefix bytes; overflow (0xFFFFFFFFFFFFFFFF) -> tty_fail.
-        mov r11, 0xFFFFFFFFFFFFFFFF;
-        cmp rax, r11;
-        je  rn_ls_tty_fail;
-
-        // tty_write(&_rn_sgr_prefix_scratch, rax).
-        lea r11, [rip + _rn_sgr_prefix_scratch];
-        mov rdi, r11;
-        mov rsi, rax;
-        call tty_write;
+        call sys_open;
         cmp rax, 0;
-        jl  rn_ls_tty_fail;
+        jl  rn_ls_open_err;                      // signed negative -> errno
+        mov rbx, rax;                            // rbx = fd
 
-        // tty_write(buf, bytes).
-        mov rdi, r15;
-        mov rsi, r14;
-        call tty_write;
-        cmp rax, 0;
-        jl  rn_ls_tty_fail;
+        // Base pointer of the getdents scratch, loaded once.
+        lea r14, [rip + _rn_getdents_buf];
 
-        // Compose SGR suffix into _rn_sgr_suffix_scratch (4 B).
-        lea r11, [rip + _rn_sgr_suffix_scratch];
-        mov rdi, r11;
-        mov rsi, 8;                              // scratch cap
-        call color_sgr_suffix;
-        mov r11, 0xFFFFFFFFFFFFFFFF;
-        cmp rax, r11;
-        je  rn_ls_tty_fail;
-
-        // tty_write(&_rn_sgr_suffix_scratch, rax).
-        lea r11, [rip + _rn_sgr_suffix_scratch];
-        mov rdi, r11;
-        mov rsi, rax;
-        call tty_write;
-        cmp rax, 0;
-        jl  rn_ls_tty_fail;
-
-        // Bump LS_ST_COLOR (slot 7) so the tool's stats record how
-        // many entries were emitted with ANSI SGR.
-        mov rdi, 7;                              // RN_STAT_COLOR
-        call ls_note;
-
-        jmp rn_ls_after_wire;
-
-      rn_ls_emit_wire_no_color:
-        // ---- Plain content emit (no color wrap) ----
-        mov rdi, r15;
-        mov rsi, r14;
-        call tty_write;
-        cmp rax, 0;
-        jl  rn_ls_tty_fail;
-
-      rn_ls_after_wire:
-        // ---- sem_emit_entry(&_rn_entry_buf) -- unchanged ------------
-        lea r11, [rip + _rn_entry_buf];
-        mov rdi, r11;
-        call sem_emit_entry;
-
-        cmp rax, 0;                              // SE_OK
-        jne rn_ls_send_fail;
-
-        // ---- Bump LS_ST_ENTRIES + continue loop ----------------------
-        mov rdi, 3;                              // RN_STAT_ENTRIES
-        call ls_note;
-
-        jmp rn_ls_continue;
-
-      rn_ls_hidden:
-        // ---- Hidden: bump LS_ST_HIDDEN + continue --------------------
-        mov rdi, 5;                              // RN_STAT_HIDDEN
-        call ls_note;
-        jmp rn_ls_continue;
-
-        // ls.ENH-020 (#38): shared continuation dispatcher. Both
-        // "advance to the next entry" sites above used to jump
-        // straight to rn_ls_loop (call pdxfs_dir_readnext again); GDF
-        // mode instead needs to advance the buffered emission cursor.
-        // r13 (flag_bits) is untouched by either predecessor, so this
-        // check is safe to run unconditionally.
-      rn_ls_continue:
-        // ls.ENH-015 (#33): single-file mode wins over GDF mode --
-        // checked first because one synthetic entry is the entire
-        // "listing"; terminate immediately rather than calling
-        // pdxfs_dir_readnext again (same cap would re-hit -EBADF).
-        lea r11, [rip + _rn_single_file_mode];
-        mov r10, [r11];
-        cmp r10, 0;
-        jne rn_ls_done;
-
-        lea r11, [rip + _rn_gdf_mode];
-        mov r10, [r11];
-        cmp r10, 0;
-        jne rn_ls_gdf_emit_next;
-
-        // ls.ENH-016 (#34): a sort-only request (no GDF) still uses
-        // the buffered emission cursor.
-        lea r11, [rip + _rn_sort_mode];
-        mov r10, [r11];
-        cmp r10, 0;
-        jne rn_ls_gdf_emit_next;
-
-        jmp rn_ls_loop;
-
-        // ==============================================================
-        // ls.ENH-018 (#36): multi-column collect + render phases.
-        //
-        // Reached only from rn_ls_order_ready when _rn_multicol_mode is
-        // set -- i.e. only after the GDF collect/sort/partition (or
-        // identity-fill) phases above have already produced a final
-        // _rn_gdf_order_buf over _rn_gdf_count buffered records. This
-        // phase NEVER re-derives ordering; it walks that order buffer
-        // exactly once, in order, applying the same accept/reject
-        // decisions the per-entry streaming dispatch makes (hidden-
-        // filter, then -R recursion-candidate detection) before handing
-        // the whole accepted set to Columns::columns_layout in one call.
-        //
-        // Register plan: rbx = current record's byte address (dead by
-        // this point as the LS_DIR_CAP_SLOT copy -- see rn_ls_pre_emit's
-        // own "load LS_DIR_CAP_SLOT into rbx" comment; the buffered-mode
-        // phases never call pdxfs_dir_readnext again, so rbx carries no
-        // meaning any per-entry code still depends on), rbp = current
-        // record's name_ptr, r14 = current record's clamped name_len --
-        // the SAME two roles rn_ls_have_entry already assigns rbp/r14
-        // for a live entry, reused here for a buffered one. r12/r13
-        // (path_ptr-then-dead / flag_bits) are read-only in this phase;
-        // r13 (flag_bits) is still valid (untouched since function
-        // entry, per rn_ls_continue's own comment on the same fact).
-        // ==============================================================
-      rn_ls_multicol_collect:
-        lea r11, [rip + _rn_col_count];
-        mov r10, 0;
-        mov [r11], r10;
-        lea r11, [rip + _rn_col_cursor];
-        mov [r11], r10;
-
-      rn_ls_multicol_walk:
-        lea r11, [rip + _rn_col_cursor];
-        mov rax, [r11];                           // cursor
-        lea r11, [rip + _rn_gdf_count];
-        mov rcx, [r11];                           // total buffered
-        cmp rax, rcx;
-        jae rn_ls_multicol_render;                // walk complete
-
-        // raw_idx = _rn_gdf_order_buf[cursor]
-        lea r11, [rip + _rn_gdf_order_buf];
-        mov rdx, [r11 + rax * 8];                 // raw_idx
-
-        // record_ptr = &_rn_gdf_buf + raw_idx*128 (via lane_base = raw_
-        // idx*16, then *8 for the byte offset -- the same two-step
-        // mov/shl chain rn_ls_gdf_emit_next's own copy loop uses).
-        mov r9, rdx;
-        shl r9, 4;                                // lane_base = raw_idx * 16
-        mov r8, r9;
-        shl r8, 3;                                // byte offset = lane_base * 8
-        lea r11, [rip + _rn_gdf_buf];
-        add r11, r8;
-        mov rbx, r11;                              // rbx = record_ptr
-
-        // name_len = record[16], clamped to RN_ENT_NAME_MAX (104).
-        mov rax, [rbx + 16];
-        mov r10, 104;                              // RN_ENT_NAME_MAX
-        cmp rax, r10;
-        jbe rn_ls_mc_len_ok;
-        mov rax, r10;
-
-      rn_ls_mc_len_ok:
-        mov r14, rax;                              // r14 = clamped name_len
-
-        // name_ptr = record_ptr + 24 (RN_ENT_OFF_NAME).
-        mov rbp, rbx;
-        add rbp, 24;
-
-        // ---- hidden_filter_accept(name_ptr, flag_bits & AS_BIT_A) ----
-        mov rdi, rbp;
-        mov rsi, r13;
-        mov r10, 2;                                // RN_BIT_A_MASK
-        and rsi, r10;
-        call hidden_filter_accept;
-        cmp rax, 0;
-        je  rn_ls_mc_hidden;
-
-        // ---- -R recursion-candidate detection (mirrors the identical
-        // gate in rn_ls_render_dispatch, caller-save registers only) --
-        lea r11, [rip + _rn_r_mode];
-        mov r10, [r11];
-        cmp r10, 0;
-        je  rn_ls_mc_no_recurse;
-
-        mov rdi, [rbx + 8];                        // kind qword
-        and rdi, 0xF;
-        mov rsi, rbp;                              // name_ptr
-        call recurse_should_descend;
-        cmp rax, 0;
-        je  rn_ls_mc_no_recurse;
-
-        lea r11, [rip + _rn_r_count];
-        mov r10, [r11];
-        cmp r10, 64;                                // RN_R_MAX_ENTRIES
-        jae rn_ls_readdir_fail_real;
-
-        mov r9, r10;
-        shl r9, 4;                                  // dst_lane_base = count * 16
-        xor rcx, rcx;                                // lane idx = 0
-
-      rn_ls_mc_recurse_copy_loop:
-        cmp rcx, 16;
-        jae rn_ls_mc_recurse_copy_done;
-        mov rax, [rbx + rcx * 8];
-        mov r11, r9;
-        add r11, rcx;
-        lea r8, [rip + _rn_r_buf];
-        mov [r8 + r11 * 8], rax;
-        add rcx, 1;
-        jmp rn_ls_mc_recurse_copy_loop;
-
-      rn_ls_mc_recurse_copy_done:
-        add r10, 1;
-        lea r11, [rip + _rn_r_count];
-        mov [r11], r10;
-
-      rn_ls_mc_no_recurse:
-        // ---- append to _rn_col_name_ptrs / _rn_col_name_lens ----------
-        lea r11, [rip + _rn_col_count];
-        mov r10, [r11];
-        cmp r10, 64;                                 // same static cap as _rn_gdf_buf
-        jae rn_ls_readdir_fail_real;
-
-        lea r11, [rip + _rn_col_name_ptrs];
-        mov [r11 + r10 * 8], rbp;
-        lea r11, [rip + _rn_col_name_lens];
-        mov [r11 + r10 * 8], r14;
-
-        add r10, 1;
-        lea r11, [rip + _rn_col_count];
-        mov [r11], r10;
-
-        // ---- sem_emit_entry(record_ptr) -- unchanged across every
-        // render path, multicol included. ------------------------------
+      rn_ls_gd_loop:
+        // ---- (4a) sys_getdents(fd, buf, 4096) --------------------
         mov rdi, rbx;
-        call sem_emit_entry;
-        cmp rax, 0;                                  // SE_OK
-        jne rn_ls_send_fail;
-
-        mov rdi, 3;                                   // RN_STAT_ENTRIES
-        call ls_note;
-        jmp rn_ls_mc_advance;
-
-      rn_ls_mc_hidden:
-        mov rdi, 5;                                   // RN_STAT_HIDDEN
-        call ls_note;
-
-      rn_ls_mc_advance:
-        lea r11, [rip + _rn_col_cursor];
-        mov r10, [r11];
-        add r10, 1;
-        mov [r11], r10;
-        jmp rn_ls_multicol_walk;
-
-      rn_ls_multicol_render:
-        // Columns::columns_layout(names_ptr, lens_ptr, count, term_width,
-        // dst_ptr, dst_cap) -- one call renders the entire fitted grid.
-        lea r11, [rip + _rn_col_name_ptrs];
-        mov rdi, r11;
-        lea r11, [rip + _rn_col_name_lens];
-        mov rsi, r11;
-        lea r11, [rip + _rn_col_count];
-        mov rdx, [r11];
-        mov rcx, 80;                                  // RN_COL_TERM_WIDTH
-        lea r11, [rip + _rn_col_render_buf];
-        mov r8, r11;
-        mov r9, 5280;                                 // RN_COL_RENDER_BUF_CAP
-        call columns_layout;
-
-        mov r10, 0xFFFFFFFFFFFFFFFF;                  // COL_ERR_OVERFLOW
-        cmp rax, r10;
-        je  rn_ls_tty_fail;
-
-        mov r14, rax;                                 // bytes composed
-        lea r11, [rip + _rn_col_render_buf];
-        mov rdi, r11;
         mov rsi, r14;
-        call tty_write;
+        mov rdx, 4096;                           // RN_GD_BUF_CAP
+        call sys_getdents;
         cmp rax, 0;
-        jl  rn_ls_tty_fail;
+        je  rn_ls_eod;                           // rax == 0 -> EOD
+        jl  rn_ls_gd_err;                        // rax < 0  -> errno
 
-        jmp rn_ls_done;
+        // rax > 0: bytes returned. Set cursor = base, end = base+rax.
+        mov r12, r14;
+        mov r13, r14;
+        add r13, rax;
 
-      rn_ls_done:
-        // ---- ls.ENH-017 (#35): -R header-emission phase ---------------
-        //
-        // Runs once, after the primary listing has fully completed
-        // (every entry emitted, in either the streaming or the GDF-
-        // buffered order). Walks _rn_r_buf in encounter order and
-        // writes one "<path>/<name>:" header per buffered candidate.
-        // It does NOT descend into the named subdirectory -- no
-        // capability exists for a held read-only tool to mint a cap
-        // for a named child of an already-held directory cap (see
-        // RecurseHeader's module doc and src/pdxfs_shim.pdx's own
-        // "why a thin local shim" note). The absence of a listing
-        // after each header is the honest signal that descent is not
-        // wired yet (paideia-os/ls#29 + the still-missing kernel
-        // pdxfs_dir_open_at trampoline), not a claim that the
-        // subdirectory is empty.
-        //
-        // r14 is free here (the per-entry dispatch loop that used it
-        // as "name_len for the current entry" has fully drained);
-        // this phase reuses it as the composed-header byte count.
-        lea r11, [rip + _rn_r_mode];
-        mov r10, [r11];
+      rn_ls_rec_loop:
+        cmp r12, r13;
+        jae rn_ls_gd_loop;                       // batch drained; fetch next
+
+        // Extract name_len via u64 load + 0xFFFF mask (see file
+        // header rationale for the mov_w avoidance).
+        mov r10, [r12 + 8];
+        and r10, 0xFFFF;
         cmp r10, 0;
-        je  rn_ls_success;
+        je  rn_ls_gd_loop;                       // terminator -> next batch
 
-      rn_ls_recurse_emit_loop:
-        lea r11, [rip + _rn_r_idx];
-        mov r10, [r11];                           // idx
-        lea r11, [rip + _rn_r_count];
-        mov r9, [r11];                             // count
-        cmp r10, r9;
-        jae rn_ls_success;
-
-        mov r9, r10;                                // record_lane_base = idx * 16
-        shl r9, 4;
-
-        // name_len at lane (record_lane_base + 2) -- byte offset 16.
-        lea r11, [rip + _rn_r_buf];
-        mov rcx, r9;
-        add rcx, 2;
-        mov rdx, [r11 + rcx * 8];                   // name_len
-
-        // name_ptr = &_rn_r_buf[record_lane_base*8 + 24].
-        lea r11, [rip + _rn_r_buf];
-        mov rax, r9;
-        shl rax, 3;                                 // lane_base -> byte offset
-        add r11, rax;
-        add r11, 24;                                // RN_ENT_OFF_NAME
-        mov rsi, r11;                                // name_ptr
-
-        lea r11, [rip + _rn_r_path_ptr];
-        mov rdi, [r11];                              // path_ptr (0 => ".")
-
-        lea r11, [rip + _rn_line_buf];
-        mov rcx, r11;                                 // dst_ptr
-        mov r8, 256;                                  // dst_cap
-
-        call recurse_header_compose;
-
-        mov r11, 0xFFFFFFFFFFFFFFFF;
-        cmp rax, r11;
-        je  rn_ls_tty_fail;                           // header too long -- reuse
-
-        mov r14, rax;                                 // bytes composed
-        lea r11, [rip + _rn_line_buf];
-        mov rdi, r11;
-        mov rsi, r14;
+        // tty_write(cursor + 12, name_len).
+        mov rdi, r12;
+        add rdi, 12;                             // RN_REC_HDR_BYTES
+        mov rsi, r10;
         call tty_write;
-        cmp rax, 0;
-        jl  rn_ls_tty_fail;
+        // Short-write / errno path ignored at v1.1-A -- a real retry
+        // loop lands with the flag-bits re-engagement round; the
+        // enumeration continues either way so an early bad byte does
+        // not silently truncate the whole listing.
 
-        lea r11, [rip + _rn_r_idx];
-        mov r10, [r11];
-        add r10, 1;
-        mov [r11], r10;
-
-        jmp rn_ls_recurse_emit_loop;
-
-      rn_ls_success:
-        // ---- ls.ENH-021 (#39): PdxLsSummaryRecord@0.1 emission --------
-        //
-        // Only when BOTH -l (RN_BIT_L_MASK) and --json (RN_BIT_JSON_MASK)
-        // are set on flag_bits (still held live in r13): compose the
-        // fixed 32-byte PdxLsSummaryRecord@0.1 wire record
-        // (LongTotal::long_total_summary_record_compose) and write it
-        // verbatim to KIND_TTY(write) via the same tty_write trampoline
-        // every --json line already goes through -- "the existing
-        // --json path" the issue's own scope note calls for, rather
-        // than standing up a second semantic-pipe endpoint bind.
-        // paideia-os/ls#30's schema-registry migration (SemanticEmit's
-        // PdxFsDirEntry stdout bind onto libpdx-semantic-pipe::
-        // Registry::bind_by_name) is a separate landing and does not
-        // itself stand up that second bind slot -- see SemanticEmit::
-        // _se_summary_schema_name's own deferred-comment marker in
-        // src/semantic_emit.pdx, left untouched here.
-        // Reached once, after the whole listing (and any -R header
-        // phase) has fully completed -- this label has exactly two
-        // entry edges, both from the -R phase above, both signalling
-        // "everything is done."
-        //
-        // entry_count / dir_count / file_count ship as 0: Runner does
-        // not accumulate a live per-kind tally across a listing today
-        // (LS_ST_ENTRIES / LS_ST_HIDDEN are aggregate run counters, not
-        // kind-partitioned) -- see LongTotal's own module doc for why
-        // this is an honest caller-side placeholder, not a hollow
-        // composer.
-        mov r10, r13;
-        mov r11, 1;                               // RN_BIT_L_MASK
-        and r10, r11;
-        cmp r10, 0;
-        je  rn_ls_summary_skip;
-
-        mov r10, r13;
-        mov r11, 8;                               // RN_BIT_JSON_MASK
-        and r10, r11;
-        cmp r10, 0;
-        je  rn_ls_summary_skip;
-
-        xor rdi, rdi;                              // entry_count = 0 (placeholder)
-        xor rsi, rsi;                              // dir_count = 0 (placeholder)
-        xor rdx, rdx;                              // file_count = 0 (placeholder)
-        lea r11, [rip + _rn_line_buf];
-        mov rcx, r11;                               // dst_ptr
-        mov r8, 256;                                // dst_cap
-        call long_total_summary_record_compose;
-        mov r11, 0xFFFFFFFFFFFFFFFF;
-        cmp rax, r11;
-        je  rn_ls_tty_fail;                         // unreachable (256 >> 32)
-                                                     // but honest
-
-        lea r11, [rip + _rn_line_buf];
-        mov rdi, r11;
-        mov rsi, rax;                                // bytes composed (32)
+        // tty_write(&_rn_newline, 1).
+        lea rdi, [rip + _rn_newline];
+        mov rsi, 1;
         call tty_write;
-        cmp rax, 0;
-        jl  rn_ls_tty_fail;
 
-      rn_ls_summary_skip:
-        // ---- Success --------------------------------------------------
+        // cursor += 12 + name_len.
+        add r12, 12;
+        add r12, r10;
+        jmp rn_ls_rec_loop;
+
+      rn_ls_eod:
+        // ---- (5) sys_close(fd); return LS_OK ---------------------
+        mov rdi, rbx;
+        call sys_close;
         mov rax, 0xFFFFEB00;                     // LS_OK
         jmp rn_ls_epilogue;
 
-      rn_ls_bad_path:
-        mov rdi, 4;                              // RN_STAT_ERRORS
-        call ls_note;
-        mov rax, 0xFFFFEB21;                     // LS_ERR_BAD_PATH
-        jmp rn_ls_epilogue;
-
-      rn_ls_bind_fail:
-        mov rdi, 4;
-        call ls_note;
-        mov rax, 0xFFFFEB24;                     // LS_ERR_EMIT_BIND
-        jmp rn_ls_epilogue;
-
-      rn_ls_readdir_fail:
-        // ls.ENH-015 (#33): sys_pdxfs_dir_readnext returns -EBADF
-        // (0xFFFFFFFFFFFFFFF7) for TWO distinct substrate conditions
-        // that the kernel body cannot itself tell apart (see
-        // paideia-os src/kernel/core/syscall/handlers/
-        // sys_pdxfs_dir_readnext.pdx §DIR-MODE GATE): (a) LS_DIR_CAP_SLOT
-        // was never populated (the M3 "shell hasn't wired a cap yet"
-        // case this exit code was originally designed to surface), and
-        // (b) LS_DIR_CAP_SLOT holds a live cap whose mode nibble is
-        // NOT DIR -- i.e. a regular-file cap the shell already
-        // narrowed to the argument path. rax still holds the raw
-        // -errno here (comparisons do not clobber it).
-        //
-        // A non-null path_ptr (r12) is used as the second signal that
-        // disambiguates (b) from (a): a bare `ls` invocation with no
-        // argument never has anything to name a synthetic row with,
-        // so that shape keeps the pre-existing LS_ERR_READDIR
-        // behaviour unconditionally (protects the M3 boot-smoke
-        // "cap slot never wired" fingerprint from regressing). This is
-        // an interim heuristic, not a real cap/argument correspondence
-        // check (paideia-os/ls#29 tracks the real fix + the standalone
-        // `ls file.txt`-with-no-pre-narrowed-cap case); it is exactly
-        // the scope #33 calls out as landable before #29 closes: "a
-        // shell that already narrows to a file cap gets correct
-        // behaviour."
-        mov r10, 0xFFFFFFFFFFFFFFF7;              // -EBADF
-        cmp rax, r10;
-        jne rn_ls_readdir_fail_real;
-        cmp r12, 0;                               // path_ptr
-        je  rn_ls_readdir_fail_real;
-        jmp rn_ls_file_fallback;
-
-      rn_ls_readdir_fail_real:
-        mov rdi, 4;
-        call ls_note;
+      rn_ls_gd_err:
+        // sys_getdents failed mid-enumeration. Drain fd, return
+        // LS_ERR_READDIR.
+        mov rdi, rbx;
+        call sys_close;
         mov rax, 0xFFFFEB22;                     // LS_ERR_READDIR
         jmp rn_ls_epilogue;
 
-      rn_ls_file_fallback:
-        // ls.ENH-015 (#33): compose one PdxFsDirEntry-shaped record
-        // from path_ptr via the pure rn_compose_file_entry helper, then
-        // fall into the SAME render dispatch a real directory entry
-        // uses (rn_ls_render_dispatch) -- no duplicated format-flag
-        // switch. See RN_ENT_KIND_FILE's comment for why kind is a
-        // hardcoded FILE placeholder rather than a real stat result
-        // (no symlink vnode type exists in tmpfs yet, and no cap-kind-
-        // query trampoline is exposed to userspace to distinguish one
-        // from a regular file); `-L` / real symlink-vs-file rendering
-        // for this row is therefore not representable today and is
-        // out of scope until both land.
-        lea r11, [rip + _rn_entry_buf];
-        mov rdi, r11;                              // entry_buf_va
-        mov rsi, r12;                              // name_ptr = path_ptr
-        call rn_compose_file_entry;
-        mov r14, rax;                              // name_len for dispatch
-
-        lea r11, [rip + _rn_single_file_mode];
-        mov r10, 1;
-        mov [r11], r10;
-
-        lea r11, [rip + _rn_entry_buf];
-        add r11, 24;                               // RN_ENT_OFF_NAME
-        mov rbp, r11;                              // name_ptr for dispatch
-
-        jmp rn_ls_render_dispatch;
-
-      rn_ls_tty_fail:
-        mov rdi, 4;
-        call ls_note;
-        mov rax, 0xFFFFEB23;                     // LS_ERR_TTY_WRITE
+      rn_ls_open_err:
+        // sys_open failed. No fd to drain -- fall straight through.
+        mov rax, 0xFFFFEB22;                     // LS_ERR_READDIR
         jmp rn_ls_epilogue;
 
-      rn_ls_send_fail:
-        mov rdi, 4;
-        call ls_note;
-        mov rax, 0xFFFFEB25;                     // LS_ERR_EMIT_SEND
-        jmp rn_ls_epilogue;
-
-      rn_ls_audit_fail:
-        mov rdi, 4;
-        call ls_note;
-        mov rax, 0xFFFFEB26;                     // LS_ERR_AUDIT
-        // audit_ls_commit is a no-op here (_au_id stayed 0) so the
-        // unified epilogue is safe -- no separate no-audit epilogue
-        // needed.
-        jmp rn_ls_epilogue;
+      rn_ls_bad_path:
+        // sys_stat rejected the path. Return LS_ERR_BAD_PATH.
+        mov rax, 0xFFFFEB21;                     // LS_ERR_BAD_PATH
 
       rn_ls_epilogue:
-        // ---- M3-003: close DirListRecord audit frame -----------------
-        //
-        // Save exit code in r13 (dead at this point -- flag_bits no
-        // longer needed), call audit_ls_commit, restore.
-        // audit_ls_commit gates internally on _au_id != 0, so the
-        // pre-audit LS_ERR_BAD_PATH path is safe here.
-        mov r13, rax;                            // save exit_code
-        mov rdi, r13;
-        call audit_ls_commit;                    // clobbers rax
-        mov rax, r13;                            // restore exit_code
-
-        add rsp, 8;
         pop rbp;
-        pop r15;
         pop r14;
         pop r13;
         pop r12;
         pop rbx;
-        ret
-      }
-    }
-
-  // ==========================================================================
-  // rn_compose_file_entry(entry_buf_va, name_ptr) -> name_len
-  //
-  // ls.ENH-015 (#33): pure record-composition helper for the file-as-
-  // path fallback (rn_ls_file_fallback above). Writes a synthetic
-  // 128-byte PdxFsDirEntry-shaped record at entry_buf_va so it can be
-  // rendered by the SAME per-entry dispatch (rn_ls_render_dispatch)
-  // that renders a real pdxfs_dir_readnext result -- this function
-  // owns none of the format-flag logic, only the record shape.
-  //
-  // Signature: (u64, u64) -> u64 !{mem} @{}
-  //   RDI (input):  entry_buf_va -- caller-owned 128-byte buffer
-  //                                 (same shape/size as _rn_entry_buf).
-  //   RSI (input):  name_ptr     -- NUL-terminated name source
-  //                                 (path_ptr from argv; not read past
-  //                                 RN_ENT_NAME_MAX bytes even if
-  //                                 unterminated within that window).
-  //   RAX (output): name_len, clamped to [0, RN_ENT_NAME_MAX=104].
-  //
-  // Record fields written:
-  //   +0  (inode)         -- 0 placeholder. No cap-to-inode lookup is
-  //                          reachable from a held KIND_PDXFS_FILE cap
-  //                          without a stat trampoline this repo does
-  //                          not have (same placeholder discipline as
-  //                          owner/mtime/mode_bits elsewhere in this
-  //                          file, pending sys_pdxfs_stat_by_inode
-  //                          integration).
-  //   +8  (kind, low nibble) -- RN_ENT_KIND_FILE (8) unconditionally.
-  //                          See RN_ENT_KIND_FILE's own comment: tmpfs
-  //                          has no symlink vnode type at HEAD and no
-  //                          cap-kind-query trampoline exists, so a
-  //                          real file cap and a hypothetical future
-  //                          symlink cap are indistinguishable here.
-  //   +16 (name_len)       -- strnlen(name_ptr, RN_ENT_NAME_MAX).
-  //   +24 (name, 104 B)    -- name bytes, zero-padded past name_len
-  //                          (the whole 128-byte record is zeroed
-  //                          first, so padding is implicit).
-  //
-  // Register plan (leaf; no nested calls, so no callee-save / stack
-  // discipline to preserve -- every register below is caller-save):
-  //   rdi = entry_buf_va (input, read-only throughout)
-  //   rsi = name_ptr     (input, read-only throughout)
-  //   r10 = scratch address / zero-fill value
-  //   r9  = scratch address / RN_ENT_KIND_FILE literal
-  //   r8  = scratch address (byte-copy loop src)
-  //   rcx = name_len accumulator (also the return value staging reg)
-  //   rax = byte-load scratch (xor+mov_b #1248 mitigation) / return
-  // ==========================================================================
-  pub let rn_compose_file_entry : (u64, u64) -> u64 !{mem} @{} =
-    fn (entry_buf_va: u64) (name_ptr: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "ls.ENH-015 (#33): compose a synthetic 128-byte PdxFsDirEntry-shaped record from a raw NUL-terminated name so Runner::runner_ls's rn_ls_file_fallback can render a non-directory LS_DIR_CAP_SLOT cap through the existing per-entry dispatch instead of a duplicate format switch. Body: (1) zero all 16 u64 lanes of entry_buf_va via a lane-indexed store loop (rcfe_zero_loop) -- this makes every field past name_len implicitly zero-padded and the inode field a stable 0 placeholder. (2) store RN_ENT_KIND_FILE (8) as a full qword at +8 (matches the existing RN_ENT_OFF_KIND read-and-mask-low-nibble convention used throughout Runner). (3) strnlen(name_ptr, 104) via rcfe_strlen_loop: byte-scan with the #1248 mitigation (xor rax, rax; mov_b rax, [addr]) bounded at RN_ENT_NAME_MAX (104) so a name longer than the record's name field is clamped rather than overrun -- the bound check runs BEFORE the byte load each iteration, so byte index 104 of an unterminated name is never read. (4) store the clamped length (rcx) as a qword at +16. (5) rcfe_copy_loop byte-copies rcx bytes from name_ptr to entry_buf_va+24 (RN_ENT_OFF_NAME), same #1248-mitigated load + mov_b store idiom used by rn_ls_copy_head elsewhere in this file. (6) return rcx (clamped name_len) in rax. Leaf function: no CALL instructions, so no push/pop parity or SysV pre-call alignment to maintain -- every register used (rax, rcx, r8, r9, r10) is caller-save and none of rdi/rsi is ever overwritten, so both inputs stay valid for the whole body. paideia-as conformance: no test mnemonic, every zero-check is cmp reg, 0; every cmp immediate (16, 104) fits imm32; no and with a 64-bit immediate; byte reads use xor rax, rax; mov_b rax, [reg] with [reg]-only addressing (no [reg+reg]); scaled-index stores ([r10 + rcx * 8]) match the existing GDF copy-loop idiom in runner_ls. Labels prefixed rcfe_.",
-      block: {
-        // ---- (1) Zero the 128-byte record (16 u64 lanes) ----------
-        mov r10, rdi;                              // dst base
-        xor rax, rax;                               // zero value
-        mov rcx, 0;                                 // lane idx
-
-      rcfe_zero_loop:
-        cmp rcx, 16;
-        jae rcfe_zero_done;
-        mov [r10 + rcx * 8], rax;
-        add rcx, 1;
-        jmp rcfe_zero_loop;
-
-      rcfe_zero_done:
-        // ---- (2) kind nibble at +8 = RN_ENT_KIND_FILE (8) ----------
-        mov r10, rdi;
-        mov r9, 8;                                  // RN_ENT_KIND_FILE
-        mov [r10 + 8], r9;
-
-        // ---- (3) name_len = strnlen(name_ptr, RN_ENT_NAME_MAX=104) -
-        mov r10, rsi;                               // name_ptr copy for scan
-        xor rcx, rcx;                                // len accumulator
-
-      rcfe_strlen_loop:
-        mov r9, 104;                                 // RN_ENT_NAME_MAX
-        cmp rcx, r9;
-        jae rcfe_strlen_done;
-        xor rax, rax;
-        mov r8, r10;
-        add r8, rcx;
-        mov_b rax, [r8];                             // #1248 mitigation
-        cmp rax, 0;
-        je  rcfe_strlen_done;
-        add rcx, 1;
-        jmp rcfe_strlen_loop;
-
-      rcfe_strlen_done:
-        // ---- (4) store name_len at +16 -----------------------------
-        mov r10, rdi;
-        mov [r10 + 16], rcx;
-
-        // ---- (5) copy rcx bytes from name_ptr to entry_buf_va+24 ---
-        xor r9, r9;                                  // idx = 0
-
-      rcfe_copy_loop:
-        cmp r9, rcx;
-        jae rcfe_copy_done;
-        mov r8, rsi;
-        add r8, r9;
-        xor rax, rax;
-        mov_b rax, [r8];                             // #1248 mitigation
-        mov r10, rdi;
-        add r10, 24;                                 // RN_ENT_OFF_NAME
-        add r10, r9;
-        mov_b [r10], rax;
-        add r9, 1;
-        jmp rcfe_copy_loop;
-
-      rcfe_copy_done:
-        // ---- (6) return clamped name_len ---------------------------
-        mov rax, rcx;
         ret
       }
     }
