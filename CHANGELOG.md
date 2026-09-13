@@ -6,10 +6,128 @@ the version stamp in `manifest.pdxproj` and the git tag.
 
 ## [Unreleased]
 
+Nothing pending -- v1.2.0 (Wave G) drained the honesty-patch queue
++ landed the v1.1-A/B/C release closer in a single batch.
+
+## [1.2.0] -- 2026-09-13 <a id="120"></a>
+
+**Wave G close.** Consolidates the v1.1-A/B/C release-closer trio
+(#42/#43/#44) with the two enhancement items whose Runner-side
+wire lands in the same pass (#29 cwd-relative path resolve, #35
+-R per-directory header). Jump from 1.0.0 -> 1.2.0 (skipping the
+never-tagged 1.1.0) mirrors the `cat` v1.2.0-A Wave-B pattern:
+one release stamp for the batch, no phantom mid-versions.
+
+The 1.0 frozen contract holds: argv surface, exit-code map, wire
+body shape (144 bytes = 128 kernel prefix + 16 owner Cap wire),
+and `caps.decl` are all bit-identical to 1.0.0. Downstream v1.0
+consumers filtering by wire shape continue to decode v1.2.0
+emissions; consumers filtering by schema-name hash see the new
+`LsRecord@0.1` id and can pin against either it or the retained
+`PdxFsDirEntry@0.1` id (both are imprinted at reset).
+
+### Closed
+
+- **#42 (v1.1-A) -- LS_RUN_STUB retirement.** The M1-001 STUB
+  posture that the Runner briefly held before M3-001 flipped it
+  to a real syscall body is now formally retired. Every
+  well-formed invocation resolves to `LS_OK` or one of the
+  substrate-error sub-band codes. `Ls::LS_RUN_STUB` (0xFFFFEB20)
+  stays declared in the error band as a historical marker (so a
+  downstream consumer parsing the band-table by name still
+  resolves the ordinal) but is never returned by any code path.
+  `src/runner.pdx` file header + §V1.1 WAVE block make this
+  explicit; no code-body edit was required.
+
+- **#43 (v1.1-B) -- direct sys_semantic_send wire.** The Runner's
+  per-entry emit now hits `sys_semantic_send` (sysno 115,
+  paideia-os R107-M0-001) directly instead of routing through
+  `libpdx-semantic-pipe::Send::send_record`. The 144-byte record
+  fits well below the kernel body's 240-byte cap, so no
+  fragmentation is required. `LsRecord@0.1` is imprinted as the
+  primary v1.1 schema literal via
+  `libpdx-semantic-pipe::Schema::spipe_schema_id_from_name`;
+  lane 0 of the resulting 32-byte hash is passed as the opaque
+  `schema` u64 the kernel body takes. The prior
+  `PdxFsDirEntry@0.1` hash is retained in `.bss` for
+  interoperability with 1.0 consumers that pin on it.
+  - `src/semantic_emit.pdx` -- adds `SE_SYSNO_SEMANTIC_SEND`,
+    `SE_KERNEL_MAX_RECORD`, `_se_lsrecord_schema_name`,
+    `_se_lsrecord_hash`, `sem_semantic_send_syscall`
+    trampoline; `sem_emit_reset` now imprints both hashes;
+    `sem_emit_entry` calls the direct trampoline; the
+    `send_record` call site is gone.
+
+- **#44 (v1.1-C) -- release closer.** Version bumped 1.0.0 ->
+  1.2.0 in `manifest.pdxproj`; `release.changelog_entry` and
+  `release.mirror_target` re-point to the 1.2.0 anchors; this
+  CHANGELOG entry lands. The `manifest.pdxsig` re-sign lands
+  with the next release scan; the on-tree signature slots keep
+  their scaffold-epoch `SIG_UNSIGNED_SCAFFOLD` posture. Git tag
+  `v1.2.0` is applied by main after the build succeeds.
+
+- **#29 (ENH-009) -- cwd-relative path resolve.** Runner now
+  resolves a non-absolute argv path against the process cwd via
+  `sys_getcwd` (sysno 86, paideia-os R86.M1-003) BEFORE calling
+  `audit_ls_begin`, so the DirListRecord frame carries the
+  fully qualified path. Null and already-absolute paths pass
+  through unchanged; a `sys_getcwd` refusal defensively falls
+  back to the raw argv path (correctness before qualification).
+  - `src/pdxfs_shim.pdx` -- new `sys_getcwd` trampoline
+    (sysno 86, 2-arg pass-through).
+  - `src/runner.pdx` -- new `runner_resolve_path` non-leaf
+    helper + `_rn_resolved_path` / `_rn_resolved_len` `.bss`
+    slots + wire-in point in `rn_ls_audit_open` (before
+    `audit_ls_begin`).
+
+- **#35 (ENH-017) -- -R per-directory header.** When
+  `AS_BIT_R_REC` (0x200) is set, Runner emits a
+  `<resolved_path>:\n` header via `runner_emit_r_header` after
+  `audit_ls_begin` succeeds and before the read loop. The
+  header is D3-safe (framed inside the audit) and gives
+  downstream tooling a stable section-boundary to bracket
+  child listings under. The full depth-first descent lands
+  when the paideia-os `sys_pdxfs_dir_open_at` kernel primitive
+  ships; today the header is the observable v1.2.0 change.
+  - `src/runner.pdx` -- new `runner_emit_r_header` non-leaf
+    helper + `_rn_hdr_buf` `.bss` slot + `RN_BIT_R_REC_MASK`
+    constant + wire-in point in `rn_ls_audit_open` (after
+    `audit_ls_begin`, before `sem_emit_reset`).
+
+### Added
+
+- **PDX_TOOL_NAME + PDX_TOOL_VERSION externs.** New
+  `src/tool_ident.pdx` module supplies the two `.rodata` symbols
+  libpdx-argv >= 1.1.3's `VersionBackend::emit_default` requires
+  (ENH-032). Wire-in of a Parser-driven `--version` fast path
+  retires the inline `--version` compare when the next argv
+  round lands; the externs ship preemptively so a final-link
+  against libpdx-argv 1.1.3+ succeeds without a source bump.
+- **`.gitignore`** covers `build-out/` (paideia-as build output),
+  `*.swp`, `.DS_Store`.
+
+### Changed
+
+- **`manifest.pdxproj`.** `version = 1.2.0`; `sources` list
+  adds `src/tool_ident.pdx`; `deps` bumps
+  `libpdx-argv @ ^1.0` -> `libpdx-argv @ >= 1.1.3`.
+
+### Deferred to v1.3
+
+- **Descent controller for -R.** Depth-first recursion under
+  `-R` lands when `sys_pdxfs_dir_open_at` (per-name kernel-side
+  dir open) ships; ls today emits only the section header.
+- **Retire inline `--version` compare.** Route the version
+  fast-path through libpdx-argv `VersionBackend::emit_default`
+  once the argv-migration round lands (mirrors cat v1.2.0-A's
+  own note).
+
+## [Unreleased-pre-1.2 items retained]
+
 Enhancement v1.x wave (`design/enhancement-plan.md`), 1.0.1
-honesty-patch items landing ahead of the 1.1.0 wiring milestone. No
-frozen 1.0 interface (argv surface, exit-code map, wire body shape,
-`caps.decl`) changes in this section.
+honesty-patch items retained from the previous [Unreleased]
+section that predated the v1.2.0 batch. No frozen 1.0 interface
+change in this section.
 
 ### Fixed
 

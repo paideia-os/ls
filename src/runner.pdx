@@ -1,4 +1,6 @@
-// src/runner.pdx -- ls.M1-003 + ls.M3-001 + ls.M3-003 (paideia-os/ls#3 + #8 + #10)
+// src/runner.pdx -- ls.M1-003 + ls.M3-001 + ls.M3-003 + ls.v1.1-A +
+//                    ls.ENH-009 + ls.ENH-017 (paideia-os/ls#3 + #8 +
+//                    #10 + #42 + #29 + #35)
 //
 // Runner module: the operation body -- iterate a held KIND_PDXFS_FILE
 // (directory) cap via sys_pdxfs_dir_readnext (sysno 72), write each
@@ -142,6 +144,7 @@
 // Called:
 //   ls_note                -- Ls (src/ls.pdx)
 //   pdxfs_dir_readnext     -- PdxfsShim (src/pdxfs_shim.pdx)
+//   sys_getcwd             -- PdxfsShim (src/pdxfs_shim.pdx) -- v1.1 (#29)
 //   tty_write              -- TtyWrite (src/tty_write.pdx)
 //   hidden_filter_accept   -- HiddenFilter (src/hidden_filter.pdx)
 //   sem_emit_reset         -- SemanticEmit (src/semantic_emit.pdx)
@@ -149,6 +152,34 @@
 //   sem_emit_entry         -- SemanticEmit (src/semantic_emit.pdx)
 //   audit_ls_begin         -- AuditShim (src/audit_shim.pdx) -- M3-003
 //   audit_ls_commit        -- AuditShim (src/audit_shim.pdx) -- M3-003
+//   runner_resolve_path    -- this module -- v1.1 (#29)
+//   runner_emit_r_header   -- this module -- v1.1 (#35)
+//
+// =============================================================================
+// V1.1 WAVE (#42/#29/#35): POSTURE UPGRADES
+// =============================================================================
+//
+//   #42 (v1.1-A): the M1-001 LS_RUN_STUB posture is retired. Runner
+//     already flipped to a real syscall body at M3-001, and v1.1
+//     freezes that as the sole return posture: every well-formed
+//     invocation now resolves to LS_OK or one of the substrate-
+//     error sub-band codes. LS_RUN_STUB (0xFFFFEB20) remains
+//     declared in Ls's error band as a historical marker (so a
+//     downstream consumer that parses the band-table by name still
+//     resolves the ordinal) but is never returned.
+//
+//   #29 (ENH-009): argv path is resolved against the kernel cwd via
+//     sys_getcwd (sysno 86) BEFORE audit_ls_begin, so the audit
+//     frame + downstream tooling see the fully qualified path. The
+//     new runner_resolve_path helper carries the discriminator
+//     (null / absolute / relative) and stores the joined path in
+//     _rn_resolved_path.
+//
+//   #35 (ENH-017): -R recognition emits a `<resolved_path>:\n`
+//     header line via runner_emit_r_header AFTER audit_ls_begin
+//     and BEFORE the read loop. Header is D3-safe (framed inside
+//     the audit). The full depth-first descent lands with the
+//     pending sys_pdxfs_dir_open_at kernel primitive.
 
 module Runner = structure {
 
@@ -161,6 +192,15 @@ module Runner = structure {
   pub let RN_BIT_A_MASK           : u64 = 0x2
   // ls.ENH-019 (#37): -F type-indicator suffix mask (AS_BIT_F).
   pub let RN_BIT_F_MASK           : u64 = 0x1000
+  // ls.ENH-017 (#35): -R recursive descent mask (AS_BIT_R_REC).
+  // When set, Runner emits a `<resolved_path>:\n` header before the
+  // entry-print loop so the output frames a per-directory section
+  // that a descent controller can slot children under. The full
+  // depth-first descent lands with paideia-os sys_pdxfs_dir_open_at
+  // (kernel primitive not shipped at v1.1); the header emit at v1.1
+  // is the observable behaviour change downstream tooling can pin
+  // fixtures against today.
+  pub let RN_BIT_R_REC_MASK       : u64 = 0x200
   // ls.ENH-019 (#37): kind-nibble offset inside the 128-byte kernel
   // PdxFsDirEntry record. See paideia-os
   // src/kernel/core/cap/pdxfs_dir_iter.pdx §1 (inode@0, kind@8,
@@ -201,6 +241,245 @@ module Runner = structure {
   // up.
   pub let mut _rn_entry_buf : [u64; 16] = uninit @align(8)
   pub let mut _rn_line_buf  : [u64; 14] = uninit @align(8)
+
+  // ls.ENH-009 (#29): resolved-path scratch buffer for the cwd-relative
+  // path-resolve pre-step. Layout: bytes [0..cwd_len-1] = sys_getcwd's
+  // composed output MINUS its trailing NUL (kernel returns
+  // content_len + 1 including NUL); byte [cwd_len-1] = '/'; bytes
+  // [cwd_len..cwd_len+tail_len-1] = argv tail; byte
+  // [cwd_len+tail_len] = 0 (NUL). Sized 512 bytes so the composed
+  // buffer holds a comfortably deep cwd (nested up to the kernel's
+  // GETCWD_MAX_DEPTH=32) followed by a full 255-byte argv tail with
+  // headroom for the '/' separator and NUL.
+  pub let mut _rn_resolved_path : [u64; 64] = uninit @align(8)
+  pub let mut _rn_resolved_len  : u64       = 0
+
+  // ls.ENH-017 (#35): -R recursion-header composition buffer. Holds
+  // `<resolved_path>:\n` -- the colon-and-newline framing that
+  // POSIX ls emits at the head of every per-directory section under
+  // -R. Sized to match _rn_resolved_path plus the two suffix bytes.
+  pub let mut _rn_hdr_buf       : [u64; 65] = uninit @align(8)
+
+  // ==========================================================================
+  // runner_resolve_path(path_ptr) -> resolved_ptr
+  //
+  // ls.ENH-009 (#29): resolve a cwd-relative argv path against the
+  // kernel-tracked process cwd via sys_getcwd (sysno 86, paideia-os
+  // R86.M1-003). Returned pointer replaces r12 in runner_ls BEFORE
+  // audit_ls_begin, so the DirListRecord frame + downstream tooling
+  // see the fully qualified path.
+  //
+  // Discriminator:
+  //   path_ptr == 0        -> return 0 (Runner's null-path posture:
+  //                            audit frame + loop use the pre-narrowed
+  //                            KIND_PDXFS_FILE cap at LS_DIR_CAP_SLOT).
+  //   path_ptr[0] == '/'   -> return path_ptr as-is (already absolute).
+  //   else                 -> sys_getcwd into _rn_resolved_path; join
+  //                            with argv tail; return
+  //                            &_rn_resolved_path.
+  //   sys_getcwd fails     -> return path_ptr as-is (defensive: audit
+  //                            sees the raw argv path; tool remains
+  //                            correct).
+  //
+  // Register plan (non-leaf, 3-push callee-save prologue):
+  //   r12 = path_ptr survivor across sys_getcwd
+  //   r13 = composed_len (bytes INCLUDING NUL) returned by sys_getcwd
+  //   r14 = write cursor into _rn_resolved_path
+  //   3 pushes = 24B; entry rsp%16==8; 8+24=32; 32%16==0 at nested call.
+  //   Labels prefixed rrp_ (paideia-as reserved-label discipline).
+  // ==========================================================================
+  pub let runner_resolve_path : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (path_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "ls.ENH-009 (#29): resolve a cwd-relative argv path via sys_getcwd (sysno 86). Null path -> 0 (Runner's null-path posture stays). Byte0 == '/' (0x2F) -> pass through (already absolute). Otherwise call sys_getcwd(&_rn_resolved_path, 256); on -errno fall back to the raw argv path (defensive: the audit frame + downstream see the caller-relative path, which is still correct but not qualified -- correctness before qualification, mirroring cp's own cwd-fallback shape). On success, the kernel returns composed_len INCLUDING the trailing NUL; two subcases: composed_len == 1 (cwd is `/`, scratch already holds `/\\0`) skips the separator write and points the tail cursor at index 1; composed_len >= 2 (cwd is `/foo/bar\\0`) overwrites the trailing NUL at index (composed_len-1) with `/` and points the tail cursor at index composed_len. Argv-tail copy walks byte-by-byte via the #1248 mitigation (xor rax, rax; mov_b rax, [r12]) until NUL, bounded at index 511 so the 512-byte scratch always retains room for the terminating NUL (defence against a corrupt or unbounded argv tail). Written length (excluding NUL) is stashed in _rn_resolved_len so runner_emit_r_header can hand it to tty_write without recomputing strlen. paideia-as conformance: no test mnemonic; largest cmp immediate 511 (imm16); byte reads via xor+mov_b; byte writes via mov_b [reg], reg; r10 + r11 scratch. Three callee-save pushes (r12=path_ptr, r13=composed_len, r14=write cursor) give rsp%16==0 at the sys_getcwd nested call. Matched pops before every ret. Labels prefixed rrp_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                            // r12 = path_ptr
+
+        // ---- (a) Null path -> return 0 --------------------------------
+        cmp r12, 0;
+        je  rrp_pass_zero;
+
+        // ---- (b) Already absolute -> pass through ---------------------
+        xor rax, rax;                            // #1248 mitigation
+        mov_b rax, [r12];
+        cmp rax, 0x2F;                           // '/'
+        je  rrp_pass_r12;
+
+        // ---- (c) Relative path -> sys_getcwd + join -------------------
+        lea r11, [rip + _rn_resolved_path];
+        mov rdi, r11;
+        mov rsi, 256;                            // buffer capacity
+        call sys_getcwd;
+
+        // Negative rax -> -errno; defensive fallback.
+        cmp rax, 0;
+        jl  rrp_pass_r12;
+
+        mov r13, rax;                            // composed_len (incl NUL)
+
+        // If composed_len == 1 the cwd is "/"; scratch is "/\0". Point
+        // the tail cursor at index 1, overwriting the NUL directly.
+        cmp r13, 1;
+        je  rrp_skip_sep;
+
+        // General case: overwrite the trailing NUL at index (r13-1)
+        // with '/', then set cursor to index r13.
+        lea r11, [rip + _rn_resolved_path];
+        mov r14, r11;
+        add r14, r13;
+        sub r14, 1;                              // &scratch[len-1]
+        mov rax, 0x2F;                           // '/'
+        mov_b [r14], rax;
+        mov r14, r11;
+        add r14, r13;                            // &scratch[len]
+        jmp rrp_copy_tail;
+
+      rrp_skip_sep:
+        lea r11, [rip + _rn_resolved_path];
+        mov r14, r11;
+        add r14, 1;                              // &scratch[1]
+
+      rrp_copy_tail:
+        // Bound loop: never write past index 511 (leaves index 511 for
+        // the terminating NUL below).
+      rrp_copy_head:
+        mov rcx, r14;
+        lea r11, [rip + _rn_resolved_path];
+        sub rcx, r11;                            // current index
+        mov r11, 511;
+        cmp rcx, r11;
+        jae rrp_copy_done;
+        xor rax, rax;                            // #1248 mitigation
+        mov_b rax, [r12];
+        cmp rax, 0;
+        je  rrp_copy_done;
+        mov_b [r14], rax;
+        add r14, 1;
+        add r12, 1;
+        jmp rrp_copy_head;
+
+      rrp_copy_done:
+        // Terminate + stash length (excluding NUL) in _rn_resolved_len.
+        xor rax, rax;
+        mov_b [r14], rax;
+        lea r11, [rip + _rn_resolved_path];
+        mov rax, r14;
+        sub rax, r11;                            // resolved_len
+        lea r11, [rip + _rn_resolved_len];
+        mov [r11], rax;
+
+        lea rax, [rip + _rn_resolved_path];
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      rrp_pass_r12:
+        mov rax, r12;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      rrp_pass_zero:
+        xor rax, rax;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // runner_emit_r_header(resolved_path_ptr) -> u64
+  //
+  // ls.ENH-017 (#35): compose `<resolved_path>:\n` into _rn_hdr_buf
+  // and write via tty_write. Called by runner_ls when RN_BIT_R_REC_MASK
+  // is set AND the audit frame is already open (D3-safe: the header
+  // byte reaches KIND_TTY only after audit_ls_begin succeeded).
+  //
+  // Returns tty_write's rax verbatim (bytes_written on success, or a
+  // negative-errno u64 on refusal) so runner_ls can gate
+  // LS_ERR_TTY_WRITE with the same `cmp rax, 0; jl` idiom the
+  // per-entry write uses.
+  //
+  // Path-ptr conventions:
+  //   resolved_path_ptr == 0 -> emit `.:\n` (null-path posture header:
+  //                              the dot mirrors POSIX ls's default-
+  //                              path echo).
+  //   resolved_path_ptr != 0 -> copy bytes until NUL (bounded at index
+  //                              511) then append ':' + '\n'.
+  //
+  // Register plan (non-leaf, 3-push callee-save prologue):
+  //   r12 = resolved_path_ptr (survives copy loop + tty_write)
+  //   r13 = compose cursor into _rn_hdr_buf
+  //   r14 = _rn_hdr_buf base (LEA once, reused across the tail append)
+  //   3 pushes = 24B; entry rsp%16==8; 8+24=32; 32%16==0 at tty_write.
+  //   Labels prefixed reh_.
+  // ==========================================================================
+  pub let runner_emit_r_header : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (resolved_path_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "ls.ENH-017 (#35): compose the -R per-directory header `<resolved_path>:\\n` into _rn_hdr_buf and write via tty_write. Null path resolves to the fallback `.:\\n` (2-byte payload) so the null-path posture (Runner defaults to LS_DIR_CAP_SLOT) still frames a per-directory section header downstream tools can bracket. Non-null path: byte-by-byte copy via the #1248 mitigation (xor rax, rax; mov_b rax, [r12]) until the first NUL, bounded at index 511 for the same overrun-safety reason runner_resolve_path bounds its own copy. Trailing suffix: ':' (0x3A) then '\\n' (0x0A) written via mov_b [reg], reg. tty_write is called with the composed length (cursor - base). Return value forwarded verbatim so runner_ls can propagate LS_ERR_TTY_WRITE using the same cmp/jl idiom the per-entry emit uses. paideia-as conformance: no test mnemonic; largest cmp immediate 511 (imm16); byte reads via xor+mov_b; byte writes via mov_b [reg], reg; r10 + r11 scratch. Three callee-save pushes (r12=path_ptr, r13=compose cursor, r14=hdr buffer base) give rsp%16==0 at the tty_write nested call site. Matched pops before ret. Labels prefixed reh_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                            // r12 = resolved_path_ptr
+        lea r14, [rip + _rn_hdr_buf];            // r14 = buffer base
+        mov r13, r14;                            // r13 = compose cursor
+
+        cmp r12, 0;
+        je  reh_fallback_dot;
+
+      reh_copy_head:
+        // Bound: current index < 511.
+        mov rcx, r13;
+        sub rcx, r14;                            // current index
+        mov r11, 511;
+        cmp rcx, r11;
+        jae reh_append_suffix;
+        xor rax, rax;                            // #1248 mitigation
+        mov_b rax, [r12];
+        cmp rax, 0;
+        je  reh_append_suffix;
+        mov_b [r13], rax;
+        add r13, 1;
+        add r12, 1;
+        jmp reh_copy_head;
+
+      reh_fallback_dot:
+        // Emit "." at cursor.
+        mov rax, 0x2E;                           // '.'
+        mov_b [r13], rax;
+        add r13, 1;
+
+      reh_append_suffix:
+        // ':' then '\n'.
+        mov rax, 0x3A;                           // ':'
+        mov_b [r13], rax;
+        add r13, 1;
+        mov rax, 0x0A;                           // '\n'
+        mov_b [r13], rax;
+        add r13, 1;
+
+        // tty_write(&_rn_hdr_buf, cursor - base).
+        mov rdi, r14;
+        mov rsi, r13;
+        sub rsi, r14;                            // composed length
+        call tty_write;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
 
   // ==========================================================================
   // runner_ls(path_ptr, flag_bits) -> u64
@@ -246,6 +525,19 @@ module Runner = structure {
         je  rn_ls_bad_path;
 
       rn_ls_audit_open:
+        // ---- ls.ENH-009 (#29): resolve cwd-relative argv path -------
+        //
+        // Runs BEFORE audit_ls_begin so the DirListRecord frame
+        // carries the fully qualified path. runner_resolve_path
+        // returns:
+        //   0                    -- null-path posture preserved
+        //   path_ptr             -- already absolute (or sys_getcwd
+        //                            refused; defensive fallback)
+        //   &_rn_resolved_path   -- cwd-joined path in .bss scratch
+        mov rdi, r12;
+        call runner_resolve_path;
+        mov r12, rax;                            // r12 = resolved path
+
         // ---- M3-003: open DirListRecord audit frame (D3) -------------
         //
         // MUST happen before any user-visible byte reaches KIND_TTY
@@ -253,11 +545,29 @@ module Runner = structure {
         // LS_ERR_AUDIT via the epilogue -- audit_ls_commit is a no-op
         // when _au_id == 0 (which it stays on refusal), so the
         // unified epilogue is safe.
-        mov rdi, r12;                            // path_ptr
+        mov rdi, r12;                            // resolved path
         mov rsi, r13;                            // flag_bits
         call audit_ls_begin;
         cmp rax, 0;                              // AU_OK
         jne rn_ls_audit_fail;
+
+        // ---- ls.ENH-017 (#35): -R per-directory header (audit-safe) --
+        //
+        // Emitted AFTER audit_ls_begin, BEFORE the schema bind + read
+        // loop. Header line frames the section a descent controller
+        // slots children under. The full depth-first descent lands
+        // with paideia-os sys_pdxfs_dir_open_at (kernel primitive
+        // still pending); today the header ships the observable
+        // v1.1 change downstream fixtures can pin against.
+        mov r10, r13;                            // r10 = flag_bits copy
+        mov r11, 0x200;                          // RN_BIT_R_REC_MASK
+        and r10, r11;
+        cmp r10, 0;
+        je  rn_ls_pre_emit;
+        mov rdi, r12;                            // resolved path
+        call runner_emit_r_header;
+        cmp rax, 0;                              // tty_write rc: >=0 ok
+        jl  rn_ls_tty_fail;                      // -errno -> propagate
 
       rn_ls_pre_emit:
         // ---- Emit prelude: schema-imprint + bind ---------------------

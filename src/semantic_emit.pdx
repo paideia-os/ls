@@ -148,6 +148,14 @@ module SemanticEmit = structure {
   pub let SE_ERR_BIND         : u64 = 0xFFFFEB24    // LS_ERR_EMIT_BIND mirror
   pub let SE_ERR_SEND         : u64 = 0xFFFFEB25    // LS_ERR_EMIT_SEND mirror
 
+  // ls.v1.1-B (#43): direct-syscall wire. Sysno 115 = sys_semantic_send,
+  // shipped at paideia-os R107-M0-001 (src/kernel/core/syscall/handlers/
+  // sys_semantic_send.pdx). The kernel body accepts records up to
+  // SSS_MAX_RECORD = 240 bytes; ls's 144-byte PdxFsDirEntry@0.1
+  // (equivalently LsRecord@0.1) fits with a 96-byte headroom.
+  pub let SE_SYSNO_SEMANTIC_SEND : u64 = 115
+  pub let SE_KERNEL_MAX_RECORD   : u64 = 240
+
   // ==========================================================================
   // Wire constants
   // ==========================================================================
@@ -191,6 +199,16 @@ module SemanticEmit = structure {
   // bytes to get the same id.
   pub let _se_schema_name : [u8; 17] = "PdxFsDirEntry@0.1"
 
+  // ls.v1.1-B (#43): the v1.1 wire's primary schema name. Kept in
+  // lockstep with the direct-sysno-115 path in sem_emit_entry. 12 bytes
+  // (NUL-excluded, matching the _se_schema_name convention). The wire
+  // body byte shape is UNCHANGED from PdxFsDirEntry@0.1 (144 bytes:
+  // 128-byte kernel prefix + 16-byte owner Cap wire) -- only the
+  // schema-name literal changes, so a v1.0 consumer that filters by
+  // schema-hash sees a distinct id at v1.1 and one that filters on
+  // record shape sees the identical byte layout.
+  pub let _se_lsrecord_schema_name : [u8; 12] = "LsRecord@0.1"
+
   // ls.ENH-021 (#39): summary schema name for the trailing
   // PdxLsSummaryRecord@0.1 record. 21 bytes, no NUL terminator (matches
   // the _se_schema_name convention -- spipe_schema_id_from_name takes an
@@ -214,6 +232,14 @@ module SemanticEmit = structure {
   // (sem_emit_reset), called once from Runner before its first bind
   // call. Aligned to 8 so the four qword lanes are naturally aligned.
   pub let mut _se_pdxfsdirentry_hash : [u64; 4] = uninit @align(8)
+
+  // ls.v1.1-B (#43): 32-byte schema id for "LsRecord@0.1", imprinted
+  // by sem_emit_reset alongside _se_pdxfsdirentry_hash. The first
+  // qword (lane 0) is passed AS-IS to sys_semantic_send as the
+  // opaque `schema` argument -- any independently-built consumer that
+  // computes spipe_schema_id_from_name("LsRecord@0.1", 12) sees the
+  // same qword, so the wire is interoperable without coordination.
+  pub let mut _se_lsrecord_hash      : [u64; 4] = uninit @align(8)
 
   // _se_wire_scratch -- 144 bytes (18 u64 lanes) at M3-002: 16 lanes
   // for the copied kernel PdxFsDirEntry + 2 lanes for the appended
@@ -261,11 +287,60 @@ module SemanticEmit = structure {
         push r12;                                // SysV alignment for the nested call
 
         lea rdi, [rip + _se_schema_name];        // name_ptr
-        mov rsi, 17;                              // name_len
+        mov rsi, 17;                             // name_len
         lea rdx, [rip + _se_pdxfsdirentry_hash]; // out_hash_ptr
         call spipe_schema_id_from_name;
 
+        // ls.v1.1-B (#43): imprint the LsRecord@0.1 schema id too,
+        // so sem_emit_entry's direct sys_semantic_send call can lift
+        // a stable opaque u64 id from lane 0. Same three-arg call
+        // shape; the pre-BLAKE3 fold is pure (well-formed inputs
+        // never miss the SP_SCHEMA_ERR_* gates).
+        lea rdi, [rip + _se_lsrecord_schema_name];
+        mov rsi, 12;                             // "LsRecord@0.1" length
+        lea rdx, [rip + _se_lsrecord_hash];
+        call spipe_schema_id_from_name;
+
         pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sem_semantic_send_syscall(schema, record_ptr, record_len) -> u64
+  //
+  // ls.v1.1-B (#43): direct-syscall trampoline for paideia-os sysno 115
+  // (sys_semantic_send). Bypasses libpdx-semantic-pipe::Send so the
+  // wire hits the kernel ring producer without an intermediate library
+  // buffer copy. The kernel body accepts up to SE_KERNEL_MAX_RECORD
+  // (240) bytes per call; ls's 144-byte record fits with a 96-byte
+  // headroom that leaves room for a schema-versioned expansion without
+  // a per-emit fragment loop.
+  //
+  // Signature: (u64, u64, u64) -> u64 !{mem, sysreg} @{}
+  //   RDI (input): schema      -- opaque u64 schema id (first qword of
+  //                               the fold-imprinted hash).
+  //   RSI (input): record_ptr  -- caller-owned wire body VA.
+  //   RDX (input): record_len  -- 1..=240 bytes.
+  //   RAX (output): 0 on success; -EFAULT / -EINVAL on refusal per
+  //                 the kernel body's contract (see paideia-os
+  //                 src/kernel/core/syscall/handlers/sys_semantic_send.pdx
+  //                 §Contract).
+  //
+  // Arity 3 <= 4 so no r10 shuffle. Kernel ABI already matches SysV
+  // rdi/rsi/rdx; the trampoline is one `mov rax, 115; syscall; ret`.
+  //
+  // Register plan (leaf):
+  //   rax = sysno (input) then return
+  //   rdi/rsi/rdx = pass-through
+  // ==========================================================================
+  pub let sem_semantic_send_syscall : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (schema: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "ls.v1.1-B (#43): trampoline for paideia-os sysno 115 (sys_semantic_send, R107-M0-001). Three SysV args map straight to SYSCALL rdi/rsi/rdx (arity 3 < 4, no r10 shuffle). Return-code shape verbatim from the kernel body: 0 on success, -EINVAL (0xFFFF...EA) if record_len is 0 or > 240, -EFAULT (0xFFFF...F2) if record_ptr rejected by user_ptr_ok, else the ring-write commit is atomic (header stamped after the data-copy so a mid-copy fault leaves the previous slot header intact). Effects {mem, sysreg} @{} match the kernel body -- mem for the user_read_bytes_via_walk of the record body into the kernel ring, sysreg for the SYSCALL clobber (rcx + r11), no cap because sys_semantic_send takes no cap slot (the schema is opaque to the kernel). Leaf trampoline: no callee-save touched, no push/pop parity, no compare (sysno 115 is a `mov rax, imm` emission that fits imm8).",
+      block: {
+        mov rax, 115;                            // SE_SYSNO_SEMANTIC_SEND
+        syscall;
         ret
       }
     }
@@ -409,14 +484,26 @@ module SemanticEmit = structure {
         xor rax, rax;                            // placeholder user_row = 0
         mov [r11], rax;
 
-        // ---- (3) send_record(fd, rec_ptr, rec_len) ------------------
-        mov rdi, 3;                              // LS_STDOUT_ENDPOINT_SLOT
-        mov rsi, r13;                            // &_se_wire_scratch
-        mov rdx, 144;                            // SE_WIRE_RECORD_SIZE (M3-002)
-        call send_record;
+        // ---- (3) sys_semantic_send(schema, rec_ptr, rec_len) --------
+        //
+        // ls.v1.1-B (#43): direct kernel wire. schema = lane-0 qword
+        // of the LsRecord@0.1 hash (imprinted by sem_emit_reset via
+        // spipe_schema_id_from_name), so an independently-built
+        // consumer computing the same fold sees the identical opaque
+        // id. rec_ptr = &_se_wire_scratch (already loaded in r13);
+        // rec_len = SE_WIRE_RECORD_SIZE (144, fits well below the
+        // kernel body's 240-byte cap).
+        lea r11, [rip + _se_lsrecord_hash];
+        mov rdi, [r11];                          // schema (opaque u64)
+        mov rsi, r13;                            // record_ptr
+        mov rdx, 144;                            // SE_WIRE_RECORD_SIZE
+        call sem_semantic_send_syscall;
 
         // ---- (4) translate return ------------------------------------
-        cmp rax, 0;                              // SP_SEND_OK
+        // sys_semantic_send returns 0 on success; any non-zero value
+        // is a negative-errno u64. Collapse to SE_ERR_SEND for the
+        // Runner's error taxonomy (0xFFFFEB2x = Runner sub-band).
+        cmp rax, 0;
         jne seme_send_fail;
         xor rax, rax;                            // SE_OK
         pop r14;

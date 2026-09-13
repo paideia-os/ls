@@ -83,6 +83,9 @@ module PdxfsShim = structure {
   // ==========================================================================
   pub let PSH_SYSNO_PDXFS_OPEN         : u64 = 71
   pub let PSH_SYSNO_PDXFS_DIR_READNEXT : u64 = 72
+  // ls.ENH-009 (#29): kernel cwd read. Landed at paideia-os R86.M1-003
+  // (src/kernel/core/syscall/sys_getcwd.pdx) with the SC+ ID 86 wire.
+  pub let PSH_SYSNO_GETCWD             : u64 = 86
 
   // ==========================================================================
   // Mode flag bits (mirror paideia-os src/kernel/core/cap/kind_pdxfs_file.pdx
@@ -153,6 +156,46 @@ module PdxfsShim = structure {
       justification: "ls.M3-001 (#8): trampoline for paideia-os sysno 72 (sys_pdxfs_dir_readnext). Two SysV args map straight to SYSCALL rdi/rsi (arity 2 < 4 so no r10 shuffle -- paideia-os src/user/syscall_shim.pdx §3.2 template). Return-code discriminator: rax == 1 means one entry written to entry_buf; rax == 0 means end-of-directory (buffer untouched); any other value is a negative-errno u64 (-EFAULT = 0xFFFFFFFFFFFFFFF2 if entry_buf_va rejected by user_ptr_ok; -EBADF = 0xFFFFFFFFFFFFFFF7 if dir_cap_slot is not a live KIND_PDXFS_FILE with DIR mode). Runner reads the return via `cmp rax, 1; jne <exit>` because 1 is the only value that means 'keep going' -- same idiom as cp's pdxfs_read return-code inspection at src/pdxfs.pdx L155. Effects {mem, sysreg} @{cap} match the kernel body's declaration -- mem for the KPTI walker's write into user pages, sysreg for the SYSCALL clobber (rcx + r11), cap for the pdxfs_file_row_of_slot lookup that resolves the cap slot to a row_id. Leaf trampoline: no callee-save touched, no push/pop parity to preserve.",
       block: {
         mov rax, 72;                             // PSH_SYSNO_PDXFS_DIR_READNEXT
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_getcwd(user_buf_va, buf_len) -> composed_len | -errno    [sysno 86]
+  //
+  // Signature: (u64, u64) -> u64 !{mem, sysreg} @{cap}
+  //   RDI (input): user_buf_va -- caller-owned buffer VA for the composed
+  //                               NUL-terminated cwd string.
+  //   RSI (input): buf_len     -- byte capacity of user_buf_va; kernel
+  //                               refuses with -ERANGE if composed_len
+  //                               (content + NUL) exceeds it.
+  //   RAX (output): composed_len (bytes INCLUDING the NUL terminator)
+  //                 on success; negative-errno u64 on failure:
+  //                   -EFAULT (0xFFFF...F2) -- buf VA rejected.
+  //                   -ERANGE (0xFFFF...DE) -- buf too small.
+  //
+  // ls.ENH-009 (#29): Runner calls this before audit_ls_begin to
+  // resolve a non-absolute argv path against the process cwd, so the
+  // DirListRecord audit frame + downstream tooling see the fully
+  // qualified path. Kernel body: paideia-os
+  // src/kernel/core/syscall/sys_getcwd.pdx (R86.M1-003, sysno 86).
+  //
+  // Arity 2 <= 4 so no r10 shuffle. Pass-through leaf per the
+  // paideia-os/src/user/syscall_shim.pdx §3.2 template shared with
+  // the two trampolines above.
+  //
+  // Register plan (leaf):
+  //   rax = sysno (input) then return
+  //   rdi = user_buf_va (SysV arg0 -> SYSCALL arg0)
+  //   rsi = buf_len     (SysV arg1 -> SYSCALL arg1)
+  // ==========================================================================
+  pub let sys_getcwd : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (user_buf_va: u64) (buf_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "ls.ENH-009 (#29): trampoline for paideia-os sysno 86 (sys_getcwd). Two SysV args map straight to SYSCALL rdi/rsi (arity 2 < 4, no r10 shuffle -- paideia-os/src/user/syscall_shim.pdx §3.2 template). Return-code shape verbatim from the kernel body (src/kernel/core/syscall/sys_getcwd.pdx): composed_len bytes INCLUDING the trailing NUL on success, negative-errno u64 on failure (-EFAULT if buf VA rejected by user_ptr_ok, -ERANGE if composed_len exceeds buf_len). Runner reads the return via `cmp rax, 0; jl <err>` for the hard-failure discriminator and uses the composed_len value on success to know where the NUL sits (so it can locate the append point when joining with the argv-relative tail). Effects {mem, sysreg} @{cap} mirror the kernel body's own declaration -- mem for the user_write_bytes_via_walk copy of the composed scratch out to user_buf_va, sysreg for the SYSCALL clobber (rcx + r11), cap for the walk over TASK_OFF_CWD + parent_idx chain that consults the vnode-pool cap-implicit table. Leaf trampoline: no callee-save touched, no push/pop parity to preserve. No compare inside this body -- sysno 86 is a `mov rax, imm` emission that fits imm8.",
+      block: {
+        mov rax, 86;                             // PSH_SYSNO_GETCWD
         syscall;
         ret
       }

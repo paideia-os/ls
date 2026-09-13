@@ -1,8 +1,20 @@
 # ls — status
 
-**Wave:** R50 (Wave 2)
-**Version:** 1.0.0
-**Current milestone:** M5 (signed 1.0 release) — CLOSED.
+**Wave:** Wave G (v1.1-A/B/C release closer + ENH-009/ENH-017 wire-in)
+**Version:** 1.2.0
+**Current milestone:** v1.2.0 (Wave G) — CLOSED (build + tag pending main).
+
+**v1.2.0 (Wave G).** Consolidates the v1.1-A/B/C release-closer trio
+(paideia-os/ls #42 / #43 / #44) with #29 (ENH-009 cwd-relative path
+resolve via `sys_getcwd`, sysno 86) and #35 (ENH-017 -R per-directory
+header emit). Jump 1.0.0 -> 1.2.0 (skipping the never-tagged 1.1.0)
+mirrors the `cat` v1.2.0-A Wave-B pattern. See `CHANGELOG.md#120`
+for the full per-issue closure map. The 1.0 frozen surface (argv,
+exit-code map, wire body shape, `caps.decl`) is bit-identical to
+1.0.0; downstream 1.0 consumers filtering by wire shape continue to
+decode 1.2.0 emissions.
+
+**Prior milestone:** M5 (signed 1.0 release) — CLOSED.
 M5-001 landed `manifest.pdxproj` (version bumped 0.4→1.0.0), `CHANGELOG.md`
 with the 1.0.0 entry freezing the argv surface + PdxFsDirEntry wire body +
 exit-code map + caps.decl at 1.0, `doc/ls.pdxdoc` (man-equivalent per I7

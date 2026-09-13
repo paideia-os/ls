@@ -1,0 +1,7 @@
+# Build artefacts (paideia-as build.sh output). Local-only; the signed
+# release ships from dist/ per design/release-1.0.md.
+build-out/
+
+# Editor + OS noise.
+*.swp
+.DS_Store

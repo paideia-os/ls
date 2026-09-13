@@ -18,11 +18,24 @@
 # a new PAIDEIA_AS_VER KV record.
 
 name        = ls
-version     = 1.0.0
+version     = 1.2.0
 kind        = tool
 entry       = Dispatch::ls_dispatch
 output      = build-out/ls
 caps_decl   = caps.decl
+
+# v1.2.0 (Wave G) closes ls #29 (ENH-009 cwd-relative path resolve
+# via sys_getcwd sysno 86), #35 (ENH-017 -R per-directory header
+# emit; depth-first descent pending sys_pdxfs_dir_open_at kernel
+# primitive), #42 (v1.1-A LS_RUN_STUB retirement -- Runner posture
+# frozen as the real syscall body first landed at M3-001), #43
+# (v1.1-B direct sys_semantic_send sysno 115 wire replacing the
+# libpdx-semantic-pipe::Send indirection, with LsRecord@0.1 as the
+# primary v1.1 schema literal), and #44 (v1.1-C release closer).
+# The 1.0 frozen surface (argv, exit map, wire body shape,
+# caps.decl) is preserved; the v1.2.0 wire body remains the
+# byte-identical 144-byte record so a v1.0 consumer parsing on
+# shape still decodes v1.2.0 emissions.
 
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). -----------------
@@ -55,6 +68,8 @@ sources:
   - src/semantic_emit.pdx         # M3-001 + M3-002 + M4-004 emit + wire_compose
   - src/audit_shim.pdx            # M3-003 audit_ls_begin + audit_ls_commit
   - src/exit_map.pdx              # M4-003 0xFFFFEBxx -> I4 exit-code map
+  - src/tool_ident.pdx            # v1.2.0 (Wave G) PDX_TOOL_NAME + _VERSION externs
+                                  #                 for libpdx-argv >= 1.1.3 (ENH-032)
 
 # --- Library dependencies -----------------------------------------------
 # ls consumes four libraries at 1.0.1+ (ls.ENH-013, #22: the phantom
@@ -66,7 +81,10 @@ sources:
 # bumps at each library's own M5 and the manifest.pdxsig at design/
 # release-1.0.md re-signs on each.
 deps:
-  - libpdx-argv @ ^1.0            # M1-002 argv surface + M4-001 typed flags
+  - libpdx-argv @ >= 1.1.3        # v1.2.0 (Wave G, #43/#44): bumped from ^1.0 for
+                                  # the ENH-032 PDX_TOOL_NAME/VERSION extern
+                                  # contract in VersionBackend::emit_default;
+                                  # src/tool_ident.pdx supplies both symbols.
   - libpdx-cap @ ^1.0             # M2-002 KIND_USER_ref decode for owner column
   - libpdx-semantic-pipe @ ^1.0   # M3-001 PdxFsDirEntry@0.1 schema bind + emit;
                                   # ls.ENH-010 (#27) adds Schema::spipe_schema_
@@ -106,6 +124,6 @@ compliance:
 # change.
 release:
   manifest_pdxsig = dist/manifest.pdxsig
-  changelog_entry = CHANGELOG.md#100
+  changelog_entry = CHANGELOG.md#120
   pdxdoc          = doc/ls.pdxdoc
-  mirror_target   = pkgs.paideia-os/ls/1.0.0/
+  mirror_target   = pkgs.paideia-os/ls/1.2.0/

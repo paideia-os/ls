@@ -1,0 +1,67 @@
+// src/tool_ident.pdx -- ls.v1.2.0 (Wave G: closes #42/#43/#44 alongside
+//                                    #29 and #35)
+//
+// ToolIdent module: per-tool identity externs consumed by libpdx-argv
+// v1.1.3+ VersionBackend::emit_default (libpdx-argv ENH-032). Follows
+// the shape cat, cp, rm, mv, mkdir land in this same wave.
+//
+// =============================================================================
+// Why this file exists
+// =============================================================================
+//
+// libpdx-argv v1.1.3 dropped the hard-coded `DOC_TOOL_NAME` /
+// `DOC_TOOL_VERSION` literals from VersionBackend::emit_default and
+// replaced them with two `UND` externs -- PDX_TOOL_NAME (lowercase,
+// NUL-terminated) and PDX_TOOL_VERSION (semver, NUL-terminated). Every
+// consumer of libpdx-argv >= 1.1.3 must provide both at final-link
+// time or `ld` fails with an undefined-symbol error (deliberate: no
+// STB_WEAK fallback, since the pre-hotfix "doc" default would silently
+// pass under `--version` -- worse than a link-time failure).
+//
+// See tools/user/libpdx-argv/src/version_backend.pdx §60-90 for the
+// ENH-032 hotfix contract.
+//
+// =============================================================================
+// Wire-in posture at v1.2.0
+// =============================================================================
+//
+// Ls's satellite deps.list bumps `libpdx-argv @ ^1.0` -> `libpdx-argv
+// >= 1.1.3` in this wave; the two symbols below satisfy the contract
+// preemptively so a re-link against v1.1.3+ succeeds without a source
+// tree bump. The Dispatch entry point still folds through ExitMap;
+// the follow-up hook that flips ArgvSurface's Parser call to invoke
+// VersionBackend::emit_default lands with the libpdx-argv v1.1.3-wave
+// migration and retires any inline `--version` short-circuit.
+//
+// =============================================================================
+// paideia-as compliance
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ToolIdent`).
+//   - No function bodies -> no register plan / push-pop parity.
+//   - String literals on single lines (fingerprint-extractor
+//     requirement + libpdx-argv's linker resolves the symbol as-is).
+//   - Array size == literal byte count including NUL: "ls\0" = 3 bytes,
+//     "1.2.0\0" = 6 bytes.
+//   - Both symbols `pub let` (public + immutable = .rodata) so the
+//     linker can resolve libpdx-argv's UND refs against them.
+
+module ToolIdent = structure {
+
+  // ============================================================================
+  // PDX_TOOL_NAME -- lowercase, NUL-terminated. Read by libpdx-argv
+  // VersionBackend::emit_default via `lea rdi, [rip + PDX_TOOL_NAME]`
+  // (ENH-032 segment 1a). "ls" fits trivially; array is 3 bytes
+  // including the trailing NUL.
+  // ============================================================================
+  pub let PDX_TOOL_NAME : [u8; 3] = "ls\0"
+
+  // ============================================================================
+  // PDX_TOOL_VERSION -- semver, NUL-terminated. Read by libpdx-argv
+  // VersionBackend::emit_default via `lea rdi, [rip + PDX_TOOL_VERSION]`
+  // (ENH-032 segment 1b). Keep this literal in lockstep with
+  // manifest.pdxproj's `version =` and CHANGELOG.md's newest entry.
+  // ============================================================================
+  pub let PDX_TOOL_VERSION : [u8; 6] = "1.2.0\0"
+
+}
