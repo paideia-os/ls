@@ -1,6 +1,6 @@
 // tests/multipath_fixtures.pdx -- ls.ENH-014 (paideia-os/ls#32)
 //
-// MultipathHeaderFixtures module: byte-exact goldens for
+// MultipathFixtures module: byte-exact goldens for
 // RecurseHeader::multipath_header_compose (src/recurse_header.pdx),
 // the `ls a b c` multi-path listing header composer ("<path>:\n",
 // optionally preceded by a blank line). Follows the M4 fixture
@@ -98,7 +98,7 @@
 // PAIDEIA-AS CONFORMANCE
 // =============================================================================
 //
-//   - Module name PascalCase basename (`MultipathHeaderFixtures`).
+//   - Module name PascalCase basename (`MultipathFixtures`).
 //   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
 //   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest immediates:
 //     5 (case cap), 221/222 (table sizes). The 0xFFFFFFFFFFFFFFFF
@@ -116,7 +116,7 @@
 // Called:
 //   multipath_header_compose -- RecurseHeader (src/recurse_header.pdx)
 
-module MultipathHeaderFixtures = structure {
+module MultipathFixtures = structure {
 
   // ==========================================================================
   // Return codes. Band picked to avoid every sentinel already claimed

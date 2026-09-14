@@ -13,6 +13,15 @@ Post-1.1.10 items on the Enhancement v1.x wave
 (`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
 exit-code map, wire body shape, `caps.decl`) changes in this section.
 
+## [1.3.1] -- 2026-09-14 -- hygiene fix
+
+**Hygiene fix.** `tests/multipath_fixtures.pdx` declared module
+`MultipathHeaderFixtures` against a `multipath_fixtures.pdx` basename
+-- a PascalCase-of-basename mismatch. Renamed the module to
+`MultipathFixtures`. No callers reference this module by qualified
+name anywhere in this repo, so this is a self-contained rename with
+no behavioural change.
+
 ## [1.3.0] -- 2026-09-13 -- v1.1-A/B/C: real body, cwd-relative resolve, real `-R`, `LsListRecord@0.1` wire <a id="v1.3.0-v1.1-a-b-c"></a>
 
 **Versioning note.** The `v1.1-A` real-body rewrite (commit
