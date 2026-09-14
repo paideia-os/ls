@@ -1,28 +1,55 @@
 # ls
 
-paideia-os directory listing — writes entry names to the terminal and emits one
-typed `PdxFsDirEntry@0.1` record per entry on the semantic pipe.
+paideia-os directory listing — writes entry names to the terminal, resolves a
+relative argument against the live kernel cwd, and, under `-R`, recurses into
+subdirectories.
 
-## Synopsis
+## v1.1-A/B real body (current, `manifest.pdxproj` `version = 1.1-C`)
+
+The cap-based architecture described lower in this file (`KIND_PDXFS_FILE`
+handed at exec, `sys_pdxfs_dir_readnext`, `SemanticEmit`'s per-entry
+`PdxFsDirEntry@0.1` wire) was the M1–M4/1.0–1.1.10 design. It never actually
+enumerated a real directory end-to-end: the shell's `InitCap` handoff never
+populated the pre-narrowed cap slot the readnext trampoline needed, so every
+invocation returned `LS_ERR_READDIR`. v1.1-A (commit `5b8b3ff`) retired that
+STUB body and replaced it with a real, path-addressed one; v1.1-B (this
+release) widens it further. The sections below marked **(retired)** describe
+the pre-rewrite architecture and stay for historical/schema reference
+(`SemanticEmit`'s 144-byte wire body is unchanged code, just not on the live
+call path); everything else in this section is what `ls` actually does today.
+
+### Synopsis
 
 ```
-ls [-l] [-a] [-h] [--json] [--schema] [--color=<v>] [<path>]
+ls [-R] [<path>]
 ls                       # <path> defaults to "."
 ```
 
-Exactly one positional path is consumed (`pos_ptrs[0]`); positionals beyond
-`[0]` are ignored at 1.0 and become a multi-path list at 1.1. Short flags are
-passed one per argument.
+`<path>` is resolved against the kernel's live cwd (`sys_getcwd`, sysno 86)
+before use: a relative path becomes `cwd + '/' + path`; an absolute path
+(leading `/`) and the bare default `.` both resolve to the cwd itself, or pass
+through unchanged. `-R` recurses into every subdirectory found (depth-capped
+at 32), printing a `<path>/<name>:` header ahead of each nested listing.
+The `-l`/`-a`/`-h`/`--json`/`--schema`/`--color=` flags described below are
+still recognised by `ArgvSurface` (so a caller passing them does not get
+`AS_ERR_UNKNOWN_FLAG`) but are READ-PAST by the real v1.1-A/B body — see
+`src/runner.pdx`'s own §SCOPE note for the full list of what re-engages in a
+later round. Positionals beyond `[0]` are handled by `Dispatch`'s own
+per-positional loop (`ls a b c`), independent of this file's `-R` recursion.
 
-## Description
+### Description
 
-`ls` iterates a directory through a pre-narrowed `KIND_PDXFS_FILE(read, <arg-path>)`
-capability the shell hands it at exec (cap slot 2), calling `sys_pdxfs_dir_readnext`
-(sysno 72) once per entry. Each accepted entry's name plus `\n` is written to the
-terminal, and the entry's 128-byte kernel record — extended with a 16-byte owner
-capability wire — is sent as one 144-byte `PdxFsDirEntry@0.1` record on the stdout
-`KIND_IPC_ENDPOINT`. `ls` never mints a filesystem capability of its own: it holds
-read authority on exactly the argument path and nothing else.
+`ls` reaches the filesystem through the path-addressed POSIX-compatibility
+primitives `sys_stat` (77, an existence check), `sys_open` (2), a
+`sys_getdents` (78) batch loop, and `sys_close` (3) — no capability is minted
+or consumed for the primary listing at all. Each accepted entry's name plus
+`\n` is written to fd 1 via the UART fast-path (`TtyWrite::tty_write`, sysno
+1). On success, once per top-level invocation, `ls` also sends one 128-byte
+`LsListRecord@0.1` summary record (`entry_count`, `path_hash`,
+`filter_flags`) directly into the kernel's semantic-pipe producer ring via
+`sys_semantic_send` (sysno 115) — see `src/pipe_emit.pdx`. This is a
+different, simpler wire than the per-entry `PdxFsDirEntry@0.1` mechanism
+described below, which remains shipped code but is not on the live call path.
 
 The semantic-pipe emission is the point of the tool. Downstream consumers filter
 and plot by field name rather than by column-slicing text, and two paideia-os
@@ -48,14 +75,19 @@ into flag bits and their renderers ship as tested primitives (`LongFormat`,
 the exit-code map, and the 144-byte wire body are frozen at 1.0, so wiring a
 renderer into the loop later is additive and needs no re-sign.
 
-## Options
+## Options (argv-surface recognition; body wiring status noted per flag)
 
 Flags are recognised by `ArgvSurface::argv_surface_parse` (`src/argv_surface.pdx`)
-over `libpdx-argv::Parser`, and OR'd into a bit-field read by `Runner`. A short
-flag that is not `l`/`a`/`h` returns `AS_ERR_UNSUPPORTED_SHORT`; a long flag
-outside the recognised set returns `AS_ERR_UNKNOWN_FLAG`. Both are exit 2.
-Clustered short flags (`-la`) are rejected upstream by `parse_argv` and surface
-as `AS_ERR_PARSER_REJECT`, also exit 2 — write `-l -a`.
+over `libpdx-argv::Parser`, and OR'd into a bit-field. A short
+flag that is not `l`/`a`/`h`/`t`/`S`/`r`/`R`/`1`/`C`/`F` returns
+`AS_ERR_UNSUPPORTED_SHORT`; a long flag outside the recognised set returns
+`AS_ERR_UNKNOWN_FLAG`. Both are exit 2. Clustered short flags (`-la`) are
+rejected upstream by `parse_argv` and surface as `AS_ERR_PARSER_REJECT`, also
+exit 2 — write `-l -a`. **`-R` is the one flag the real v1.1-A/B `Runner` body
+actually consumes** (real recursive descent, depth-capped at 32 — see this
+file's own top section); every other row below reflects the pre-rewrite
+**(retired)** cap-based body's intended wiring, not what the current
+`Runner::runner_ls` executes.
 
 ### Listing
 
@@ -79,7 +111,13 @@ as `AS_ERR_PARSER_REJECT`, also exit 2 — write `-l -a`.
 8 doc `94`, 9 unknown-schema `37`. A non-zero `schema_id` routes to palette 9
 until the schema registry lands; only then does the kind/mode fallback retire.
 
-## Semantic pipe output
+## Semantic pipe output (`PdxFsDirEntry@0.1`, retired call path)
+
+`SemanticEmit`'s per-entry wire below is shipped code, byte-pinned by
+`tests/schema_golden.pdx`, but is NOT called by the live v1.1-A/B `Runner`
+body — the real `LsListRecord@0.1` summary wire (`src/pipe_emit.pdx`, one
+record per top-level invocation, sent via raw `sys_semantic_send`) is
+described in this file's own top section instead.
 
 **Schema:** `PdxFsDirEntry@0.1` (declared in `caps.decl` under
 `declares_output_schemas`). **Body:** 144 bytes, composed by
@@ -209,6 +247,8 @@ semantic_emit.pdx
 - [libpdx-cap](https://github.com/paideia-os/libpdx-cap) — `KIND_USER` wire decode behind the `u:<row>` owner column.
 - [cat](https://github.com/paideia-os/cat) · [doc](https://github.com/paideia-os/doc) — sibling core utilities; `doc ls` renders `doc/ls.pdxdoc`.
 
-Version `1.0.0` (R50 Wave-2). `CHANGELOG.md` records the 0.1→1.0 progression and
-the 1.x additive-only rules; `design/release-1.0.md` pins the `manifest.pdxsig`
-shape and `design/mirror-push.md` the `pkg install ls` path. MIT — see `LICENSE`.
+Tag `v1.3.0` / `manifest.pdxproj` `version = 1.1-C` (the v1.1-A/B real-body wave
+closer). `CHANGELOG.md` records the 0.1→1.0 progression, the 1.x additive-only
+rules, and the `v1.1-A/B/C` real-body landing; `design/release-1.0.md` pins the
+1.0-era `manifest.pdxsig` shape and `design/mirror-push.md` the `pkg install ls`
+path. MIT — see `LICENSE`.

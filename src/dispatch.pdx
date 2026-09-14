@@ -8,6 +8,20 @@
 // wrapper would otherwise fold at. Every caller therefore sees the
 // I4 vocabulary (0/2/3/4) rather than a raw 0xFFFFEBxx sentinel.
 //
+// v1.1-B (paideia-os/ls#29 + #35) widens `Runner::runner_ls` to a
+// third parameter, `depth` -- every reference to `runner_ls(path_ptr,
+// flag_bits)` below (including the per-positional loop's own call
+// site, `ls_dp_mp_call`) predates that widening and is still
+// accurate for what those TWO arguments mean; the call site itself
+// now also sets `rdx = 0` (a Dispatch-level invocation is always a
+// top-level, depth-0 one -- only Runner's own `-R` recursive self-call
+// ever passes depth > 0) immediately before the `call runner_ls`
+// instruction. See src/runner.pdx's own file header for the full
+// `-R` design and src/pipe_emit.pdx for the new per-invocation
+// `LsListRecord@0.1` emission (ls.ENH-024, #43) `runner_ls` now
+// triggers internally on its `LS_OK` path -- neither is a Dispatch
+// concern.
+//
 // =============================================================================
 // SCOPE
 // =============================================================================
@@ -295,6 +309,12 @@ module Dispatch = structure {
         or  rsi, 0x10000;                     // RN_BIT_HEADER_BLANK_MASK
 
       ls_dp_mp_call:
+        // ls.ENH-009 (#29) / ls.ENH-017 (#35): runner_ls widened to a
+        // third parameter, depth. Every Dispatch-level call is a
+        // top-level invocation -- depth 0 -- regardless of which
+        // positional this iteration is on; only Runner's own -R
+        // recursive self-call ever passes a nonzero depth.
+        xor rdx, rdx;                          // depth = 0
         call runner_ls;
         mov rdi, rax;                          // ls_code arg for exit_map
         call exit_map;

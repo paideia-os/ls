@@ -13,6 +13,108 @@ Post-1.1.10 items on the Enhancement v1.x wave
 (`design/enhancement-plan.md`). No frozen 1.0 interface (argv surface,
 exit-code map, wire body shape, `caps.decl`) changes in this section.
 
+## [1.3.0] -- 2026-09-13 -- v1.1-A/B/C: real body, cwd-relative resolve, real `-R`, `LsListRecord@0.1` wire <a id="v1.3.0-v1.1-a-b-c"></a>
+
+**Versioning note.** The `v1.1-A` real-body rewrite (commit
+`5b8b3ff`) that retired the M1-M4 cap-slot STUB landed untagged,
+adopting a descriptive `1.1-A/B/C` codename sequence in
+`manifest.pdxproj`'s `version` field distinct from this repo's prior
+`v1.0.0`/`v1.1.x`/`v1.2.0` semver tag line. This entry retroactively
+documents that rewrite (v1.1-A) alongside the two landings this round
+adds (v1.1-B: #29 + #35 + #43; v1.1-C: this release-closer, #44), and
+tags the combined result `v1.3.0` -- continuing the git tag sequence
+from `v1.2.0` rather than fragmenting it into a parallel `v1.1-A`-style
+tag scheme. `manifest.pdxproj`'s own `version` field keeps the
+descriptive `1.1-C` label; the two numbering schemes are intentionally
+distinct going forward (see that file's own note at its `version` /
+`release:` fields).
+
+### v1.1-A (retroactive entry for commit `5b8b3ff`)
+
+- **`Runner::runner_ls`** -- replaced the M1-M4 ceremonial cap-based
+  body (which called `sys_pdxfs_dir_readnext`, sysno 72, on a
+  pre-narrowed `KIND_PDXFS_FILE` cap that shell.M2's InitCap handoff
+  never populated -- every invocation refused `LS_ERR_READDIR`) with a
+  real end-to-end body: `sys_stat` (77) existence check, `sys_open`
+  (2), a `sys_getdents` (78) batch loop, `sys_close` (3), writing each
+  name + `\n` to fd 1 via `TtyWrite::tty_write`.
+- **`PosixShim`** (`src/posix_shim.pdx`, new) -- the four trampolines
+  above.
+- Scope explicitly narrowed at landing: no column layout, no color, no
+  `-l`, no `-a`, no `-R`, no `--json`, no sort, no semantic-pipe
+  emission, no audit frame (see `src/runner.pdx`'s own §SCOPE note).
+
+### Added (v1.1-B: `ls.ENH-009` #29, `ls.ENH-017` #35, `ls.ENH-024` #43)
+
+- **`PosixShim::sys_getcwd`** (`src/posix_shim.pdx`) -- trampoline for
+  sysno 86 (`design/user/syscall-table.md` row 86, #1955/#1956). Note:
+  the wave dispatch that requested this cited sysno 95, which is
+  `sys_kill` at that table -- corrected to the authoritative row 86.
+- **`Runner::rn_resolve_path`** (`src/runner.pdx`) -- resolves
+  `runner_ls`'s path argument against the live cwd before any
+  `sys_stat`/`sys_open` call. `path_ptr == 0` or the literal `"."`
+  resolve to the cwd verbatim; an absolute path (leading `/`) passes
+  through unchanged; anything else composes `cwd + '/' + path_ptr`
+  into a bounded 512-byte scratch, truncating rather than overflowing
+  on an oversized combination.
+- **`Runner::runner_ls`** widened to a third parameter, `depth` --
+  Dispatch's call site passes `0`; a real `-R` recursive self-call
+  passes `depth + 1`. `RN_RECURSE_MAX_DEPTH` (32) caps descent.
+- **Real `-R` recursive descent** (`Runner::runner_ls`, phase 2) --
+  during the primary `sys_getdents` walk, every directory-kind entry
+  (getdents `type` byte == `VNODE_TYPE_DIR`, 2) that is not exactly
+  `.` or `..` is copied (length-bounded, since raw getdents names are
+  NOT NUL-terminated) into a per-depth candidate buffer
+  (`_rn_candidates`, 8 candidates/level, 63-byte name clamp). After the
+  primary directory is fully drained and its fd closed, Runner
+  recurses into each buffered candidate: composes the child's absolute
+  path (`Runner::rn_compose_child_path`), emits a
+  `"\n<path>/<name>:\n"` header via the existing
+  `RecurseHeader::recurse_header_compose` (landed at v1.1.4 for the
+  header-only interim shape; now actually followed by a real listing),
+  then calls `runner_ls` recursively. Buffering candidates out of the
+  transient `_rn_getdents_buf` batch BEFORE any recursive call starts
+  is deliberate: it keeps every level's own use of that single global
+  scratch buffer strictly sequential, never live across a nested call
+  -- see `src/runner.pdx`'s file header §35 for the full rationale,
+  including why `RecurseFilter::recurse_should_descend` is bypassed
+  here (its NUL-terminated-name and `PdxFsDirEntry`-kind-nibble
+  contracts do not fit a raw, length-prefixed getdents record) while
+  `RecurseHeader::recurse_header_compose` is reused as designed. A
+  recursive child's return value does not change the top-level exit
+  code -- documented honest gap, not a silent one.
+- **`PipeEmit`** (`src/pipe_emit.pdx`, new module) -- `sys_semantic_
+  send` (sysno 115) trampoline, `pe_hash_path` (bounded FNV-1a 64-bit
+  hash), and `pipe_emit_send`, which composes a 128-byte
+  `LsListRecord@0.1` record (`entry_count`, `path_hash`,
+  `filter_flags`, 104 bytes reserved) and sends it once per top-level
+  (`depth == 0`) `runner_ls` invocation on the `LS_OK` success path.
+  This is a raw kernel-ring wire, independent of `SemanticEmit`'s
+  per-entry `PdxFsDirEntry@0.1` path via `libpdx-semantic-pipe`'s
+  `Registry`/`Send` -- see that module's file header for why it does
+  NOT participate in `caps.decl`'s `declares_output_schemas`
+  three-file sync.
+- **`Runner::_rn_pe_entry_count`** (`src/runner.pdx`) -- dedicated
+  per-invocation counter (reset only at `depth == 0`, bumped at every
+  depth) feeding `PipeEmit`'s `entry_count` field; deliberately not
+  the shared global `_ls_stats` table, which persists across a
+  multi-path (`ls a b c`) invocation's separate `runner_ls` calls.
+
+### Not in scope (honest boundary, v1.1-B)
+
+- No column layout, color, `-l`, `-a`, `--json`, or sort -- unchanged
+  from v1.1-A's own deferral list.
+- `-R` still ignores a per-child cap-slot narrowing concern that does
+  not apply to this path-addressed body (that concern was specific to
+  the retired cap-based v1.0-v1.1.10 line); the real gap this round
+  leaves open is recursive error propagation (see above) and the
+  fixture coverage noted in `manifest.pdxproj`'s `tests:` block.
+- `LsListRecord@0.1` is not (yet) a `ls --schema`-discoverable schema;
+  see `PipeEmit`'s file header for the explicit non-decision on
+  whether a future round folds it into the `Registry`-based mechanism.
+
+## [1.1.10] -- 2026-09-06 -- stdout schema bind onto `Registry::bind_by_name` (R90-XREPO.012.M4-002) <a id="1110"></a>
+
 ## [1.1.10] -- 2026-09-06 -- stdout schema bind onto `Registry::bind_by_name` (R90-XREPO.012.M4-002) <a id="1110"></a>
 
 **1.1.10.** `SemanticEmit::sem_emit_bind_stdout` no longer pairs a

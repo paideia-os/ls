@@ -1,141 +1,243 @@
-// src/runner.pdx -- ls v1.1-A (paideia-os/ls M1-001 STUB retirement)
+// src/runner.pdx -- ls v1.1-B (paideia-os/ls#29 + #35 + #43)
 //
-// Runner module: the ls operation body. v1.1-A REPLACES the M1-M4
-// ceremonial cap-based body -- which called sys_pdxfs_dir_readnext
-// (sysno 72) on a pre-narrowed KIND_PDXFS_FILE cap slot that
-// shell.M2's InitCap handoff never actually populated, so every
-// invocation refused with LS_ERR_READDIR (-EBADF from the kernel) --
-// with a REAL end-to-end body that reaches the filesystem through
-// the path-addressed POSIX-compat primitives sys_stat (77) /
-// sys_open (2) / sys_getdents (78) / sys_close (3), and writes each
-// name to fd 1 via the existing TtyWrite::tty_write trampoline
-// (sysno 1, UART fast-path per src/kernel/core/syscall/dispatch.pdx
-// L515).
+// Runner module: the ls operation body. v1.1-A shipped a REAL
+// end-to-end body reaching the filesystem through sys_stat (77) /
+// sys_open (2) / sys_getdents (78) / sys_close (3), writing each name
+// to fd 1 via TtyWrite::tty_write. v1.1-B is a body-only widening of
+// that same shape, adding three things the v1.1-A SCOPE section
+// explicitly deferred:
 //
-// =============================================================================
-// SCOPE OF v1.1-A (deliberately narrow)
-// =============================================================================
+//   (#29) Relative positional arguments now resolve against the
+//         kernel's live cwd (sys_getcwd, sysno 86) before any
+//         sys_stat/sys_open call, instead of being handed to the
+//         filesystem layer unresolved. Absolute paths (leading '/')
+//         and the "." default both pass through as before.
 //
-// One name per line. No column layout. No color. No -l long format.
-// No -a hidden-file gating (every entry the kernel hands back is
-// written, including dot-prefixed ones -- a proper -a/-A split
-// lands with v1.2 when the flag_bits path re-engages). No -R
-// recursion. No --json. No semantic-pipe emission. No audit frame.
-// No sort. No -F suffix. No group-directories-first.
+//   (#35) `-R` now performs REAL recursive descent -- not just the
+//         "<path>/<name>:" header-only interim landing v1.1.4 shipped
+//         against the since-retired cap-based body. Runner buffers
+//         directory-kind candidates found during its primary getdents
+//         pass, then (after closing the primary fd) recurses into
+//         each one via a genuine self-call, depth-capped at 32.
 //
-// This is the "just make ls actually enumerate a directory"
-// deliverable the user's dev loop has been asking for since the
-// M1-M4 wave completed. Every one of the deferred features above
-// lands as a use-site edit against THIS Runner body in a later
-// round -- the pre-v1.1-A modules (LongFormat, JsonLine, ColorPicker,
-// Columns, HiddenFilter, HumanSize, OwnerCol, SemanticEmit,
-// AuditShim, GroupSort, SortOptions, RecurseFilter, RecurseHeader,
-// SchemaDump, LongTotal) are still in-tree exactly as they were, so
-// their re-engagement is a Runner-body edit rather than a
-// re-declare. Dispatch's --schema short-circuit (which never went
-// through Runner) is unaffected.
+//   (#43) On the LS_OK success path of a top-level (depth == 0)
+//         invocation, Runner composes and sends one 128-byte
+//         LsListRecord@0.1 summary record via PipeEmit::
+//         pipe_emit_send (src/pipe_emit.pdx) -- a raw
+//         sys_semantic_send (sysno 115) wire, independent of
+//         SemanticEmit's per-entry libpdx-semantic-pipe path.
 //
 // =============================================================================
-// FLOW
+// SCOPE OF v1.1-B (still deliberately narrow)
 // =============================================================================
 //
-//   (1) Default path: if path_ptr == 0 (the pos_count-0 case
-//       Dispatch passes through as the _as_path_ptr sentinel), use
-//       the local _rn_default_path (".\0").
-//
-//   (2) sys_stat(path_ptr, RN_STAT_PATH_HINT, &_rn_stat_buf). Any
-//       non-zero return (missing path, kernel-half VA, ...) is
-//       LS_ERR_BAD_PATH (0xFFFFEB21). This costs one syscall per
-//       invocation but keeps the LS_ERR_BAD_PATH sub-band the M1
-//       tests/exit_matrix.pdx fixture already pins meaningful --
-//       LS_ERR_READDIR gets reserved for enumeration failures on a
-//       path that DID resolve.
-//
-//   (3) sys_open(path_ptr, 0 /*O_RDONLY*/, 0 /*mode*/) -> fd. Any
-//       negative-errno return (bit 63 set; caller detects via
-//       `cmp rax, 0; jl`) -> LS_ERR_READDIR (same sub-band the
-//       downstream getdents-time failures use; open-vs-enumerate
-//       distinction is not part of the v1.1-A external vocabulary).
-//
-//   (4) Loop:
-//         (a) sys_getdents(fd, &_rn_getdents_buf,
-//                          RN_GD_BUF_CAP=4096) -> rax.
-//         (b) rax == 0 -> end-of-directory; break.
-//             rax  < 0 -> close fd + LS_ERR_READDIR (propagate).
-//             rax  > 0 -> proceed to record walk.
-//         (c) Walk records from cursor = base to end = base + rax:
-//               name_len_u16 = *(u64)(cursor + 8) & 0xFFFF
-//               (the u64 load spans name_len@8 + type@10 +
-//                reserved@11 + name[0..4]; the mask isolates
-//                name_len -- avoids needing a mov_w mnemonic
-//                paideia-as's encoder does not yet expose to userspace).
-//               if name_len == 0 -> terminator; fetch next batch.
-//               tty_write(cursor + 12, name_len)
-//               tty_write(&_rn_newline, 1)
-//               cursor += 12 + name_len
-//               continue.
-//
-//   (5) sys_close(fd). Return LS_OK (0xFFFFEB00).
-//
-// Dispatch's per-positional loop (src/dispatch.pdx §ls.ENH-014
-// section) is unchanged: it still folds every Runner return
-// through ExitMap immediately and returns the worst code. Because
-// v1.1-A is path-addressed, `ls a b c` now actually reads three
-// distinct directories (in the pre-v1.1-A cap body every call
-// read through the same LS_DIR_CAP_SLOT).
+// Still no column layout, no color, no -l long format, no -a hidden-
+// file gating, no --json, no sort. Every one of those deferred
+// features lands as its own Runner-body edit against the modules
+// already in-tree (LongFormat, JsonLine, ColorPicker, Columns,
+// HiddenFilter, HumanSize, OwnerCol, SemanticEmit, AuditShim,
+// GroupSort, SortOptions, RecurseHeader, SchemaDump, LongTotal) --
+// see v1.1-A's own SCOPE note, unchanged by this round.
 //
 // =============================================================================
-// FLAG BITS
+// #29: PATH RESOLUTION AGAINST CWD
 // =============================================================================
 //
-// v1.1-A IGNORES flag_bits entirely. Both the substantive user
-// flags (-l / -a / -h / --color / --json / -R / -t / -S / -r /
-// -1 / -C / -F / --group-directories-first) and the
-// Dispatch<->Runner header bits (RN_BIT_HEADER_MASK /
-// RN_BIT_HEADER_BLANK_MASK) are read-past. The rsi argument is
-// still declared in the signature so Dispatch's call site does not
-// have to change. Flag re-engagement is scoped to v1.2 (columns +
-// header lines), v1.3 (color / -l / -a), and beyond -- see the
-// SCOPE section for the full deferral list.
+// `rn_resolve_path(path_ptr)` runs first, before sys_stat. It always
+// calls sys_getcwd once (PosixShim::sys_getcwd, sysno 86 -- see that
+// module's file header for a correction against the wave dispatch's
+// stale "sysno 95" cross-reference, which is actually sys_kill at
+// design/user/syscall-table.md row 95) and then:
+//
+//   - path_ptr == 0 (Dispatch's pos_count-0 default), OR path_ptr
+//     points at the exact one-byte string "." -- resolves to the cwd
+//     buffer itself, verbatim.
+//   - path_ptr's first byte == '/' -- absolute; passes through
+//     unchanged (the cwd fetch still ran, but its result is unused on
+//     this branch -- see that function's own doc for why the fetch is
+//     unconditional rather than short-circuited).
+//   - anything else -- relative; composes `cwd + '/' + path_ptr` into
+//     a bounded 512-byte scratch buffer, truncating (never
+//     overflowing) past 511 bytes + NUL.
+//
+// A sys_getcwd failure (negative return) is folded into
+// LS_ERR_BAD_PATH -- the same sub-band a missing target already uses,
+// since "cannot resolve the argument to an absolute path" and
+// "resolved path does not exist" are both, from the caller's view,
+// "the path Runner was asked to list is not usable."
+//
+// Every recursive call (see #35 below) passes an ALREADY-ABSOLUTE
+// child path (parent + '/' + name, where parent was resolved by this
+// same function one level up), so rn_resolve_path's relative branch
+// never actually fires below depth 0 in practice -- it still runs
+// (uniformly, no depth-conditioned skip) because an absolute path
+// takes the cheap early branch anyway, and keeping the call
+// unconditional means a future caller that passes a genuinely
+// relative child path (there is none today) is not surprised by a
+// hidden depth-gated code path.
+//
+// =============================================================================
+// #35: REAL -R RECURSIVE DESCENT
+// =============================================================================
+//
+// Runner threads an explicit third parameter, `depth`, through
+// runner_ls (Dispatch's call site passes 0; every recursive self-call
+// passes depth+1). RN_RECURSE_MAX_DEPTH (32) caps how deep a self-call
+// chain may go -- a directory at depth 31 does not recurse into its
+// own children, so the deepest listing body that ever runs is at
+// depth 31 and the deepest self-call site is called FROM depth 30.
+//
+// Candidate detection happens inline during the primary getdents
+// record walk (the same loop that already writes each name + '\n' to
+// KIND_TTY): for every entry whose getdents `type` byte (offset 10 in
+// the record; VNODE_TYPE_DIR = 2) is a directory, and whose name is
+// not exactly "." or "..", Runner copies the entry's name (length-
+// bounded, NOT NUL-terminated in the source record) into a per-depth
+// candidate buffer (`_rn_candidates`, capped at
+// RN_RECURSE_MAX_CANDIDATES = 8 candidates per depth level, each name
+// clamped to 63 bytes) rather than recursing immediately mid-batch.
+//
+// Deferring descent to a SECOND phase -- after the primary fd is
+// closed -- is deliberate, not cosmetic: `_rn_getdents_buf` is a
+// single global 4096-byte scratch. If Runner recursed the moment it
+// found a directory entry, the recursive call's OWN sys_getdents
+// calls would overwrite that same global buffer while the CURRENT
+// level's record-walk cursor (r12/r13) still pointed into it,
+// corrupting the parent's in-flight batch on return. Buffering names
+// out of the transient getdents batch BEFORE any recursive call
+// starts, then recursing only once the primary directory is fully
+// drained and closed, means every level's own use of
+// `_rn_getdents_buf` is strictly sequential -- never live across a
+// recursive call -- with no risk of that collision. This is also why
+// candidate storage itself IS per-depth (`_rn_candidates[depth]`,
+// `_rn_candidate_counts[depth]`): a depth-D frame's own candidate list
+// must survive across every recursive call it makes into depth D+1,
+// D+2, ... while it is still mid-loop over its OWN candidates.
+//
+// `RecurseFilter::recurse_should_descend` and `RecurseHeader::
+// recurse_header_compose` (both landed at v1.1.4 for the header-only
+// interim shape) are reused where their contracts actually fit and
+// bypassed where they do not:
+//
+//   - `recurse_header_compose` is called as designed -- it composes
+//     the "\n<path>/<name>:\n" header line Runner writes via
+//     tty_write ahead of each real recursive descent.
+//   - `recurse_should_descend` is NOT called for the dot-exclusion
+//     it also performs. It expects a NUL-terminated name_ptr (its
+//     own doc: "name is exactly '.'" / "'..'" read one byte past a
+//     presumed terminator); a raw getdents record's name field is
+//     length-prefixed and NOT NUL-terminated -- the byte immediately
+//     after name[name_len-1] is the START OF THE NEXT RECORD's header,
+//     not a terminator. Forcing that mismatch would either read
+//     garbage or, worse, coincidentally match a NUL from unrelated
+//     record bytes. Runner instead performs its own length-bounded
+//     dot-exclusion (name_len == 1 && byte0 == '.'; name_len == 2 &&
+//     byte0 == byte1 == '.') directly against the exact name_len the
+//     record already carries -- safe by construction, no scan past a
+//     boundary the record's own length field does not promise.
+//     RecurseFilter's kind check is also not reused here: it expects
+//     a PdxFsDirEntry-shaped kind NIBBLE (GS_KIND_DIR = 4, per
+//     GroupSort's own mirror of that encoding), a different domain
+//     from the raw getdents `type` BYTE (VNODE_TYPE_DIR = 2) this
+//     v1.1-A/B body reads -- translating one into the other just to
+//     call a predicate that would then re-derive the same answer
+//     this module already has directly is not a simplification.
+//     RecurseFilter remains exactly as it was for a future
+//     PdxFsDirEntry-based enumeration call site.
+//
+// A recursive child's return value is NOT folded into this
+// invocation's own LS_OK/LS_ERR_* return -- a permission or read
+// failure three levels down does not change the top-level exit code.
+// This is a documented, honest interim gap (the same "known gap,
+// tracked, not a silent regression" posture Dispatch's own
+// ls.ENH-014 doc uses for its per-positional cap-slot limitation),
+// not an oversight: bubbling a worst-case child code up through an
+// arbitrary-depth recursion tree needs an accumulator threaded through
+// every recursive frame, which is a real design decision (worst-of-
+// what, exactly, across how many independent subtrees) better left to
+// its own follow-up than bolted on here.
+//
+// =============================================================================
+// #43: LsListRecord@0.1 SEMANTIC-PIPE EMISSION
+// =============================================================================
+//
+// `_rn_pe_entry_count` is a dedicated (NOT the global `_ls_stats`
+// counter table) .bss scalar, reset to 0 only when depth == 0 --
+// i.e. once per Dispatch::ls_dispatch call to runner_ls, not once per
+// process. Every name Runner writes via tty_write, at ANY depth
+// (top-level or any -R descendant), bumps it by one, so by the time
+// the top-level frame reaches its LS_OK return the counter holds the
+// TRUE total entries listed across this invocation's whole -R tree
+// (1 if -R was not given). On the LS_OK path, only the depth == 0
+// frame calls `PipeEmit::pipe_emit_send(entry_count, path_hash,
+// filter_flags)` -- path_hash is `PipeEmit::pe_hash_path` over this
+// frame's own resolved path (rbp); filter_flags is the low 16 bits of
+// flag_bits (AS_BIT_* only -- Dispatch's private RN_BIT_HEADER_MASK /
+// RN_BIT_HEADER_BLANK_MASK bits, 0x8000 / 0x10000, are masked out
+// since they are a Dispatch<->Runner signaling convention, not a
+// user-visible filter). A recursive (depth > 0) frame reaching its
+// own LS_OK never calls pipe_emit_send -- there is exactly one
+// LsListRecord@0.1 per Dispatch-level invocation, matching the
+// dispatch's own "per invocation" wording.
+//
+// pipe_emit_send's return is not inspected -- this is a best-effort
+// telemetry emission Runner does not gate its own LS_OK/LS_ERR_*
+// return on (see PipeEmit's own file header).
 //
 // =============================================================================
 // PAIDEIA-AS CONFORMANCE
 // =============================================================================
 //
-//   - Module basename PascalCase (`Runner`), no directory prefix
-//     (same module name as the pre-v1.1-A body -- Dispatch's
-//     `call runner_ls` is a symbol reference that resolves against
-//     THIS file after rebuild).
+//   - Module basename PascalCase (`Runner`), unchanged.
 //   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
-//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Immediates in
-//     this module: 0 (null-check + EOD-check + name_len terminator
-//     + O_RDONLY flag), 12 (record header size), 255
-//     (RN_STAT_PATH_HINT), 4096 (getdents buffer cap), 0xFFFF
-//     (name_len mask); every larger value (LS_OK /
-//     LS_ERR_BAD_PATH / LS_ERR_READDIR) is a `mov rax, imm64`
-//     emission, not a compare.
-//   - No byte reads (the u64 load + mask pattern for name_len
-//     sidesteps the mov_w gap; the record's name payload is passed
-//     by pointer to tty_write, never loaded byte-by-byte here).
-//   - r11 is scratch (paideia-as reserved); r10 is scratch (used
-//     transiently for the name_len extraction).
-//   - Non-leaf: 5 callee-save pushes (rbx=fd, r12=cursor,
-//     r13=end-cursor, r14=buf-base, rbp=path_ptr) => 40 bytes; entry
-//     rsp % 16 == 8; 8 + 40 = 48; 48 % 16 == 0 at every nested-call
-//     site (sys_stat, sys_open, sys_getdents, sys_close, tty_write).
-//     No `sub rsp, 8` pad needed -- the 5-push count already
-//     restores 16-byte alignment. Matched 5 pops via the single
-//     shared rn_ls_epilogue label every ret path converges on.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. New immediates in
+//     this round: 8 (RN_RECURSE_MAX_CANDIDATES), 31 (recursion depth
+//     guard), 63 (RN_RECURSE_NAME_MAX), 190 / 255 (rn_resolve_path's
+//     copy bounds), 256 / 512 (recurse-buffer stride shifts, applied
+//     via `shl`, never as a `cmp` operand), 320 (header scratch cap).
+//     Every larger value (LS_OK / LS_ERR_* sentinels, the recursive
+//     self-call's depth arithmetic) is `mov`/`add reg, reg` on an
+//     already-staged register, never a bare large-immediate compare.
+//   - No `lea` with a plain-register base + scaled index anywhere in
+//     this file -- `lea` is rip-relative only (matches the
+//     "lea-is-rip-only convention" SortOptions::son_ already documents
+//     for this tree). Every scaled address (depth*256, depth*512,
+//     count*64, index*64) is built via `shl` + `add` on a value
+//     already staged into a plain register; every `[base + idx*8]`
+//     form (the u64-per-count arrays) uses the SIB-native scale-8
+//     addressing already proven at Ls::ls_reset / Dispatch's
+//     `pos_ptrs[i]` reach.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` per #1248.
+//   - `imul` never appears in this file (FNV-1a hashing lives in
+//     PipeEmit, not here).
+//   - r10 / r11 remain scratch throughout every new function.
+//   - runner_ls widens from 5 callee-save pushes to 6 (adds r15 =
+//     flag_bits, held for the whole function lifetime instead of a
+//     bare rsi pass-through, so the -R candidate check and the
+//     PipeEmit filter_flags field both have it available after rsi
+//     is repeatedly overwritten by nested-call argument marshalling)
+//     plus a `sub rsp, 8` pad -- see runner_ls's own doc for the
+//     alignment arithmetic. rn_resolve_path and rn_compose_child_path
+//     are new; their own register plans are documented at their own
+//     declarations.
 //
 // =============================================================================
 // CROSS-MODULE SYMBOLS
 // =============================================================================
 //
 // Called:
-//   sys_stat, sys_open, sys_close, sys_getdents  -- PosixShim
-//                                                   (src/posix_shim.pdx)
+//   sys_stat, sys_open, sys_close, sys_getdents, sys_getcwd
+//                                                  -- PosixShim
+//                                                     (src/posix_shim.pdx)
 //   tty_write                                     -- TtyWrite
-//                                                   (src/tty_write.pdx)
+//                                                     (src/tty_write.pdx)
+//   recurse_header_compose                        -- RecurseHeader
+//                                                     (src/recurse_header.pdx)
+//   pipe_emit_send, pe_hash_path                  -- PipeEmit
+//                                                     (src/pipe_emit.pdx)
+//   runner_ls                                     -- Runner (self;
+//                                                     the -R recursive
+//                                                     descent call)
 
 module Runner = structure {
 
@@ -159,197 +261,680 @@ module Runner = structure {
   // sys_getdents.pdx §Record layout for R56.M3.
   pub let RN_REC_HDR_BYTES  : u64 = 12
   // Mask that isolates name_len from a u64 load at (cursor + 8).
-  // The load spans name_len (2 bytes) + type (1) + reserved (1) +
-  // name[0..4] (4); the mask keeps only the two low bytes.
   pub let RN_NAME_LEN_MASK  : u64 = 0xFFFF
-  // Directory getdents batch size. Fixed at one page; see PosixShim's
-  // PSH_GETDENTS_BUF_CAP for the rationale.
+  // Directory getdents batch size. Fixed at one page.
   pub let RN_GD_BUF_CAP     : u64 = 4096
-  // sys_stat path_len_hint. Fixed at 255 -- see PosixShim's
-  // PSH_PATH_HINT_DEFAULT and design/user/syscall-table.md row 85 for
-  // the walker-CAP convention.
+  // sys_stat / sys_getcwd-consuming callers' path_len_hint. Fixed at
+  // 255 -- see PosixShim's PSH_PATH_HINT_DEFAULT.
   pub let RN_STAT_PATH_HINT : u64 = 255
+  // getdents `type` byte value for a directory entry (backend-defined;
+  // see PosixShim's file header §Record layout). A DIFFERENT encoding
+  // from RecurseFilter::RF_KIND_DIR (4) -- see file header §35 for why
+  // this module compares the raw getdents byte directly rather than
+  // translating into RecurseFilter's domain.
+  pub let RN_VNODE_TYPE_DIR : u64 = 2
+
+  // -R recursion bounds (ls.ENH-017, #35).
+  pub let RN_RECURSE_MAX_DEPTH      : u64 = 32   // depths 0..31 legal
+  pub let RN_RECURSE_MAX_CANDIDATES : u64 = 8    // per directory level
+  pub let RN_RECURSE_NAME_MAX       : u64 = 63   // per candidate name
+  // Per-level candidate-name-buffer stride: 8 candidates * 64 bytes
+  // each (1 length byte + up to 63 name bytes) = 512 bytes/level.
+  // Power-of-two so indexing is `shl 9`, never an `imul`.
+  pub let RN_CANDIDATE_STRIDE       : u64 = 512
+  pub let RN_CANDIDATE_SLOT_SIZE    : u64 = 64
+  // Per-level composed child-path buffer stride: 256 bytes -- ample
+  // for a resolved absolute path plus '/' plus a 63-byte name plus
+  // NUL, well under the bound rn_compose_child_path enforces.
+  pub let RN_PATH_BUF_STRIDE        : u64 = 256
+
+  // AS_BIT_R_REC mirror (ArgvSurface::AS_BIT_R_REC, src/argv_surface.pdx).
+  pub let RN_BIT_R_REC : u64 = 0x200
 
   // ==========================================================================
   // Immutable defaults (.rodata).
   //
-  // _rn_default_path -- ".\0" (0x2E 0x00). Used when path_ptr == 0
-  //   at Runner entry (the pos_count-0 case Dispatch passes through
-  //   as the _as_path_ptr sentinel). Explicit NUL terminator so
-  //   sys_open's user_read_str_via_walk halts inside the two-byte
-  //   footprint rather than reading into the next .rodata symbol.
-  //
-  // _rn_newline -- 0x0A. Written after each directory entry name so
-  //   the output stays one-name-per-line without a per-call
-  //   composition step.
+  // v1.1-A's `_rn_default_path` ("." literal) is retired at v1.1-B --
+  // the path_ptr == 0 default case is now handled by rn_resolve_path
+  // itself (it resolves straight to the live cwd buffer rather than
+  // handing the filesystem layer an unresolved "." literal), so no
+  // caller in this file references a bare "." placeholder anymore.
   // ==========================================================================
-  pub let _rn_default_path : [u8; 2] = [0x2E, 0x00]
   pub let _rn_newline      : [u8; 1] = [0x0A]
 
   // ==========================================================================
   // .bss scratch.
-  //
-  // _rn_getdents_buf -- 4096-byte user scratch sys_getdents writes
-  //   into (one batch at a time). 513 u64 lanes @align(8): the
-  //   first 512 (= 4096 bytes = RN_GD_BUF_CAP) are the syscall
-  //   destination; the trailing 8-byte lane is unused headroom the
-  //   record walk relies on. The walk's name_len extraction does a
-  //   u64 load at (cursor + 8); when the last live record sits
-  //   flush against the batch tail the cursor advances into the
-  //   12-byte terminator header, and the load at
-  //   (terminator_start + 8) reads 4 bytes past the terminator's
-  //   own name_len field. Without the headroom lane, an exactly-
-  //   full 4096-byte return (kernel guarantees a terminator so this
-  //   is the tight worst case) would overread the last 4 bytes
-  //   into whatever .bss symbol the linker packed next -- benign
-  //   if it is also .bss, but a fault risk if the next page were
-  //   unmapped. The pad lane keeps the overread strictly within
-  //   this symbol.
-  //
-  // _rn_stat_buf -- 64-byte user scratch sys_stat writes into.
-  //   8 u64 lanes @align(8). v1.1-A only uses the buffer as an
-  //   existence-check sink -- no field is inspected -- but the
-  //   allocation is real so the syscall does not fault on a null
-  //   write pointer.
   // ==========================================================================
   pub let mut _rn_getdents_buf : [u64; 513] = uninit @align(8)
   pub let mut _rn_stat_buf     : [u64; 8]   = uninit @align(8)
 
+  // #29: sys_getcwd output (256 bytes) and the composed-relative-path
+  // scratch (512 bytes) rn_resolve_path writes into.
+  pub let mut _rn_cwd_buf       : [u64; 32] = uninit @align(8)  // 256 B
+  pub let mut _rn_resolved_path : [u64; 64] = uninit @align(8)  // 512 B
+
+  // #35: per-depth candidate name lists (33 levels * 512 B = 16896 B)
+  // and their counts (33 * 8 B), plus the per-depth composed child-
+  // path buffers (33 levels * 256 B = 8448 B) and the shared header
+  // composition scratch (RH_PATH_MAX 200 + RH_NAME_MAX 104 + 4 = 308,
+  // rounded up to 320 B).
+  pub let mut _rn_candidates          : [u64; 2112] = uninit @align(8) // 33*512 B
+  pub let mut _rn_candidate_counts    : [u64; 33]   = uninit @align(8)
+  pub let mut _rn_recurse_path_bufs   : [u64; 1056] = uninit @align(8) // 33*256 B
+  pub let mut _rn_header_scratch      : [u64; 40]   = uninit @align(8) // 320 B
+
+  // #43: per-invocation entry counter (see file header §43).
+  pub let mut _rn_pe_entry_count : u64 = uninit @align(8)
+
   // ==========================================================================
-  // runner_ls(path_ptr, flag_bits) -> u64
+  // rn_compose_child_path(parent_ptr, name_ptr, name_len, dst_ptr) -> ()
   //
-  // Signature: (u64, u64) -> u64 !{mem, sysreg} @{}
-  //   RDI (input): path_ptr  -- NUL-terminated user path; 0 -> "."
-  //   RSI (input): flag_bits -- IGNORED at v1.1-A (see file header)
-  //   RAX (output): LS_OK on success, LS_ERR_BAD_PATH if the path
-  //                 does not resolve, LS_ERR_READDIR if enumeration
-  //                 fails after the path resolves.
+  // Signature: (u64, u64, u64, u64) -> () !{mem} @{}
+  //   RDI (input): parent_ptr -- NUL-terminated absolute path of the
+  //                              directory the candidate was found in.
+  //   RSI (input): name_ptr   -- candidate name bytes (need not be
+  //                              NUL-terminated; name_len is
+  //                              authoritative -- same convention
+  //                              RecurseHeader::recurse_header_compose
+  //                              already uses for its own name_ptr).
+  //   RDX (input): name_len   -- byte count at name_ptr.
+  //   RCX (input): dst_ptr    -- caller-owned 256-byte destination
+  //                              (one of the RN_PATH_BUF_STRIDE-sized
+  //                              slots in _rn_recurse_path_bufs).
+  //   (no return value; dst_ptr is always left NUL-terminated,
+  //    truncated rather than overflowed on an oversized input.)
   //
-  // Register plan (non-leaf, 5 callee-save pushes -- see file
-  // header §PAIDEIA-AS CONFORMANCE for the alignment arithmetic):
-  //   rbx = fd (from sys_open; held across the getdents loop and
-  //             the close call).
-  //   r12 = record cursor (moves through the getdents batch).
-  //   r13 = record end (base + bytes returned by the last
-  //         sys_getdents call).
-  //   r14 = _rn_getdents_buf base (loaded once via lea).
-  //   rbp = path_ptr (saved from the initial rdi; sys_stat and
-  //         sys_open both consume rdi so we cannot leave it live
-  //         in-place).
-  //   r10 = scratch (name_len extraction; not preserved across
-  //         calls, refreshed per record).
-  //   r11 = scratch (LEA base for .rodata reaches; not preserved).
+  // Bounded, two-segment copy: parent_ptr bytes (until NUL, clamped at
+  // 190) + '/' + name_ptr bytes (clamped at whatever room remains
+  // under a 255-byte total, i.e. up to RN_RECURSE_NAME_MAX=63 in
+  // practice since callers only ever pass an already-clamped
+  // candidate name) + a trailing NUL. 190 + 1 + 63 + 1 = 255, safely
+  // inside the 256-byte destination stride with one byte of headroom.
+  //
+  // Register plan (leaf, four caller-save inputs, no push/pop needed):
+  //   rdi = parent_ptr (scan cursor in the first copy loop; never
+  //         advanced destructively past what the loop itself needs --
+  //         see the loop body, which reads via a freshly-computed r10
+  //         each iteration rather than incrementing rdi in place, so
+  //         Runner's own rbp source value is never at risk even if it
+  //         happened to alias this register's incoming value)
+  //   rsi = name_ptr (same non-destructive-read discipline)
+  //   rdx = name_len (read-only; never decremented)
+  //   rcx = dst_ptr (read-only; every store address is computed fresh
+  //         as dst_ptr + r8)
+  //   r8  = dst cursor (byte offset into dst_ptr; the one register
+  //         genuinely accumulated across both copy loops)
+  //   r9  = source-copy index (parent-scan count in loop 1, reused as
+  //         name-copy index in loop 2 -- each loop owns it exclusively)
+  //   r10 / r11 = address-holder scratch (per-iteration src/dst reach)
+  //   rax = byte-load / byte-store scratch (#1248 mitigation)
   // ==========================================================================
-  pub let runner_ls : (u64, u64) -> u64 !{mem, sysreg} @{} =
-    fn (path_ptr: u64) (flag_bits: u64) -> unsafe {
+  pub let rn_compose_child_path : (u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (parent_ptr: u64) (name_ptr: u64) (name_len: u64) (dst_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls.ENH-017 (#35): bounded two-segment path composer -- parent_ptr (scanned for NUL, clamped at 190) + '/' + name_ptr (name_len bytes, clamped so the running dst cursor never exceeds 255) + a trailing NUL, written into a caller-owned 256-byte slot. Never overflows dst_ptr: both copy loops re-check the 255 boundary on r8 (the dst cursor) every iteration before the next store, truncating rather than overrunning on an oversized parent path -- the same 'clamp, do not scan/write unbounded' discipline RecurseHeader::recurse_header_compose already pins for its own path_ptr scan. Neither rdi (parent_ptr) nor rsi (name_ptr) is advanced in place; every source byte address is computed fresh as base+index into r10, so this function's caller-save inputs are read-only for their whole lifetime here -- defensive, since Runner's own rbp (the live resolved path this function's parent_ptr argument is sourced from) must remain valid immediately after this call returns for the subsequent recurse_header_compose call, and this function has no way to know that without documenting its own non-destructive-read contract explicitly. Byte reads follow the #1248 mitigation (xor rax, rax; mov_b rax, [r10]); byte writes are direct mov_b [r11], rax stores. LEAF: no nested calls, so every one of the four named inputs plus r8/r9/r10/r11/rax stays caller-save for the whole body -- no callee-save push/pop or SysV call-site alignment applies, matching RecurseHeader's own 'leaf, no nested calls' precedent for an identical two-pass-shaped composer. paideia-as conformance: no test mnemonic; every cmp immediate (190, 255, 0, 0x2F) fits imm32 trivially; no lea with a scaled register index (every address is base register + accumulated offset via add, never lea); r10/r11 are the only address-holder scratch beyond the named inputs. Labels prefixed rccp_.",
+      block: {
+        xor r8, r8;                          // dst cursor
+
+      rccp_copy_parent:
+        cmp r8, 190;
+        jae rccp_copy_parent_done;
+        mov r10, rdi;
+        add r10, r8;
+        xor rax, rax;
+        mov_b rax, [r10];                    // #1248 mitigation
+        cmp rax, 0;
+        je  rccp_copy_parent_done;
+        mov r11, rcx;
+        add r11, r8;
+        mov_b [r11], rax;
+        add r8, 1;
+        jmp rccp_copy_parent;
+
+      rccp_copy_parent_done:
+        mov r11, rcx;
+        add r11, r8;
+        mov_b [r11], 0x2F;                   // '/'
+        add r8, 1;
+
+        xor r9, r9;                          // name-copy index
+
+      rccp_copy_name:
+        cmp r9, rdx;
+        jae rccp_copy_name_done;
+        cmp r8, 255;
+        jae rccp_copy_name_done;
+        mov r10, rsi;
+        add r10, r9;
+        xor rax, rax;
+        mov_b rax, [r10];                    // #1248 mitigation
+        mov r11, rcx;
+        add r11, r8;
+        mov_b [r11], rax;
+        add r9, 1;
+        add r8, 1;
+        jmp rccp_copy_name;
+
+      rccp_copy_name_done:
+        mov r11, rcx;
+        add r11, r8;
+        mov_b [r11], 0;                      // NUL terminator
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rn_resolve_path(path_ptr) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem, sysreg} @{}
+  //   RDI (input): path_ptr -- the raw argument runner_ls received
+  //                            (0 = Dispatch's pos_count-0 default).
+  //   RAX (output): pointer to a NUL-terminated absolute path on
+  //                 success; 0 if sys_getcwd itself failed.
+  //
+  // See file header §29 for the full branch table. Always calls
+  // sys_getcwd once, unconditionally, regardless of which branch it
+  // ultimately takes -- see file header's note on why the absolute-
+  // path branch does not short-circuit ahead of the fetch.
+  //
+  // Register plan (non-leaf, one call site: sys_getcwd):
+  //   r12 = path_ptr, saved from rdi before the call (rdi is
+  //         clobbered as sys_getcwd's own first argument)
+  //   r13 = cwd strlen (sys_getcwd's return, saved across the
+  //         subsequent branch dispatch)
+  //   rax = sys_getcwd's return (transiently), byte-load scratch,
+  //         final return value
+  //   r10 / r11 = address-holder scratch
+  //   rcx = relative-path compose cursor (loop 1: cwd copy index;
+  //         reused untouched as the running dst offset for loop 2)
+  //   rsi = relative-path compose source cursor (loop 2 only)
+  //
+  // Two callee-save pushes (r12, r13) + `sub rsp, 8` pad: entry
+  // rsp % 16 == 8; two pushes -> 8; +8 pad -> 0 at the sys_getcwd
+  // call site.
+  // ==========================================================================
+  pub let rn_resolve_path : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (path_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "ls v1.1-A: real path-addressed body replacing the M1-M4 cap-slot STUB (which called sys_pdxfs_dir_readnext (sysno 72) on a pre-narrowed KIND_PDXFS_FILE cap that shell.M2's InitCap handoff never populated -- every invocation returned LS_ERR_READDIR at HEAD). Flow: default path_ptr to _rn_default_path (\".\\0\") when 0 (the pos_count-0 case Dispatch passes as the _as_path_ptr sentinel); sys_stat as an existence check that surfaces missing-path as LS_ERR_BAD_PATH ahead of the more expensive open+enumerate path; sys_open (O_RDONLY=0, mode=0) -> fd; loop sys_getdents with a 4096-byte .bss buffer until it returns 0 (EOD); walk each returned batch record-by-record extracting name_len via a u64 load + 0xFFFF mask at cursor+8 (avoids needing a mov_w mnemonic paideia-as's encoder does not yet expose to userspace) and calling tty_write per name and per newline; sys_close on the way out. Every error path (open failure, getdents failure) drains fd via sys_close before returning LS_ERR_READDIR so the fd table does not leak. flag_bits is read-past at v1.1-A (see file-header §FLAG BITS) -- the substantive user flags (-l/-a/-h/--color/--json/-R/-t/-S/-r/-1/-C/-F/--group-directories-first) and the Dispatch<->Runner header bits (RN_BIT_HEADER_MASK / RN_BIT_HEADER_BLANK_MASK) all defer to later rounds. Non-leaf: 5 callee-save pushes (rbx=fd, r12=cursor, r13=end, r14=buf-base, rbp=path_ptr) = 40 bytes; entry rsp % 16 == 8; 8 + 40 = 48; 48 % 16 == 0 at every nested-call site (sys_stat, sys_open, sys_getdents, sys_close, tty_write). No `sub rsp, 8` pad needed -- the 5-push count already restores 16-byte alignment. Matched 5 pops via the single shared rn_ls_epilogue label. paideia-as conformance: no test mnemonic (every zero-check via cmp reg, 0); every cmp reg, imm uses imm <= 0x7FFFFFFF (0, 12, 255, 4096, 0xFFFF; every larger sentinel is a mov rax, imm64 emission). No byte reads (the u64 load + mask sidesteps mov_w; name payload is passed by pointer to tty_write, never inspected byte-wise here). r10 and r11 both scratch. Labels prefixed rn_ls_.",
+      justification: "ls.ENH-009 (#29): resolves runner_ls's raw path argument against the kernel's live cwd. Always fetches cwd first (sys_getcwd(&_rn_cwd_buf, 256)) regardless of which branch it will take -- the alternative (probe path_ptr's first byte before deciding whether to fetch cwd at all) would save one syscall on the absolute-path branch but means the default-path branch (path_ptr == 0, which needs the cwd verbatim) and the relative branch (which needs it as a prefix) each need their own fetch call site instead of sharing one; a single unconditional fetch keeps the function to one call site and one alignment story. path_ptr == 0 OR path_ptr == the exact one-byte string '.' both resolve to the cwd buffer verbatim (the dot-check reads byte0 then, only if it is '.', byte1 -- looking for a NUL there -- via the #1248-mitigated load; any other byte1 falls through to the general relative-path branch, which is still correct for a longer dot-prefixed name like '.git' since that name does not equal the literal string \".\"). An absolute path (byte0 == '/') passes through path_ptr unchanged. Anything else composes cwd + '/' + path_ptr into _rn_resolved_path (512 B), bounded: the cwd-copy loop stops at cwd's own strlen (r13, never scanned past it) and additionally never advances past a 511-byte destination cursor (rcx), so an oversized cwd+relative combination truncates rather than overflows the scratch buffer -- the truncated result would then simply fail the subsequent sys_stat/sys_open as a nonexistent path, which is the correct, safe failure mode for an input this function has no better recovery for. A sys_getcwd failure (negative return) is reported as 0 (RAX), which runner_ls's own caller then folds into LS_ERR_BAD_PATH -- the same sub-band an unresolvable target already uses. Two callee-save pushes (r12=path_ptr survivor, r13=cwd strlen survivor) + sub rsp,8 pad = 24 bytes; entry rsp % 16 == 8; 8 + 24 = 32; 32 % 16 == 0 at the sys_getcwd call site. Matched add rsp,8 + two pops before every ret. paideia-as conformance: no test mnemonic; every cmp immediate (0, 0x2E, 0x2F, 511) fits imm32 trivially; byte reads follow #1248; no lea with a scaled register index (the cwd/name copy loops use base-register-plus-accumulated-offset addressing, never a scaled lea). Labels prefixed rn_rp_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // r12 = original path_ptr (may be 0)
+
+        lea rdi, [rip + _rn_cwd_buf];
+        mov rsi, 256;                         // cwd buffer cap
+        call sys_getcwd;
+        cmp rax, 0;
+        jl  rn_rp_fail;
+        mov r13, rax;                         // r13 = cwd strlen
+
+        cmp r12, 0;
+        jne rn_rp_check_dot;
+        lea rax, [rip + _rn_cwd_buf];
+        jmp rn_rp_done;
+
+      rn_rp_check_dot:
+        xor rax, rax;
+        mov_b rax, [r12];                     // #1248 mitigation
+        cmp rax, 0x2E;                        // '.'
+        jne rn_rp_check_abs;
+        mov r10, r12;
+        add r10, 1;
+        xor rax, rax;
+        mov_b rax, [r10];                     // #1248 mitigation
+        cmp rax, 0;
+        jne rn_rp_check_abs;                  // not exactly "."; fall through
+        lea rax, [rip + _rn_cwd_buf];
+        jmp rn_rp_done;
+
+      rn_rp_check_abs:
+        xor rax, rax;
+        mov_b rax, [r12];                     // #1248 mitigation
+        cmp rax, 0x2F;                        // '/'
+        jne rn_rp_relative;
+        mov rax, r12;
+        jmp rn_rp_done;
+
+      rn_rp_relative:
+        lea r10, [rip + _rn_resolved_path];   // dst base
+        lea r11, [rip + _rn_cwd_buf];         // src base
+        xor rcx, rcx;                          // dst cursor / cwd index
+
+      rn_rp_copy_cwd:
+        cmp rcx, r13;                          // cwd strlen
+        jae rn_rp_copy_cwd_done;
+        cmp rcx, 511;
+        jae rn_rp_copy_cwd_done;
+        mov r9, r11;
+        add r9, rcx;
+        xor rax, rax;
+        mov_b rax, [r9];                       // #1248 mitigation
+        mov r9, r10;
+        add r9, rcx;
+        mov_b [r9], rax;
+        add rcx, 1;
+        jmp rn_rp_copy_cwd;
+
+      rn_rp_copy_cwd_done:
+        cmp rcx, 511;
+        jae rn_rp_append_rel;
+        mov r9, r10;
+        add r9, rcx;
+        mov_b [r9], 0x2F;                     // '/'
+        add rcx, 1;
+
+      rn_rp_append_rel:
+        mov rsi, r12;                          // relative-path source cursor
+        xor r9, r9;                             // relative-path copy index
+
+      rn_rp_copy_rel:
+        cmp rcx, 511;
+        jae rn_rp_terminate;
+        mov r11, rsi;
+        add r11, r9;
+        xor rax, rax;
+        mov_b rax, [r11];                      // #1248 mitigation
+        cmp rax, 0;
+        je  rn_rp_terminate;
+        mov r11, r10;
+        add r11, rcx;
+        mov_b [r11], rax;
+        add r9, 1;
+        add rcx, 1;
+        jmp rn_rp_copy_rel;
+
+      rn_rp_terminate:
+        mov r11, r10;
+        add r11, rcx;
+        mov_b [r11], 0;
+        mov rax, r10;                          // return &_rn_resolved_path
+
+      rn_rp_done:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      rn_rp_fail:
+        xor rax, rax;
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // runner_ls(path_ptr, flag_bits, depth) -> u64
+  //
+  // Signature: (u64, u64, u64) -> u64 !{mem, sysreg} @{}
+  //   RDI (input): path_ptr  -- NUL-terminated user path, or 0 (see
+  //                             rn_resolve_path).
+  //   RSI (input): flag_bits -- the ArgvSurface AS_BIT_* vocabulary
+  //                             plus Dispatch's private
+  //                             RN_BIT_HEADER_MASK / RN_BIT_HEADER_
+  //                             BLANK_MASK bits. Only RN_BIT_R_REC
+  //                             (0x200) is consulted at v1.1-B; every
+  //                             other bit is still read-past (see
+  //                             file header §SCOPE).
+  //   RDX (input): depth     -- 0 from Dispatch's own call site; N+1
+  //                             from any -R recursive self-call.
+  //                             RN_RECURSE_MAX_DEPTH (32) caps descent.
+  //   RAX (output): LS_OK on success, LS_ERR_BAD_PATH if the path does
+  //                 not resolve, LS_ERR_READDIR if enumeration fails
+  //                 after the path resolves.
+  //
+  // Register plan (non-leaf, 6 callee-save pushes -- widened from
+  // v1.1-A's 5 to also hold flag_bits and depth for the whole
+  // function lifetime; see file header §PAIDEIA-AS CONFORMANCE):
+  //   rbx = fd during phase 1 (sys_open..sys_close); repurposed as a
+  //         scratch address-holder during phase 2 (the -R recursive
+  //         descent loop) once fd is dead.
+  //   r12 = record cursor during phase 1; candidate index during
+  //         phase 2 (both roles are temporally disjoint).
+  //   r13 = record-batch end during phase 1; candidate count during
+  //         phase 2 (same disjoint-roles rationale).
+  //   r14 = depth, loaded once from rdx and held UNCHANGED for the
+  //         whole function -- freeing it from v1.1-A's role as a
+  //         cached getdents-buffer-base register, which this version
+  //         instead recomputes via a fresh `lea` at the top of every
+  //         gd_loop iteration (negligible cost, one per batch, not
+  //         one per record).
+  //   rbp = resolved absolute path_ptr (rn_resolve_path's return).
+  //   r15 = flag_bits, loaded once from rsi and held UNCHANGED for the
+  //         whole function (rsi itself is repeatedly overwritten by
+  //         nested-call argument marshalling, so a bare rsi read at
+  //         the top of the -R check would already be wrong by the
+  //         time the record loop reaches it).
+  //   r10 / r11 = scratch (name_len extraction, address staging).
+  // ==========================================================================
+  pub let runner_ls : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (path_ptr: u64) (flag_bits: u64) (depth: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "ls v1.1-B (#29 + #35 + #43): widens v1.1-A's real path-addressed body with cwd-relative path resolution, real -R recursive descent, and a per-invocation LsListRecord@0.1 semantic-pipe emission -- see this file's own header sections §29/§35/§43 for the full design rationale (buffered-candidates-then-recurse ordering, the RecurseFilter/RecurseHeader reuse-vs-bypass split, the per-depth storage layout, the entry-count/path-hash/filter-flags field derivation). Six callee-save pushes (rbx=fd/phase-2 scratch, r12=cursor/candidate-index, r13=end/candidate-count, r14=depth, rbp=resolved path, r15=flag_bits) = 48 bytes; entry rsp % 16 == 8; 8 + 48 = 56; 56 % 16 == 8, so `sub rsp, 8` brings it to 0 for every nested-call site (rn_resolve_path, sys_stat, sys_open, sys_getdents, sys_close, tty_write, rn_compose_child_path, recurse_header_compose, pipe_emit_send, pe_hash_path, and the recursive runner_ls self-call). Matched `add rsp, 8` + 6 pops before the single shared rn_ls_epilogue label every path converges on. r14 holds depth verbatim from entry to exit -- unlike v1.1-A's r14 (a cached getdents-buffer-base pointer), this round recomputes that base via a fresh `lea r11, [rip + _rn_getdents_buf]` at the top of every rn_ls_gd_loop iteration instead, which costs one extra instruction per BATCH (not per record) and in exchange frees a whole callee-save register for depth without needing a seventh push or any stack-relative addressing beyond the proven push/pop discipline. Every recursive self-call is a normal SysV call: the callee's own six-register save/restore protects THIS frame's rbx/r12/r13/r14/rbp/r15 exactly as any other nested call would, so descending into a child and returning leaves this frame's candidate list, resolved path, depth, and flag_bits all intact for the next candidate in this frame's own phase-2 loop. paideia-as conformance: no test mnemonic; every cmp reg,imm immediate (0, 2, 8, 12, 31, 63, 190, 255, 256, 4096, 0xFFFF, and the two RH_ERR_OVERFLOW / sentinel movs which are never compare operands) fits imm32 or is staged via a mov, never a bare cmp on a >imm32 constant; every scaled address (depth*512, index*64, (depth+1)*256) is built via `shl` + `add` on a plain register, never a scaled-index `lea`; byte reads follow #1248 throughout. Labels prefixed rn_ls_.",
       block: {
         push rbx;
         push r12;
         push r13;
         push r14;
         push rbp;
-        // rsp % 16 == 0 at every nested-call site.
+        push r15;
+        sub rsp, 8;                              // rsp % 16 == 0 at every nested-call site
 
-        // Stash path_ptr; default to _rn_default_path when 0.
-        mov rbp, rdi;
-        cmp rbp, 0;
-        jne rn_ls_have_path;
-        lea rbp, [rip + _rn_default_path];
+        mov r14, rdx;                            // r14 = depth (unchanged for life of function)
+        mov r15, rsi;                            // r15 = flag_bits (unchanged for life of function)
 
-      rn_ls_have_path:
-        // ---- (2) sys_stat(path, 255, &_rn_stat_buf) ---------------
+        // ---- (#29) resolve path against cwd ------------------------
+        // rdi already = path_ptr (the incoming first arg).
+        call rn_resolve_path;
+        cmp rax, 0;
+        je  rn_ls_bad_path;
+        mov rbp, rax;                             // rbp = resolved absolute path
+
+        // Reset this depth level's candidate count to 0 before the
+        // primary getdents pass starts appending to it.
+        lea r11, [rip + _rn_candidate_counts];
+        xor rax, rax;
+        mov [r11 + r14 * 8], rax;
+
+        // (#43) reset the per-invocation entry counter only at the
+        // TOP-LEVEL call -- a recursive (depth > 0) call must NOT
+        // reset it, since it accumulates across the whole -R tree.
+        cmp r14, 0;
+        jne rn_ls_skip_pe_reset;
+        lea r11, [rip + _rn_pe_entry_count];
+        xor rax, rax;
+        mov [r11], rax;
+
+      rn_ls_skip_pe_reset:
+        // ---- sys_stat(path, 255, &_rn_stat_buf) --------------------
         mov rdi, rbp;
-        mov rsi, 255;                            // RN_STAT_PATH_HINT
+        mov rsi, 255;                             // RN_STAT_PATH_HINT
         lea rdx, [rip + _rn_stat_buf];
         call sys_stat;
         cmp rax, 0;
-        jne rn_ls_bad_path;                      // non-zero -> BAD_PATH
+        jne rn_ls_bad_path;
 
-        // ---- (3) sys_open(path, 0 /*O_RDONLY*/, 0 /*mode*/) ------
+        // ---- sys_open(path, 0 /*O_RDONLY*/, 0 /*mode*/) ------------
         mov rdi, rbp;
         xor rsi, rsi;
         xor rdx, rdx;
         call sys_open;
         cmp rax, 0;
-        jl  rn_ls_open_err;                      // signed negative -> errno
-        mov rbx, rax;                            // rbx = fd
-
-        // Base pointer of the getdents scratch, loaded once.
-        lea r14, [rip + _rn_getdents_buf];
+        jl  rn_ls_open_err;
+        mov rbx, rax;                             // rbx = fd
 
       rn_ls_gd_loop:
-        // ---- (4a) sys_getdents(fd, buf, 4096) --------------------
+        // ---- sys_getdents(fd, buf, 4096) ----------------------------
+        // Buffer base recomputed fresh each batch (see file header /
+        // this function's own doc for why r14 no longer caches it).
+        lea r11, [rip + _rn_getdents_buf];
         mov rdi, rbx;
-        mov rsi, r14;
-        mov rdx, 4096;                           // RN_GD_BUF_CAP
+        mov rsi, r11;
+        mov rdx, 4096;                            // RN_GD_BUF_CAP
         call sys_getdents;
         cmp rax, 0;
-        je  rn_ls_eod;                           // rax == 0 -> EOD
-        jl  rn_ls_gd_err;                        // rax < 0  -> errno
+        je  rn_ls_eod;
+        jl  rn_ls_gd_err;
 
-        // rax > 0: bytes returned. Set cursor = base, end = base+rax.
-        mov r12, r14;
-        mov r13, r14;
+        // rax > 0: bytes returned. r12 = cursor, r13 = end. Base must
+        // be recomputed here too -- the call above clobbered r11.
+        lea r11, [rip + _rn_getdents_buf];
+        mov r12, r11;
+        mov r13, r11;
         add r13, rax;
 
       rn_ls_rec_loop:
         cmp r12, r13;
-        jae rn_ls_gd_loop;                       // batch drained; fetch next
+        jae rn_ls_gd_loop;                        // batch drained; fetch next
 
-        // Extract name_len via u64 load + 0xFFFF mask (see file
-        // header rationale for the mov_w avoidance).
         mov r10, [r12 + 8];
-        and r10, 0xFFFF;
+        and r10, 0xFFFF;                          // name_len
         cmp r10, 0;
-        je  rn_ls_gd_loop;                       // terminator -> next batch
+        je  rn_ls_gd_loop;                        // terminator -> next batch
 
-        // tty_write(cursor + 12, name_len).
+        // ---- print the entry (unchanged from v1.1-A) ---------------
         mov rdi, r12;
-        add rdi, 12;                             // RN_REC_HDR_BYTES
+        add rdi, 12;                              // RN_REC_HDR_BYTES
         mov rsi, r10;
         call tty_write;
-        // Short-write / errno path ignored at v1.1-A -- a real retry
-        // loop lands with the flag-bits re-engagement round; the
-        // enumeration continues either way so an early bad byte does
-        // not silently truncate the whole listing.
 
-        // tty_write(&_rn_newline, 1).
         lea rdi, [rip + _rn_newline];
         mov rsi, 1;
         call tty_write;
 
-        // cursor += 12 + name_len.
+        // (#43) count this entry.
+        lea r11, [rip + _rn_pe_entry_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // ---- (#35) -R candidate detection ---------------------------
+        mov rax, r15;
+        and rax, 0x200;                           // RN_BIT_R_REC
+        cmp rax, 0;
+        je  rn_ls_rec_advance;
+
+        cmp r14, 31;                              // depth guard: child = depth+1 <= 31
+        jae rn_ls_rec_advance;
+
+        xor rax, rax;
+        mov_b rax, [r12 + 10];                    // #1248 mitigation; getdents `type` byte
+        cmp rax, 2;                                // RN_VNODE_TYPE_DIR
+        jne rn_ls_rec_advance;
+
+        // dot-exclusion, bounded by name_len (r10) -- see file header
+        // §35 for why this does not delegate to RecurseFilter here.
+        cmp r10, 1;
+        jne rn_ls_rec_dotdot_check;
+        xor rax, rax;
+        mov_b rax, [r12 + 12];                    // #1248 mitigation
+        cmp rax, 0x2E;                             // '.'
+        je  rn_ls_rec_advance;
+
+      rn_ls_rec_dotdot_check:
+        cmp r10, 2;
+        jne rn_ls_rec_add_candidate;
+        xor rax, rax;
+        mov_b rax, [r12 + 12];                     // #1248 mitigation
+        cmp rax, 0x2E;
+        jne rn_ls_rec_add_candidate;
+        xor rax, rax;
+        mov_b rax, [r12 + 13];                     // #1248 mitigation
+        cmp rax, 0x2E;
+        je  rn_ls_rec_advance;                      // name == ".."
+
+      rn_ls_rec_add_candidate:
+        lea r11, [rip + _rn_candidate_counts];
+        mov rcx, [r11 + r14 * 8];                   // current count for this depth
+        cmp rcx, 8;                                  // RN_RECURSE_MAX_CANDIDATES
+        jae rn_ls_rec_advance;                       // cap reached; silently skip (documented)
+
+        mov r9, r10;                                 // clamp candidate name_len to 63
+        cmp r9, 63;                                   // RN_RECURSE_NAME_MAX
+        jbe rn_ls_rec_cand_len_ok;
+        mov r9, 63;
+
+      rn_ls_rec_cand_len_ok:
+        // slot base = _rn_candidates + depth*512 + count*64
+        lea r11, [rip + _rn_candidates];
+        mov r8, r14;
+        shl r8, 9;                                    // depth * 512
+        add r11, r8;
+        mov r8, rcx;
+        shl r8, 6;                                     // count * 64
+        add r11, r8;                                   // r11 = slot base
+
+        mov_b [r11], r9;                               // store clamped name_len
+
+        xor r8, r8;                                     // copy index j
+
+      rn_ls_rec_cand_copy:
+        cmp r8, r9;
+        jae rn_ls_rec_cand_copy_done;
+        mov rdx, r12;
+        add rdx, 12;
+        add rdx, r8;                                    // src = r12+12+j
+        xor rax, rax;
+        mov_b rax, [rdx];                               // #1248 mitigation
+        mov rdx, r11;
+        add rdx, 1;
+        add rdx, r8;                                     // dst = slot_base+1+j
+        mov_b [rdx], rax;
+        add r8, 1;
+        jmp rn_ls_rec_cand_copy;
+
+      rn_ls_rec_cand_copy_done:
+        lea r11, [rip + _rn_candidate_counts];
+        mov rcx, [r11 + r14 * 8];
+        add rcx, 1;
+        mov [r11 + r14 * 8], rcx;
+
+      rn_ls_rec_advance:
         add r12, 12;
         add r12, r10;
         jmp rn_ls_rec_loop;
 
       rn_ls_eod:
-        // ---- (5) sys_close(fd); return LS_OK ---------------------
         mov rdi, rbx;
         call sys_close;
+
+        // ---- (#35) phase 2: recurse into buffered candidates -------
+        mov rax, r15;
+        and rax, 0x200;                              // RN_BIT_R_REC
+        cmp rax, 0;
+        je  rn_ls_ok;
+
+        lea r11, [rip + _rn_candidate_counts];
+        mov r13, [r11 + r14 * 8];                     // r13 = candidate count (phase-1 role dead)
+        cmp r13, 0;
+        je  rn_ls_ok;
+
+        xor r12, r12;                                  // r12 = candidate index (phase-1 role dead)
+
+      rn_ls_phase2_loop:
+        cmp r12, r13;
+        jae rn_ls_ok;
+
+        // candidate slot base = _rn_candidates + depth*512 + index*64
+        lea r11, [rip + _rn_candidates];
+        mov r8, r14;
+        shl r8, 9;
+        add r11, r8;
+        mov r8, r12;
+        shl r8, 6;
+        add r11, r8;                                    // r11 = candidate slot base
+
+        xor rax, rax;
+        mov_b rax, [r11];                               // #1248 mitigation; candidate name_len
+        mov r9, rax;                                     // r9 = name_len
+        mov r10, r11;
+        add r10, 1;                                       // r10 = name bytes ptr
+
+        // compose child path into _rn_recurse_path_bufs[depth+1]
+        lea rbx, [rip + _rn_recurse_path_bufs];         // rbx (fd, dead) repurposed as scratch
+        mov r8, r14;
+        add r8, 1;
+        shl r8, 8;                                        // (depth+1) * 256
+        add rbx, r8;                                       // rbx = dst ptr for composed child path
+
+        mov rdi, rbp;                                       // parent_ptr
+        mov rsi, r10;                                        // name_ptr
+        mov rdx, r9;                                          // name_len
+        mov rcx, rbx;                                          // dst_ptr
+        call rn_compose_child_path;
+
+        // emit the recursion header (recompute name_ptr/name_len --
+        // rsi/rdx/r9/r10 are caller-save and were clobbered above).
+        lea r9, [rip + _rn_candidates];
+        mov r8, r14;
+        shl r8, 9;
+        add r9, r8;
+        mov r8, r12;
+        shl r8, 6;
+        add r9, r8;                                            // r9 = candidate slot base
+
+        xor rax, rax;
+        mov_b rax, [r9];                                       // #1248 mitigation
+        mov rdx, rax;                                           // name_len
+        mov rsi, r9;
+        add rsi, 1;                                              // name_ptr
+        mov rdi, rbp;                                             // path_ptr (parent)
+        lea rcx, [rip + _rn_header_scratch];
+        mov r8, 320;                                               // dst_cap
+        call recurse_header_compose;
+        mov r10, 0xFFFFFFFFFFFFFFFF;                                // RH_ERR_OVERFLOW
+        cmp rax, r10;
+        je  rn_ls_phase2_recurse;                                    // overflow: skip header, still recurse
+
+        lea rdi, [rip + _rn_header_scratch];
+        mov rsi, rax;                                                 // bytes_written
+        call tty_write;
+
+      rn_ls_phase2_recurse:
+        lea rdi, [rip + _rn_recurse_path_bufs];
+        mov r8, r14;
+        add r8, 1;
+        shl r8, 8;
+        add rdi, r8;                                                   // child path ptr
+        mov rsi, r15;                                                   // flag_bits, unchanged
+        mov rdx, r14;
+        add rdx, 1;                                                      // child depth
+        call runner_ls;                                                  // real recursive descent
+        // Child's return value is not folded into this frame's own
+        // return -- see file header §35.
+
+        add r12, 1;
+        jmp rn_ls_phase2_loop;
+
+      rn_ls_ok:
+        // (#43) top-level only: emit the LsListRecord@0.1 summary.
+        // r12 / r13 are dead by this point (phase-1's cursor/end and
+        // phase-2's candidate-index/count roles are both finished) --
+        // reused here purely as callee-save carriers across the
+        // pe_hash_path call, which needs rdi for ITS OWN path_ptr
+        // argument.
+        cmp r14, 0;
+        jne rn_ls_ok_return;
+
+        lea r11, [rip + _rn_pe_entry_count];
+        mov r12, [r11];                          // r12 = entry_count (survives the call)
+
+        mov rdi, rbp;                             // path_ptr arg for pe_hash_path
+        call pe_hash_path;
+        mov r13, rax;                              // r13 = path_hash (survives)
+
+        mov rdi, r12;                               // entry_count
+        mov rsi, r13;                                // path_hash
+        mov rdx, r15;
+        and rdx, 0xFFFF;                              // filter_flags: AS_BIT_* low bits only
+        call pipe_emit_send;
+        // Return value ignored -- best-effort telemetry (see
+        // PipeEmit's own file header).
+
+      rn_ls_ok_return:
         mov rax, 0xFFFFEB00;                     // LS_OK
         jmp rn_ls_epilogue;
 
       rn_ls_gd_err:
-        // sys_getdents failed mid-enumeration. Drain fd, return
-        // LS_ERR_READDIR.
         mov rdi, rbx;
         call sys_close;
         mov rax, 0xFFFFEB22;                     // LS_ERR_READDIR
         jmp rn_ls_epilogue;
 
       rn_ls_open_err:
-        // sys_open failed. No fd to drain -- fall straight through.
         mov rax, 0xFFFFEB22;                     // LS_ERR_READDIR
         jmp rn_ls_epilogue;
 
       rn_ls_bad_path:
-        // sys_stat rejected the path. Return LS_ERR_BAD_PATH.
         mov rax, 0xFFFFEB21;                     // LS_ERR_BAD_PATH
 
       rn_ls_epilogue:
+        add rsp, 8;
+        pop r15;
         pop rbp;
         pop r14;
         pop r13;

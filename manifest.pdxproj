@@ -20,7 +20,7 @@
 # a new PAIDEIA_AS_VER KV record.
 
 name        = ls
-version     = 1.1-A
+version     = 1.1-C
 kind        = tool
 entry       = Dispatch::ls_dispatch
 output      = build-out/ls
@@ -38,6 +38,26 @@ caps_decl   = caps.decl
 # layout at v1.1-A (see src/runner.pdx §SCOPE for the full deferral
 # list; every deferred flag re-engages as a use-site Runner-body
 # edit against the pre-v1.1-A modules still in-tree).
+#
+# v1.1-B (paideia-os/ls#29 + #35 + #43) widens the v1.1-A body:
+# relative positional arguments now resolve against the kernel's live
+# cwd via sys_getcwd (sysno 86) before any sys_stat/sys_open call;
+# `-R` performs real recursive descent (buffered per-depth candidate
+# names, depth-capped at 32, real self-call recursion) rather than the
+# v1.1.4 header-only interim landing; and a top-level (depth == 0)
+# LS_OK return now composes and sends one 128-byte LsListRecord@0.1
+# summary record via the new PipeEmit module's raw sys_semantic_send
+# (sysno 115) wire, independent of SemanticEmit's per-entry
+# libpdx-semantic-pipe path. See src/runner.pdx and src/pipe_emit.pdx
+# for the full design rationale.
+#
+# v1.1-C (paideia-os/ls#44) is the release closer for the v1.1-A/B
+# real-body wave: CHANGELOG + README + this manifest's version stamp
+# and release: block move together with the `v1.3.0` git tag (see
+# CHANGELOG.md's own note on why the tag continues the pre-rewrite
+# v1.0.0/v1.1.x/v1.2.0 semver sequence while this manifest's `version`
+# field keeps the descriptive `1.1-A/B/C` codename the real-body
+# rewrite adopted).
 
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). -----------------
@@ -60,9 +80,15 @@ sources:
   - src/ls.pdx                    # M1-001 KIND mirrors + error band + stats
   - src/argv_surface.pdx          # M1-002 flag-bit recogniser
   - src/runner.pdx                # v1.1-A path-addressed runner_ls body
-                                  # (retires the M1-M4 cap-slot STUB)
+                                  # (retires the M1-M4 cap-slot STUB);
+                                  # v1.1-B adds cwd-relative path
+                                  # resolve + real -R recursion + the
+                                  # PipeEmit call site (#29/#35/#43)
   - src/posix_shim.pdx            # v1.1-A sys_open/close/stat/getdents
-                                  # trampolines (sysnos 2/3/77/78)
+                                  # trampolines (sysnos 2/3/77/78);
+                                  # v1.1-B adds sys_getcwd (sysno 86, #29)
+  - src/pipe_emit.pdx             # v1.1-B (#43) LsListRecord@0.1 raw
+                                  # sys_semantic_send (sysno 115) wire
   - src/dispatch.pdx              # M1-003 ls_dispatch composition
   - src/long_format.pdx           # M2-001 -l line renderer
   - src/owner_col.pdx             # M2-002 owner column: u:<row>; ls.ENH-008
@@ -130,6 +156,15 @@ tests:
   - tests/multicol_fixtures.pdx       # 1.1.6 ENH-018 (#36) 5 columns_layout cases
   - tests/long_total_fixtures.pdx     # 1.1.7 ENH-021 (#39) 7 long_total_compute / long_total_summary_record_compose cases
   - tests/multipath_fixtures.pdx      # 1.1.8 ENH-014 (#32) 5 multipath_header_compose cases
+  #   v1.1-B (#29/#35/#43) ships no new fixture file in this pass --
+  #   rn_resolve_path, the -R candidate/recursion body, and PipeEmit
+  #   are exercised as source-only landings pending a live-substrate
+  #   or paideia-as-test verify_all harness (see tools/build.sh's own
+  #   note that Phase 2 is a parse+encode smoke, not a live invocation
+  #   check, until the runtime evaluator lands). Tracked as an honest
+  #   gap, not a silent one -- the debugger pass this wave's own loop
+  #   shape runs after every softarch iteration is the intended first
+  #   real verification of this landing's control flow.
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49/R50 tool observes and every M1
@@ -154,7 +189,7 @@ compliance:
 # 1.0 tag freezes those, and a re-sign at R32 rewrites the mirror
 # copy only (source tree unchanged).
 release:
-  manifest_pdxsig = pkgs.paideia-os/ls/1.1.4/manifest.pdxsig
-  changelog_entry = CHANGELOG.md#114
+  manifest_pdxsig = pkgs.paideia-os/ls/1.3.0/manifest.pdxsig
+  changelog_entry = CHANGELOG.md#v1.3.0-v1.1-a-b-c
   pdxdoc          = doc/ls.pdxdoc
-  mirror_target   = pkgs.paideia-os/ls/1.1.4/
+  mirror_target   = pkgs.paideia-os/ls/1.3.0/

@@ -17,6 +17,22 @@
 //   sys_getdents (sysno 78)  fd, buf, cap                       -> bytes (0=EOD)
 //                                                                   | -errno
 //
+// v1.1-B (paideia-os/ls#29) adds a fifth trampoline:
+//
+//   sys_getcwd   (sysno 86)  buf, cap                           -> strlen
+//                                                                   (excl NUL)
+//                                                                   | -errno
+//
+// Sysno 86 is the AUTHORITATIVE value pinned at paideia-os design/
+// user/syscall-table.md row 86 ("R86.M1 sys_chdir (85) / sys_getcwd
+// (86)", #1955/#1956). The wave dispatch that requested this
+// trampoline cited sysno 95; 95 is `sys_kill` at that same table (row
+// 95, "R73.M1-001 sys_kill (95)", #1938) -- a stale cross-reference,
+// not a real ordinal. This module trampolines the syscall-table's own
+// authoritative row rather than the dispatch prose, since binding to
+// the wrong sysno would silently deliver `-ENOSYS` (or worse, invoke
+// `sys_kill` with `sys_getcwd`'s argument shape) at every call site.
+//
 // Sysnos frozen at paideia-os design/user/syscall-table.md rows 2, 3,
 // 77, 78. Record layout for sys_getdents is documented at paideia-os
 // src/kernel/core/syscall/sys_getdents.pdx §Record layout (frozen for
@@ -74,6 +90,9 @@ module PosixShim = structure {
   pub let PSH_SYSNO_CLOSE    : u64 = 3
   pub let PSH_SYSNO_STAT     : u64 = 77
   pub let PSH_SYSNO_GETDENTS : u64 = 78
+  // v1.1-B (#29): authoritative sysno per design/user/syscall-table.md
+  // row 86 -- see file header for the 95-vs-86 correction note.
+  pub let PSH_SYSNO_GETCWD   : u64 = 86
 
   // ==========================================================================
   // Suggested getdents batch size. sys_getdents.pdx §KPTI bounce
@@ -219,6 +238,41 @@ module PosixShim = structure {
       justification: "ls v1.1-A: trampoline for paideia-os sysno 78 (sys_getdents). Arity 3 so SysV rdi/rsi/rdx map straight to SYSCALL rdi/rsi/rdx -- no r10 shuffle. Fills buf with a stream of variable-length records (layout frozen at sys_getdents.pdx §Record layout for R56.M3: ino@0 u64, name_len@8 u16, type@10 u8, reserved@11 u8, name@12; a header with name_len=0 terminates the stream). Return: bytes-written on success (0 = end-of-directory, buf untouched), negative-errno u64 on failure. Runner iterates until a 0 return, walking each returned batch record-by-record; the kernel fd_entry carries the readdir cursor across calls per §Cursor discipline. Leaf trampoline. Effects {mem, sysreg} match the kernel body's tail -- mem for user_write_bytes_via_walk into buf, sysreg for the SYSCALL clobber.",
       block: {
         mov rax, 78;                             // PSH_SYSNO_GETDENTS
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_getcwd(buf, cap) -> strlen | -errno
+  //
+  // Signature: (u64, u64) -> u64 !{mem, sysreg} @{}
+  //   RDI (input): buf -- writable user scratch the kernel fills with
+  //                       the NUL-terminated cwd path.
+  //   RSI (input): cap -- capacity of buf in bytes. Per design/user/
+  //                       syscall-table.md's "Walker length hint
+  //                       semantics" note, `getcwd` REVERSES the
+  //                       direction every other `path_len_hint`
+  //                       syscall uses: `cap` bounds the OUTPUT, not
+  //                       an input scan.
+  //   RAX (output): strlen (excluding the NUL) on success, buf
+  //                 NUL-terminated; negative-errno u64 on failure.
+  //
+  // v1.1-B (paideia-os/ls#29): Runner::rn_resolve_path calls this once
+  // per top-level invocation (and once per recursive descent, since
+  // each depth's own child path is already absolute by construction --
+  // see rn_resolve_path's own doc) to resolve a relative positional
+  // argument against the kernel's live cwd rather than the bare "."
+  // placeholder v1.1-A wrote to the filesystem layer unresolved.
+  //
+  // Arity 2; no shuffle.
+  // ==========================================================================
+  pub let sys_getcwd : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (buf: u64) (cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "ls v1.1-B (#29): trampoline for paideia-os sysno 86 (sys_getcwd; design/user/syscall-table.md row 86, #1955/#1956 -- see file header for the 95-vs-86 correction against the wave dispatch's stale cross-reference to sys_kill's sysno). Arity 2 so SysV rdi/rsi map straight to SYSCALL rdi/rsi -- no r10 shuffle. `cap` bounds the kernel's write into `buf` (the output-direction convention the syscall-table's own 'Walker length hint semantics' section calls out as the one reversal from every other path_len_hint syscall in this table). Return: strlen excluding the NUL on success (buf left NUL-terminated), negative-errno u64 on failure -- Runner detects failure via `cmp rax, 0; jl <err>` exactly like sys_open/sys_stat. Leaf trampoline: no callee-save touched, no push/pop parity. Effects {mem, sysreg} match the kernel body's tail: mem for the walker's write into buf's user pages, sysreg for the SYSCALL clobber of rcx + r11.",
+      block: {
+        mov rax, 86;                             // PSH_SYSNO_GETCWD
         syscall;
         ret
       }

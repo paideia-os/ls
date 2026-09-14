@@ -1,0 +1,281 @@
+// src/pipe_emit.pdx -- ls v1.1-B (paideia-os/ls#43)
+//
+// PipeEmit module: a per-invocation `LsListRecord@0.1` summary record
+// written directly to the kernel's semantic-pipe producer ring via
+// `sys_semantic_send` (sysno 115), independent of the existing
+// `SemanticEmit` module's per-entry `PdxFsDirEntry@0.1` path.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// One entry point:
+//
+//   pipe_emit_send(entry_count, path_hash, filter_flags) -> 0 | -errno
+//
+// composes a fixed 128-byte record --
+//
+//   [0..8)    entry_count   : u64  -- total entries this invocation
+//                                     listed (top-level directory plus
+//                                     every -R descendant; see
+//                                     Runner::_rn_pe_entry_count).
+//   [8..16)   path_hash     : u64  -- FNV-1a 64-bit hash (see
+//                                     `pe_hash_path` below) of the
+//                                     resolved top-level path this
+//                                     invocation listed.
+//   [16..24)  filter_flags  : u64  -- the low 16 bits of the argv
+//                                     surface's flag_bits (the
+//                                     AS_BIT_* vocabulary; Dispatch's
+//                                     private RN_BIT_HEADER_* bits are
+//                                     masked out).
+//   [24..128) reserved      : zero -- 104 bytes of headroom for a
+//                                     future field; a v1 consumer that
+//                                     only reads [0..24) is unaffected
+//                                     by whatever lands there.
+//
+// and calls `sys_semantic_send(schema, &_pe_record, 128)` once.
+//
+// =============================================================================
+// WHY THIS IS NOT libpdx-semantic-pipe::Send::send_record
+// =============================================================================
+//
+// `SemanticEmit` (src/semantic_emit.pdx) already emits a per-entry
+// `PdxFsDirEntry@0.1` record on ls's stdout `KIND_IPC_ENDPOINT` via
+// `libpdx-semantic-pipe`'s `Registry::bind_by_name` + `Send::
+// send_record` -- a schema-registry-aware, per-fd-bound mechanism.
+// `LsListRecord@0.1` is a DIFFERENT, deliberately simpler wire: a
+// single per-invocation summary written straight into the kernel's
+// fixed 16-slot producer ring (design/user/syscall-table.md row 115)
+// with no bind step and no fd. The two mechanisms are independent by
+// design -- ls.ENH-024 (#43) asks for the raw `sys_semantic_send`
+// wire specifically, not a second `libpdx-semantic-pipe` bind slot --
+// so `PipeEmit` does NOT participate in the `caps.decl ::
+// declares_output_schemas` three-file sync that governs
+// `SemanticEmit` / `schema_dump.pdx` / `caps.decl` (see caps.decl's
+// own INVARIANT note). A future round that wants `LsListRecord@0.1`
+// discoverable via `ls --schema` needs its own, separate decision
+// about whether to fold it into that registry or keep it as an
+// out-of-band telemetry-shaped wire; this landing takes no position
+// on that and changes no file outside this one plus its one call site
+// in Runner.
+//
+// =============================================================================
+// SCHEMA ID
+// =============================================================================
+//
+// `sys_semantic_send`'s `schema` argument is opaque to the kernel
+// (design/user/syscall-table.md row 115: "Schema is opaque to the
+// kernel; caller-side schema whitelisting lives in
+// libpdx-semantic-pipe"). `PE_SCHEMA_LSLISTRECORD_ID` is NOT a
+// BLAKE3 or registry-resolved hash -- it is the literal ASCII bytes
+// "LSLIST01" packed big-endian into one u64, chosen so the constant
+// is self-describing at a hex dump without a lookup table. This is
+// the same "honest, non-cryptographic placeholder, PENDING a real
+// schema-registry integration" posture `SemanticEmit::sem_emit_reset`
+// already documents for `PdxFsDirEntry@0.1`'s own pre-BLAKE3 fold --
+// a future round that wants `LsListRecord@0.1` registry-resolved can
+// replace this literal with a real call without changing
+// `pipe_emit_send`'s signature or its one call site.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`PipeEmit`), no directory
+//     prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (16, 128, 255, 3 --
+//     the largest is 128). The schema id and FNV-1a constants are
+//     `mov reg, imm64` emissions (movabs), never compare operands --
+//     `mov` (unlike `cmp`/`and`) is not subject to the imm32 rule
+//     anywhere else in this tree either (e.g. `mov rax, 0xFFFFEB00`
+//     throughout src/ls.pdx, src/runner.pdx).
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` per #1248.
+//   - `imul` is always register-register (`imul r8, r9`), never
+//     register-immediate -- the encoder pitfall the wave dispatch
+//     itself calls out ("2-op imul r,imm") only applies to the
+//     immediate form; staging the FNV-1a prime into r9 first sidesteps
+//     it entirely.
+//   - r10 / r11 are scratch address-holders. r8 / r9 hold the FNV-1a
+//     hash accumulator / prime across `pe_hash_path`'s scan loop --
+//     both are caller-save (SysV volatile), so no push/pop is needed
+//     for a leaf function that uses them.
+//   - `sys_semantic_send` is a LEAF (pure syscall pass-through, same
+//     shape as every PosixShim trampoline).
+//   - `pe_hash_path` is a LEAF (no nested calls, bounded 255-byte scan
+//     matching `PosixShim::PSH_PATH_HINT_DEFAULT`'s own walker-CAP
+//     convention).
+//   - `pipe_emit_send` is non-leaf (one call to `sys_semantic_send`).
+//     No callee-save register is touched -- every field write and the
+//     record-zero loop use only caller-save registers (rdi, rsi, rdx,
+//     rcx, r8, r9, r10, rax) -- so the only alignment concern is the
+//     nested call site itself: entry rsp % 16 == 8; `sub rsp, 8`
+//     brings it to 0; matched `add rsp, 8` before `ret`.
+//
+// =============================================================================
+// CROSS-MODULE SYMBOLS
+// =============================================================================
+//
+// Called by:
+//   runner_ls -- Runner (src/runner.pdx), once per top-level (depth
+//                == 0) invocation, on the LS_OK success path only.
+
+module PipeEmit = structure {
+
+  // ==========================================================================
+  // Constants.
+  // ==========================================================================
+  pub let PE_SYSNO_SEMANTIC_SEND     : u64 = 115
+  pub let PE_RECORD_SIZE             : u64 = 128
+  // "LSLIST01" packed big-endian: L=0x4C S=0x53 L=0x4C I=0x49 S=0x53
+  // T=0x54 0=0x30 1=0x31. See file header §Schema Id.
+  pub let PE_SCHEMA_LSLISTRECORD_ID  : u64 = 0x4C534C4953543031
+  // FNV-1a 64-bit constants (Fowler/Noll/Vo), used by pe_hash_path.
+  pub let PE_FNV_OFFSET_BASIS        : u64 = 0xCBF29CE484222325
+  pub let PE_FNV_PRIME               : u64 = 0x100000001B3
+  // Bounded scan cap for pe_hash_path, matching PosixShim::
+  // PSH_PATH_HINT_DEFAULT's own "walker CAP, not exact strlen" bound.
+  pub let PE_HASH_PATH_MAX           : u64 = 255
+
+  // ==========================================================================
+  // .bss scratch: the 128-byte composed record, 16 u64 lanes.
+  // ==========================================================================
+  pub let mut _pe_record : [u64; 16] = uninit @align(8)
+
+  // ==========================================================================
+  // sys_semantic_send(schema, record_ptr, record_len) -> 0 | -errno
+  //
+  // Signature: (u64, u64, u64) -> u64 !{mem, sysreg} @{}
+  //   RDI (input): schema     -- opaque u64 schema id (see file header).
+  //   RSI (input): record_ptr -- caller-owned record bytes.
+  //   RDX (input): record_len -- byte count at record_ptr (<= 240 per
+  //                              design/user/syscall-table.md row 115;
+  //                              this module always passes 128).
+  //   RAX (output): 0 on success; negative-errno u64 on failure
+  //                 (-EINVAL on record_len == 0 or > 240; -EFAULT on
+  //                 a bad record_ptr / walker fault).
+  //
+  // Arity 3; no shuffle. LEAF trampoline, same shape as every
+  // PosixShim trampoline in this repo.
+  // ==========================================================================
+  pub let sys_semantic_send : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (schema: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "ls v1.1-B (#43): trampoline for paideia-os sysno 115 (sys_semantic_send; design/user/syscall-table.md row 115, R107-M0-001 #2350). Arity 3 so SysV rdi/rsi/rdx map straight to SYSCALL rdi/rsi/rdx -- no r10 shuffle. Copies record_len bytes from record_ptr into the kernel's fixed 16-slot 256-byte-stride producer ring; schema is opaque to the kernel (caller-side whitelisting lives in libpdx-semantic-pipe, which this module deliberately bypasses -- see file header §Why this is not libpdx-semantic-pipe::Send::send_record). Return: 0 on success, negative-errno on failure (-EINVAL for record_len out of [1,240], -EFAULT for a bad record_ptr). Leaf trampoline: no callee-save touched, no push/pop parity. Effects {mem, sysreg} match the kernel body's tail: mem for the walker's read of record_ptr's user pages, sysreg for the SYSCALL clobber of rcx + r11.",
+      block: {
+        mov rax, 115;                            // PE_SYSNO_SEMANTIC_SEND
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pe_hash_path(path_ptr) -> u64
+  //
+  // Signature: (u64) -> u64 !{mem} @{}
+  //   RDI (input): path_ptr -- NUL-terminated path, scanned up to
+  //                            PE_HASH_PATH_MAX (255) bytes.
+  //   RAX (output): FNV-1a 64-bit hash of the scanned bytes.
+  //
+  // Register plan (leaf, no nested calls):
+  //   rdi = path_ptr (untouched; each byte address is computed fresh
+  //         into r10 rather than advancing rdi destructively, since
+  //         Runner may want to reuse path_ptr immediately after this
+  //         call returns)
+  //   r8  = hash accumulator (FNV-1a offset basis, then folded per byte)
+  //   r9  = FNV-1a prime (staged once; `imul r8, r9` stays
+  //         register-register per the encoder-pitfall note in the
+  //         file header)
+  //   rcx = scan index
+  //   r10 = scratch address (path_ptr + rcx)
+  //   rax = byte-load scratch (#1248 mitigation), then the return value
+  // ==========================================================================
+  pub let pe_hash_path : (u64) -> u64 !{mem} @{} =
+    fn (path_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "ls v1.1-B (#43): FNV-1a 64-bit hash (Fowler/Noll/Vo) of up to PE_HASH_PATH_MAX (255) bytes at path_ptr, stopping early at the first NUL. Not cryptographic -- collision resistance is not a goal for a best-effort telemetry field a downstream consumer uses to bucket/dedupe invocations by path, not to authenticate one. path_ptr itself is never advanced (each iteration computes a fresh r10 = path_ptr + rcx) so the caller's own path_ptr register, if it happens to be the same physical register value Runner is still holding as rbp's source, is never destructively consumed -- defensive, since this function has no way to know whether its caller needs path_ptr again immediately after return. The multiply is register-register (`imul r8, r9` with the prime pre-staged into r9) specifically to avoid the register-immediate `imul r,imm` form the wave dispatch itself flags as an encoder pitfall. Byte reads follow the #1248 mitigation (xor rax, rax; mov_b rax, [r10]). LEAF: no nested calls, no callee-save register touched (r8, r9, r10, rcx, rax are all SysV-volatile). paideia-as conformance: no test mnemonic; the only cmp immediate is 255 (PE_HASH_PATH_MAX) and 0 (NUL check), both trivially imm32; the two 64-bit FNV-1a constants are `mov reg, imm64` (movabs) emissions, never compare operands. Labels prefixed peh_.",
+      block: {
+        mov r8, 0xCBF29CE484222325;              // PE_FNV_OFFSET_BASIS
+        mov r9, 0x100000001B3;                    // PE_FNV_PRIME
+        xor rcx, rcx;                              // scan index
+
+      peh_loop:
+        cmp rcx, 255;                              // PE_HASH_PATH_MAX
+        jae peh_done;
+
+        mov r10, rdi;
+        add r10, rcx;
+        xor rax, rax;
+        mov_b rax, [r10];                          // #1248 mitigation
+        cmp rax, 0;
+        je  peh_done;
+
+        xor r8, rax;
+        imul r8, r9;                               // register-register only
+        add rcx, 1;
+        jmp peh_loop;
+
+      peh_done:
+        mov rax, r8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pipe_emit_send(entry_count, path_hash, filter_flags) -> u64
+  //
+  // Signature: (u64, u64, u64) -> u64 !{mem, sysreg} @{}
+  //   RDI (input): entry_count  -- see file header §Scope.
+  //   RSI (input): path_hash    -- pe_hash_path's return over the
+  //                                resolved top-level path.
+  //   RDX (input): filter_flags -- caller-masked low bits of
+  //                                ArgvSurface::_as_flag_bits (or the
+  //                                packed flag_bits Runner carries;
+  //                                see that call site's own mask).
+  //   RAX (output): 0 on success; negative-errno u64 on
+  //                 sys_semantic_send refusal (propagated verbatim --
+  //                 no tool-level sentinel translation, since this is
+  //                 a best-effort telemetry emission Runner does not
+  //                 gate the overall LS_OK/LS_ERR_* return on).
+  //
+  // Register plan (non-leaf, one nested call, no callee-save touched):
+  //   r10 = &_pe_record (LEA once, reused as the write base for every
+  //         field store and the zero loop)
+  //   rax = zero constant (for the reserved-region zero loop), then
+  //         the call's return value
+  //   rcx = zero-loop index (starts at 3 -- lanes 0/1/2 already hold
+  //         entry_count/path_hash/filter_flags; loop zeroes lanes 3..15)
+  // ==========================================================================
+  pub let pipe_emit_send : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (entry_count: u64) (path_hash: u64) (filter_flags: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "ls v1.1-B (#43): compose the 128-byte LsListRecord@0.1 body into _pe_record (lane 0 = entry_count, lane 1 = path_hash, lane 2 = filter_flags, lanes 3..15 zeroed -- 104 bytes of reserved headroom per file header §Scope) and call sys_semantic_send(PE_SCHEMA_LSLISTRECORD_ID, &_pe_record, 128) once. The zero loop starts at rcx=3 (not 0) since lanes 0..2 are populated by the three direct qword stores immediately before it, matching Ls::ls_reset's own `[base + idx*8]` addressing idiom for a bounded counter-table clear. No callee-save register is touched anywhere in this body -- entry_count/path_hash/filter_flags (rdi/rsi/rdx) are stored to memory before rdi/rsi/rdx are reused as sys_semantic_send's own arguments, and r10 (record base) plus rax/rcx (zero-loop) are all SysV-volatile -- so the only alignment concern is the one nested call: entry rsp % 16 == 8; `sub rsp, 8` reaches 0 for sys_semantic_send's call site; matched `add rsp, 8` before ret. Return value is sys_semantic_send's own raw return, propagated verbatim -- Runner treats this as best-effort telemetry and does not fold a failure here into the LS_OK/LS_ERR_* vocabulary the rest of the tool observes (see this function's one call site in src/runner.pdx). paideia-as conformance: no test mnemonic; cmp immediates are 3 and 16 (zero-loop bounds), both trivial; the schema id constant is a `mov rdi, imm64` emission at the call site, never a compare operand; array addressing uses the proven `[r10 + rcx*8]` form. Labels prefixed pes_.",
+      block: {
+        sub rsp, 8;                                // align for the nested call
+
+        lea r10, [rip + _pe_record];
+        mov [r10], rdi;                            // entry_count @ lane 0
+        mov [r10 + 8], rsi;                        // path_hash @ lane 1
+        mov [r10 + 16], rdx;                       // filter_flags @ lane 2
+
+        xor rax, rax;
+        mov rcx, 3;
+
+      pes_zero_loop:
+        cmp rcx, 16;
+        jae pes_zero_done;
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        jmp pes_zero_loop;
+
+      pes_zero_done:
+        mov rdi, 0x4C534C4953543031;               // PE_SCHEMA_LSLISTRECORD_ID
+        mov rsi, r10;                               // record_ptr
+        mov rdx, 128;                                // PE_RECORD_SIZE
+        call sys_semantic_send;
+
+        add rsp, 8;
+        ret
+      }
+    }
+}
